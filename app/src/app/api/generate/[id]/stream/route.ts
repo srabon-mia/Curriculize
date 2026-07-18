@@ -261,12 +261,8 @@ export async function GET(
             const topicText = await callClaude(topicPrompt, true);
             console.log(`Topic text for "${node.title}":`, topicText.slice(0, 200));
 
-            const jsonMatch = topicText.match(/\[[\s\S]*\]/);
-            if (!jsonMatch) {
-              console.log(`No JSON array found for topic "${node.title}", skipping`);
-              continue;
-            }
-
+            // Try array first, fall back to object with a resources key
+            let jsonMatch = topicText.match(/\[[\s\S]*\]/);
             let candidates: Array<{
               url: string;
               title: string;
@@ -276,12 +272,36 @@ export async function GET(
               license_status: string;
             }> = [];
 
-            try {
-              candidates = JSON.parse(jsonMatch[0]);
-              if (!Array.isArray(candidates)) continue;
-            } catch {
-              console.log(`Parse failed for topic "${node.title}", skipping`);
-              continue;
+            if (!jsonMatch) {
+              // Claude may have returned an object like { resources: [...] }
+              const objMatch = topicText.match(/\{[\s\S]*\}/);
+              if (objMatch) {
+                try {
+                  const parsed = JSON.parse(objMatch[0]) as Record<string, unknown>;
+                  // Find any array value inside the object
+                  const arrayValue = Object.values(parsed).find((v) => Array.isArray(v));
+                  if (arrayValue) {
+                    candidates = arrayValue as typeof candidates;
+                  }
+                } catch {
+                  // ignore
+                }
+              }
+              if (candidates.length === 0) {
+                console.log(`No JSON found for topic "${node.title}", skipping`);
+                continue;
+              }
+            } else {
+              try {
+                candidates = JSON.parse(jsonMatch[0]);
+                if (!Array.isArray(candidates)) {
+                  console.log(`JSON wasn't an array for topic "${node.title}", skipping`);
+                  continue;
+                }
+              } catch {
+                console.log(`Parse failed for topic "${node.title}", skipping`);
+                continue;
+              }
             }
 
             const resources = candidates
@@ -304,7 +324,11 @@ export async function GET(
               await supabase.from("resources").insert(resources);
             }
           } catch (err) {
-            console.log(`Resource discovery failed for topic "${node.title}":`, err);
+            console.log(
+              `Resource discovery failed for topic "${node.title}":`,
+              err instanceof Error ? err.message : err
+            );
+            // If rate limited, wait and the next topic will still run
           }
 
           if (i < nodeIds.length - 1) {

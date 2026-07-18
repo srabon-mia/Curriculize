@@ -52,5 +52,6 @@ Rules:
 - Be specific — major understandings should be concrete concepts, not vague themes
 - Order topics so prerequisites come first
 - Adjust depth based on time available: less time = fewer topics, more focused
-- Return only the JSON object, nothing else`;
+- Return only the JSON object, nothing else
+CRITICAL: Your entire response must be ONLY the JSON object starting with { and ending with }. No introduction, no explanation, no markdown. Start your response with { and end with }.`;
 }

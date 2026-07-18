@@ -90,5 +90,6 @@ Rules:
 - If a resource covers the whole topic generally, list all codes
 - Only freely accessible resources, no login or payment required
 - Match difficulty to the course level — advanced courses need advanced resources
-- Return only the JSON object`;
+- Return only the JSON object
+CRITICAL: Your entire response must be ONLY the JSON object starting with { and ending with }. No introduction, no explanation, no markdown. Start your response with { and end with }.`;
 }

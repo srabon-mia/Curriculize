@@ -31,5 +31,5 @@ Rules:
 - Prioritize sources that are well-known and trusted in this specific field
 - Include a mix of: explanations/readings, videos, practice problems, and reference material
 - Be specific to the difficulty level — don't include beginner resources for advanced students
-- Return only the JSON array`;
+CRITICAL: Your entire response must be ONLY the JSON array starting with [ and ending with ]. No introduction, no explanation, no markdown. Start your response with [ and end with ].`;
 }
