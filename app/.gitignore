@@ -42,3 +42,5 @@ next-env.d.ts
 
 # Phase 1 additions
 .env.local
+
+.claude
