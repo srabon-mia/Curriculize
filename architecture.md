@@ -126,6 +126,10 @@ The system must NEVER silently create a bill because a free dependency stopped b
 10. Bound searches, candidates, fetches, retries, and AI calls.
 11. Only invoke semantic AI reasoning when genuinely necessary.
 
+### AI-call minimization (architectural invariant)
+
+**AI calls are an expensive and slow operation and MUST be minimized.** Every pipeline stage must prefer deterministic logic, existing persisted data, caching, deduplication, content hashing, and reusable acquisition before invoking AI. AI must only be invoked when deterministic methods cannot adequately perform the required operation.
+
 ### Warm-path requirement
 
 A student request satisfied by already-verified data must require **$0** in new external AI/search/acquisition cost. The warm path performs only database lookup, assembly, filtering, personalization, and local application work.
@@ -850,6 +854,7 @@ Job records are persisted to `acquisition_jobs` table with status and results. T
 - No separate worker service, Redis, or message queue is required.
 - Retries are recorded in `retry_count`; after a configurable limit, the job may be flagged for human review.
 - Acquisition results are persisted to `verification_records`, `resource_mappings`, `curriculum_sources`, etc. The DB IS the durable storage.
+- **Acquisition job claiming must be concurrency-safe/atomic** (e.g., `UPDATE acquisition_jobs SET status = 'running', started_at = now() WHERE id = ? AND status = 'pending'` with a row-count check). Multiple simultaneous processors must not process the same job.
 
 ### Acquisition budgets (bounded behavior)
 
@@ -861,6 +866,8 @@ Configurable per-job/per-cycle limits include:
 - `max_fetch_attempts`
 - `max_ai_calls`
 - `max_retries`
+
+**`max_ai_calls` is a HARD per-job ceiling, not merely monitoring/telemetry.** A job MUST NOT exceed `max_ai_calls`. Once the ceiling is reached, the job must stop making additional AI calls and follow the existing bounded/failure/review behavior already documented (job status transitions to `failed` or `completed` with partial results, retry logic governed by `retry_count`, human review flagging).
 
 Application-level abuse controls / rate limiting must also prevent unbounded acquisition or AI spending during cold-path generation. Authentication/rate-limit details are implementation-specific, but the architecture must explicitly account for them.
 
@@ -1037,6 +1044,8 @@ Fetched URLs must not be allowed to target internal-only network targets. At min
 - link-local addresses (169.254.0.0/16)
 - cloud metadata endpoints (e.g., 169.254.169.254)
 - other internal-only network targets
+
+**Implementation hardening:** SSRF protection must validate resolved destination IPs on the initial fetch AND on all subsequent redirects (IPv4 and IPv6), mitigating DNS rebinding and DNS resolution-time attacks. A URL that resolves to a private IP only after a redirect must still be blocked.
 
 ### Bounded request behavior
 
