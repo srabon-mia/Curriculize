@@ -376,14 +376,17 @@ export function canonicalizeUrl(input: string): CanonicalUrl | null {
  * Validate a URL against all deterministic checks:
  * - Well-formed URL
  * - Allowed scheme (http/https)
- * - Not in SSRF hostname blocklist
- * - Hostname is not an IP address in the SSRF blocklist
+ * - Not in SSRF hostname blocklist (unless skipHostnameBlocklist is true)
+ * - Hostname is not an IP address in the SSRF blocklist (unless skipHostnameBlocklist is true)
  * - Hostname resolves to non-blocked IPs (if resolution provided)
  * - Not a data:, file:, ftp:, etc. scheme
  */
 export function validateUrl(
   input: string,
-  options?: { resolvedIps?: { ipv4: string[]; ipv6: string[] } }
+  options?: {
+    resolvedIps?: { ipv4: string[]; ipv6: string[] };
+    skipHostnameBlocklist?: boolean;
+  }
 ): UrlValidationResult {
   const failures: string[] = [];
   const canonical = canonicalizeUrl(input);
@@ -392,16 +395,18 @@ export function validateUrl(
     return { valid: false, reason: failures[0], failures };
   }
   const { parsed } = canonical;
-  // SSRF hostname blocklist (exact match)
-  if (isHostnameBlocked(parsed.hostname)) {
+  // SSRF hostname blocklist (exact match) - skip if explicitly allowed (e.g., pre-resolved IPs)
+  if (!options?.skipHostnameBlocklist && isHostnameBlocked(parsed.hostname)) {
     failures.push(`Hostname '${parsed.hostname}' is blocked (SSRF protection)`);
   }
-  // SSRF IP blocklist: check if hostname itself is an IP address
-  const hostnameIpCheck = isIpBlocked(parsed.hostname);
-  if (hostnameIpCheck) {
-    failures.push(
-      `Hostname '${parsed.hostname}' resolves to blocked IP (SSRF protection)`
-    );
+  // SSRF IP blocklist: check if hostname itself is an IP address - skip if explicitly allowed
+  if (!options?.skipHostnameBlocklist) {
+    const hostnameIpCheck = isIpBlocked(parsed.hostname);
+    if (hostnameIpCheck) {
+      failures.push(
+        `Hostname '${parsed.hostname}' resolves to blocked IP (SSRF protection)`
+      );
+    }
   }
   // SSRF IP blocklist (if resolved IPs provided)
   if (options?.resolvedIps) {
