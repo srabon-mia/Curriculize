@@ -5,6 +5,7 @@
  */
 
 import { isAllowedScheme, canonicalizeUrl } from "@/lib/deterministic/url";
+import { sha256 } from "@/lib/deterministic/hash";
 import type { CleanedDocument } from "./cleanedDocument";
 
 /** Heading with level and text */
@@ -150,6 +151,10 @@ export function extractStructuredContentFromDoc(doc: CleanedDocument): Structure
   const serializedText = serializeTreeToText(doc.tree);
   const wordCount = countWords(serializedText);
 
+  // Compute actual cleaned hash from the cleaned text (Phase 5 behavior)
+  const cleanedText = normalizeWhitespace(serializedText);
+  const cleanedHash = sha256(cleanedText);
+
   const headingCountsByLevel: Record<1 | 2 | 3 | 4 | 5 | 6, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 };
   for (const h of headings) headingCountsByLevel[h.level]++;
 
@@ -165,7 +170,7 @@ export function extractStructuredContentFromDoc(doc: CleanedDocument): Structure
 
   return {
     source: {
-      cleanedHash: doc.acquiredPage.contentHash, // Note: using contentHash as cleanedHash proxy - will be corrected
+      cleanedHash,
       contentHash: doc.acquiredPage.contentHash,
     },
     metadata: {
