@@ -117,6 +117,8 @@ export interface AcquisitionResult {
   acquiredPage?: AcquiredPage;
   /** Cleaned page if successful */
   cleanedPage?: CleanedPage;
+  /** Structured content from Phase 6A extraction */
+  structuredContent?: import("./structuredExtract").StructuredContent;
   /** Error if failed */
   error?: {
     code: string;

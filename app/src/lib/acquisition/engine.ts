@@ -2,13 +2,15 @@
  * Phase 5 Acquisition Engine - Main Entry Point
  * Orchestrates URL validation, DNS, HTTP acquisition, and cleaning.
  * Zero AI, deterministic, reusable Phase 4 utilities.
+ * Now also produces Phase 6A StructuredContent from the shared cleaned document.
  */
 
 import { validateUrl, normalizeForDedup, canonicalizeUrl, CanonicalUrl } from "@/lib/deterministic/url";
 import { sha256 } from "@/lib/deterministic/hash";
 import { DedupTracker, makeDedupKey, DedupKey } from "@/lib/deterministic/dedup";
 import { acquireUrl } from "./http";
-import { cleanPage, acquireAndClean } from "./cleaner";
+import { buildCleanedDocument, serializeCleanedDocument } from "./cleanedDocument";
+import { extractStructuredContentFromDoc, StructuredContent } from "./structuredExtract";
 import { AcquisitionError, isAcquisitionError } from "./errors";
 import type {
   AcquisitionOptions,
@@ -61,7 +63,6 @@ export class AcquisitionDedupTracker {
 export function validateCandidate(candidate: DiscoveryCandidate): CanonicalUrl {
   const validation = validateUrl(candidate.url);
   if (!validation.valid) {
-    // Check if failure is due to blocked hostname/IP (SSRF)
     const isBlocked = validation.failures?.some((f) =>
       f.includes("blocked (SSRF protection)")
     ) ?? false;
@@ -87,6 +88,7 @@ export function getCandidateDedupKey(candidate: DiscoveryCandidate): DedupKey | 
 /**
  * Acquire a single candidate with full pipeline.
  * Returns AcquisitionResult with success/error info.
+ * Now includes StructuredContent from Phase 6A.
  */
 export async function acquireCandidate(
   candidate: DiscoveryCandidate,
@@ -149,10 +151,10 @@ export async function acquireCandidate(
     };
   }
 
-  // Cleaning
-  let cleaned: CleanedPage;
+  // SINGLE HTML PROCESSING PASS - build cleaned document once
+  let doc: ReturnType<typeof buildCleanedDocument>;
   try {
-    cleaned = cleanPage(acquired);
+    doc = buildCleanedDocument(acquired);
   } catch (err) {
     if (isAcquisitionError(err)) {
       return {
@@ -168,11 +170,18 @@ export async function acquireCandidate(
     };
   }
 
+  // Phase 5 output
+  const cleaned = serializeCleanedDocument(doc);
+
+  // Phase 6A output
+  const structuredContent = extractStructuredContentFromDoc(doc);
+
   return {
     candidate,
     success: true,
     acquiredPage: acquired,
     cleanedPage: cleaned,
+    structuredContent,
   };
 }
 
@@ -199,9 +208,17 @@ export async function acquireCandidates(
 
 /**
  * High-level function: acquire and clean in one call.
- * Re-exported from cleaner for convenience.
+ * Returns CleanedPage only (for backward compatibility).
  */
-export { acquireAndClean } from "./cleaner";
+export async function acquireAndClean(
+  url: string,
+  options?: Parameters<typeof import("./http").acquireUrl>[1]
+): Promise<CleanedPage> {
+  const { acquireUrl } = await import("./http");
+  const acquired = await acquireUrl(url, options);
+  const doc = buildCleanedDocument(acquired);
+  return serializeCleanedDocument(doc);
+}
 
 /**
  * Default options re-export
@@ -222,3 +239,6 @@ export type {
 } from "./types";
 export type { AcquisitionErrorCode, AcquisitionErrorDetails } from "./errors";
 export { AcquisitionError, isAcquisitionError } from "./errors";
+
+// Re-export Phase 6A types
+export type { StructuredContent } from "./structuredExtract";
