@@ -3,6 +3,7 @@ import { buildSkeletonPrompt } from "@/lib/prompts/skeleton";
 import { buildDiscoverPrompt, buildTopicBatchPrompt } from "@/lib/prompts/discover";
 import { buildSourceDiscoveryPrompt } from "@/lib/prompts/sources";
 import type { NodeWithChildren } from "@/lib/curriculum-data";
+import { getAIProvider } from "@/lib/ai";
 
 export const maxDuration = 300;
 
@@ -11,52 +12,35 @@ const supabase = createServiceClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-async function callClaude(prompt: string, useSearch = true): Promise<string> {
-  let lastErr = "";
+// Lazy AI provider getter - avoids initialization at module load time (build time)
+function getAI(): ReturnType<typeof getAIProvider> {
+  return getAIProvider();
+}
 
-  for (let attempt = 0; attempt < 4; attempt++) {
-    if (attempt > 0) {
-      const waitMs = attempt * 30000;
-      console.log(`Rate limited, waiting ${waitMs / 1000}s before retry ${attempt}...`);
-      await new Promise((r) => setTimeout(r, waitMs));
-    }
+/**
+ * Call AI provider with text completion.
+ * Preserves exact pre-6-Pre behavior: same prompts, same retry logic.
+ * Returns raw text response; callers handle JSON extraction.
+ */
+async function callAI(prompt: string, useSearch = true): Promise<string> {
+  const textResult = await getAI().complete(prompt, {
+    useSearch,
+    maxTokens: 4000,
+  });
+  return textResult.text;
+}
 
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY!,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 4000,
-        ...(useSearch && {
-          tools: [{ type: "web_search_20250305", name: "web_search" }],
-        }),
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-
-    if (res.status === 429) {
-      lastErr = await res.text();
-      continue;
-    }
-
-    if (!res.ok) {
-      throw new Error(await res.text());
-    }
-
-    const data = await res.json();
-    const textBlocks = data.content
-      .filter((b: { type: string }) => b.type === "text")
-      .map((b: { text: string }) => b.text);
-
-    const allText = textBlocks.join("");
-    return allText;
-  }
-
-  throw new Error(`Rate limited after retries: ${lastErr}`);
+/**
+ * Call AI for source discovery (no search, smaller max tokens).
+ * Preserves exact pre-6-Pre behavior.
+ * Returns raw text response; callers handle JSON extraction.
+ */
+async function callAISources(prompt: string): Promise<string> {
+  const textResult = await getAI().complete(prompt, {
+    useSearch: false,
+    maxTokens: 2000,
+  });
+  return textResult.text;
 }
 
 export async function GET(
@@ -111,7 +95,7 @@ export async function GET(
           notes.added_context ?? ""
         );
 
-        const skeletonText = await callClaude(skeletonPrompt, true);
+        const skeleton = await callAI(skeletonPrompt, true);
 
         type SkeletonNode = {
           title: string;
@@ -130,11 +114,11 @@ export async function GET(
           nodes: SkeletonNode[];
         };
 
-        let skeleton: Skeleton;
+        let skeletonParsed: Skeleton;
         try {
-          const jsonMatch = skeletonText.match(/\{[\s\S]*\}/);
+          const jsonMatch = (skeleton as string).match(/\{[\s\S]*\}/);
           if (!jsonMatch) throw new Error("No JSON found");
-          skeleton = JSON.parse(jsonMatch[0]) as Skeleton;
+          skeletonParsed = JSON.parse(jsonMatch[0]) as Skeleton;
         } catch {
           send(controller, "error", {
             message: "Failed to generate curriculum structure",
@@ -147,18 +131,18 @@ export async function GET(
         await supabase
           .from("curricula")
           .update({
-            title: skeleton.title,
-            source_type: skeleton.source_type,
-            source_attribution: skeleton.source_attribution,
-            source_url: skeleton.source_url,
+            title: skeletonParsed.title,
+            source_type: skeletonParsed.source_type,
+            source_attribution: skeletonParsed.source_attribution,
+            source_url: skeletonParsed.source_url,
           })
           .eq("id", id);
 
-        const curriculumTitle = skeleton.title;
+        const curriculumTitle = skeletonParsed.title;
 
         send(controller, "skeleton", {
-          title: skeleton.title,
-          topic_count: skeleton.nodes.length,
+          title: skeletonParsed.title,
+          topic_count: skeletonParsed.nodes.length,
         });
 
         // Step 2: Insert nodes and major understandings
@@ -167,7 +151,7 @@ export async function GET(
           node: SkeletonNode;
         }> = [];
 
-        for (const node of skeleton.nodes) {
+        for (const node of skeletonParsed.nodes) {
           const { data: nodeRow } = await supabase
             .from("nodes")
             .insert({
@@ -215,7 +199,7 @@ export async function GET(
           );
 
           // No web search needed — Claude already knows which sites are good
-          const sourcesText = await callClaude(sourcesPrompt, false);
+          const sourcesText = await callAISources(sourcesPrompt);
           const jsonMatch = sourcesText.match(/\[[\s\S]*\]/);
           if (jsonMatch) {
             discoveredSources = JSON.parse(jsonMatch[0]) as DiscoveredSource[];
@@ -258,11 +242,10 @@ export async function GET(
               discoveredSources.map((s) => s.domain)
             );
 
-            const topicText = await callClaude(topicPrompt, true);
-            console.log(`Topic text for "${node.title}":`, topicText.slice(0, 200));
+            const topicText = await callAI(topicPrompt, true);
 
             // Try array first, fall back to object with a resources key
-            let jsonMatch = topicText.match(/\[[\s\S]*\]/);
+            const jsonMatch = topicText.match(/\[[\s\S]*\]/);
             let candidates: Array<{
               url: string;
               title: string;
@@ -387,7 +370,7 @@ export async function GET(
                 discoveredSources.map((s) => s.domain)
               );
 
-              const text = await callClaude(prompt, true);
+              const text = await callAI(prompt, true);
               const jsonMatch = text.match(/\{[\s\S]*\}/);
               if (!jsonMatch) {
                 console.log(`No JSON object found for batch topic "${node.title}"`);

@@ -2,6 +2,7 @@ import { createClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
 import { buildDiscoverPrompt } from "@/lib/prompts/discover";
 import { getNodesWithUnderstandings, getDomainScores } from "@/lib/curriculum-data";
+import { getAIProvider } from "@/lib/ai";
 
 export const maxDuration = 60;
 
@@ -18,6 +19,43 @@ const VALID_TYPES = [
   "video", "text", "textbook", "problem_set",
   "reference_tool", "practice_exam", "other"
 ];
+
+// Lazy AI provider getter - avoids initialization at module load time (build time)
+function getAI(): ReturnType<typeof getAIProvider> {
+  return getAIProvider();
+}
+
+/**
+ * Call AI for resource discovery with text completion and JSON extraction.
+ * Preserves exact pre-6-Pre behavior: same prompts, same JSON extraction, same retry logic.
+ */
+async function callAIDiscover(prompt: string): Promise<ResourceCandidate[]> {
+  const textResult = await getAI().complete(prompt, {
+    useSearch: true,
+    maxTokens: 2000,
+  });
+
+  // Extract JSON array from wherever it appears in the text
+  // Claude sometimes wraps it in prose, sometimes returns it clean
+  const allText = textResult.text;
+  const jsonMatch = allText.match(/\[[\s\S]*\]/);
+  if (!jsonMatch) {
+    console.log("No JSON array found in response:", allText.slice(0, 300));
+    throw new Error("No JSON array found in AI response");
+  }
+
+  let candidates: ResourceCandidate[];
+  try {
+    candidates = JSON.parse(jsonMatch[0]);
+    if (!Array.isArray(candidates)) throw new Error("Not an array");
+  } catch (e) {
+    console.log("Parse error:", e, "matched text:", jsonMatch[0].slice(0, 300));
+    throw new Error("Failed to parse AI response as JSON");
+  }
+
+  console.log(`Parsed ${candidates.length} candidates`);
+  return candidates;
+}
 
 export async function POST(request: Request) {
   const supabase = await createClient();
@@ -68,89 +106,16 @@ export async function POST(request: Request) {
     []
   );
 
-  let anthropicData;
-  let lastErr = "";
-
-  for (let attempt = 0; attempt < 4; attempt++) {
-    if (attempt > 0) {
-      const waitMs = attempt * 30000; // 30s, 60s, 90s
-      console.log(`Rate limited, waiting ${waitMs / 1000}s before retry ${attempt}...`);
-      await new Promise((r) => setTimeout(r, waitMs));
-    }
-
-    const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY!,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 2000,
-        tools: [{ type: "web_search_20250305", name: "web_search" }],
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-
-    if (anthropicRes.status === 429) {
-      lastErr = await anthropicRes.text();
-      continue; // retry
-    }
-
-    if (!anthropicRes.ok) {
-      const err = await anthropicRes.text();
-      console.log("Anthropic error:", err);
-      return NextResponse.json(
-        { error: `Anthropic API error: ${err}` },
-        { status: 500 }
-      );
-    }
-
-    anthropicData = await anthropicRes.json();
-    break;
-  }
-
-  if (!anthropicData) {
-    console.log("All retries exhausted:", lastErr);
-    return NextResponse.json(
-      { error: "Rate limited after retries — wait a minute and try again" },
-      { status: 429 }
-    );
-  }
-
-  console.log("Anthropic stop reason:", anthropicData.stop_reason);
-  console.log("Content blocks:", anthropicData.content?.map((b: {type: string}) => b.type));
-
-  const textBlocks = anthropicData.content
-    .filter((block: { type: string }) => block.type === "text")
-    .map((block: { text: string }) => block.text);
-
-  // Extract JSON array from wherever it appears in the text
-  // Claude sometimes wraps it in prose, sometimes returns it clean
-  const allText = textBlocks.join("");
-  const jsonMatch = allText.match(/\[[\s\S]*\]/);
-  if (!jsonMatch) {
-    console.log("No JSON array found in response:", allText.slice(0, 300));
-    return NextResponse.json(
-      { error: "No JSON array found in Claude response", raw: allText },
-      { status: 500 }
-    );
-  }
-
-  let candidates: ResourceCandidate[] = [];
+  let candidates: ResourceCandidate[];
   try {
-    candidates = JSON.parse(jsonMatch[0]);
-    if (!Array.isArray(candidates)) throw new Error("Not an array");
-  } catch (e) {
-    console.log("Parse error:", e, "matched text:", jsonMatch[0].slice(0, 300));
+    candidates = await callAIDiscover(prompt);
+  } catch (err) {
+    console.log("AI discover failed:", err instanceof Error ? err.message : err);
     return NextResponse.json(
-      { error: "Failed to parse Claude response as JSON", raw: jsonMatch[0] },
+      { error: "Failed to discover resources" },
       { status: 500 }
     );
   }
-
-  console.log(`Parsed ${candidates.length} candidates`);
 
   const domainScores = await getDomainScores();
   const inserted: string[] = [];
