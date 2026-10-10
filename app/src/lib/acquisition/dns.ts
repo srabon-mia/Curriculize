@@ -55,9 +55,33 @@ export function validateResolvedIps(ipv4: string[], ipv6: string[]): Acquisition
 /**
  * Resolve a hostname and validate all resolved IPs.
  * This is the main DNS security function for Phase 5.
+ * If the input is already an IP address (IPv4, IPv6, or IPv4-mapped IPv6),
+ * skip DNS resolution and validate directly against the SSRF blocklist.
  */
 export async function resolveAndValidate(hostname: string): Promise<ResolvedHost> {
   const normalized = normalizeHostname(hostname);
+
+  // Step 0: Check if input is an IP address (IPv4, IPv6, or IPv4-mapped IPv6)
+  // Do this FIRST so IP addresses get BLOCKED_RESOLVED_IP not BLOCKED_URL
+  const { isIp, ipv4, ipv6 } = classifyIpAddress(normalized);
+  if (isIp) {
+    const ipError = validateResolvedIps(ipv4, ipv6);
+    if (ipError) {
+      return {
+        hostname: normalized,
+        ipv4,
+        ipv6,
+        valid: false,
+        error: ipError,
+      };
+    }
+    return {
+      hostname: normalized,
+      ipv4,
+      ipv6,
+      valid: true,
+    };
+  }
 
   // Step 1: Check hostname blocklist (fast, no network)
   const hostnameError = checkHostnameBlocked(normalized);
@@ -72,23 +96,23 @@ export async function resolveAndValidate(hostname: string): Promise<ResolvedHost
   }
 
   // Step 2: Resolve A and AAAA records
-  let ipv4: string[] = [];
-  let ipv6: string[] = [];
+  let resolvedIpv4: string[] = [];
+  let resolvedIpv6: string[] = [];
 
   try {
-    ipv4 = await dns.resolve4(normalized);
-  } catch (err) {
+    resolvedIpv4 = await dns.resolve4(normalized);
+  } catch {
     // No A records or resolution failed - not an error yet
   }
 
   try {
-    ipv6 = await dns.resolve6(normalized);
-  } catch (err) {
+    resolvedIpv6 = await dns.resolve6(normalized);
+  } catch {
     // No AAAA records or resolution failed - not an error yet
   }
 
   // Step 3: Check if we got any records
-  if (ipv4.length === 0 && ipv6.length === 0) {
+  if (resolvedIpv4.length === 0 && resolvedIpv6.length === 0) {
     return {
       hostname: normalized,
       ipv4: [],
@@ -99,12 +123,12 @@ export async function resolveAndValidate(hostname: string): Promise<ResolvedHost
   }
 
   // Step 4: Validate ALL resolved IPs against SSRF blocklist
-  const ipError = validateResolvedIps(ipv4, ipv6);
+  const ipError = validateResolvedIps(resolvedIpv4, resolvedIpv6);
   if (ipError) {
     return {
       hostname: normalized,
-      ipv4,
-      ipv6,
+      ipv4: resolvedIpv4,
+      ipv6: resolvedIpv6,
       valid: false,
       error: ipError,
     };
@@ -113,10 +137,145 @@ export async function resolveAndValidate(hostname: string): Promise<ResolvedHost
   // Step 5: Success
   return {
     hostname: normalized,
-    ipv4,
-    ipv6,
+    ipv4: resolvedIpv4,
+    ipv6: resolvedIpv6,
     valid: true,
   };
+}
+
+/**
+ * Classify an input string as IPv4, IPv6, or IPv4-mapped IPv6 address.
+ * Returns { isIp, ipv4[], ipv6[] } where arrays contain the address if matched.
+ */
+function classifyIpAddress(input: string): {
+  isIp: boolean;
+  ipv4: string[];
+  ipv6: string[];
+} {
+  // IPv4: dotted quad
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(input)) {
+    const parts = input.split(".").map(Number);
+    if (parts.every((p) => p >= 0 && p <= 255)) {
+      return { isIp: true, ipv4: [input], ipv6: [] };
+    }
+  }
+
+  // IPv6 (full or compressed) - contains only colons and hex, no dots
+  // But exclude IPv4-mapped which contains dots
+  if (input.includes(":") && !input.includes(".")) {
+    // Basic IPv6 validation: try to parse
+    try {
+      // Validate it's a plausible IPv6 by checking it can be expanded
+      const expanded = expandIPv6ForValidation(input);
+      if (expanded) {
+        return { isIp: true, ipv4: [], ipv6: [input] };
+      }
+    } catch {
+      // Not a valid IPv6
+    }
+  }
+
+  // IPv4-mapped IPv6: ::ffff:x.x.x.x or 0:0:0:0:0:ffff:x.x.x.x
+  // Contains both colons and dots
+  if (input.includes(":") && input.includes(".")) {
+    // Check for IPv4-mapped prefix
+    const mappedMatch = input.match(/^(?:::ffff:|0:0:0:0:0:ffff:)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i);
+    if (mappedMatch) {
+      const ipv4Part = mappedMatch[1];
+      const parts = ipv4Part.split(".").map(Number);
+      if (parts.every((p) => p >= 0 && p <= 255)) {
+        return { isIp: true, ipv4: [ipv4Part], ipv6: [input] };
+      }
+    }
+    // Also check expanded form: 0:0:0:0:0:ffff:xxxx:xxxx where last 4 bytes are IPv4
+    try {
+      const expanded = expandIPv6ForValidation(input);
+      if (expanded) {
+        // Check for IPv4-mapped prefix in expanded form (first 10 bytes 0, bytes 10-11 = 0xff, 0xff)
+        const isIpv4Mapped =
+          expanded[0] === 0 &&
+          expanded[1] === 0 &&
+          expanded[2] === 0 &&
+          expanded[3] === 0 &&
+          expanded[4] === 0 &&
+          expanded[5] === 0 &&
+          expanded[6] === 0 &&
+          expanded[7] === 0 &&
+          expanded[8] === 0 &&
+          expanded[9] === 0 &&
+          expanded[10] === 0xff &&
+          expanded[11] === 0xff;
+        if (isIpv4Mapped) {
+          const ipv4Part = `${expanded[12]}.${expanded[13]}.${expanded[14]}.${expanded[15]}`;
+          return { isIp: true, ipv4: [ipv4Part], ipv6: [input] };
+        }
+        // Regular IPv6
+        return { isIp: true, ipv4: [], ipv6: [input] };
+      }
+    } catch {
+      // Not a valid IPv6
+    }
+  }
+
+  return { isIp: false, ipv4: [], ipv6: [] };
+}
+
+/**
+ * Expand IPv6 address for validation. Returns Uint8Array(16) or null if invalid.
+ * Used only for classification, not for connection.
+ */
+function expandIPv6ForValidation(addr: string): Uint8Array | null {
+  try {
+    const parts = addr.split(":");
+    let firstEmpty = -1;
+    let lastEmpty = -1;
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i] === "") {
+        if (firstEmpty === -1) firstEmpty = i;
+        lastEmpty = i;
+      }
+    }
+    const hasDoubleColon = firstEmpty !== -1;
+    const doubleColonStart = firstEmpty;
+    const doubleColonEnd = lastEmpty;
+
+    const result = new Uint8Array(16);
+    let resultIndex = 0;
+    const processPart = (part: string): boolean => {
+      if (part === "") return true;
+      const val = parseInt(part, 16);
+      if (isNaN(val) || val > 0xffff) return false;
+      if (resultIndex >= 16) return false;
+      result[resultIndex++] = (val >> 8) & 0xff;
+      result[resultIndex++] = val & 0xff;
+      return true;
+    };
+    if (hasDoubleColon) {
+      for (let i = 0; i < doubleColonStart; i++) {
+        if (!processPart(parts[i])) return null;
+      }
+      let groupsAfter = 0;
+      for (let i = doubleColonEnd + 1; i < parts.length; i++) {
+        if (parts[i] !== "") groupsAfter++;
+      }
+      const groupsBefore = resultIndex / 2;
+      const zeroGroups = 8 - groupsBefore - groupsAfter;
+      if (zeroGroups < 1) return null;
+      resultIndex += zeroGroups * 2;
+      for (let i = doubleColonEnd + 1; i < parts.length; i++) {
+        if (!processPart(parts[i])) return null;
+      }
+    } else {
+      if (parts.length !== 8) return null;
+      for (const part of parts) {
+        if (!processPart(part)) return null;
+      }
+    }
+    if (resultIndex !== 16) return null;
+    return result;
+  } catch {
+    return null;
+  }
 }
 
 /**

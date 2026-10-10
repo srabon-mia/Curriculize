@@ -18,7 +18,7 @@ import {
   AcquisitionError,
   isAcquisitionError,
 } from "./errors";
-import { resolveAndValidate, canReuseResolution, ResolvedHost } from "./dns";
+import { resolveAndValidate, ResolvedHost } from "./dns";
 import type { AcquisitionOptions, AcquiredPage, RedirectHop } from "./types";
 import { DEFAULT_ACQUISITION_OPTIONS } from "./types";
 export { DEFAULT_ACQUISITION_OPTIONS } from "./types";
@@ -101,7 +101,7 @@ export function validateRedirectUrl(
   currentUrl: string,
   currentResolved: ResolvedHost,
   options: Required<AcquisitionOptions>
-): { canonical: CanonicalUrl; resolved: ResolvedHost } | AcquisitionError {
+): { canonical: CanonicalUrl } | AcquisitionError {
   // Parse the redirect location (may be relative)
   let absoluteUrl: string;
   try {
@@ -117,28 +117,14 @@ export function validateRedirectUrl(
   }
 
   // Validate URL structure - skip hostname blocklist if pre-resolved IPs were provided
-  // (same host redirects should reuse the validated resolution)
-  const skipHostBlocklist = options.preResolvedIps && canReuseResolution(currentResolved.hostname, canonical.parsed.hostname);
+  // (caller will re-resolve and re-validate regardless)
+  const skipHostBlocklist = options.preResolvedIps !== undefined;
   const validation = validateUrl(canonical.url, skipHostBlocklist ? { skipHostnameBlocklist: true } : undefined);
   if (!validation.valid) {
     return createUnsafeRedirectError(canonical.url, validation.reason || "Redirect URL validation failed");
   }
 
-  // Check if hostname changed
-  const currentHost = currentResolved.hostname;
-  const redirectHost = canonical.parsed.hostname;
-
-  let resolved: ResolvedHost;
-  if (canReuseResolution(currentHost, redirectHost)) {
-    // Same hostname - reuse validated resolution
-    resolved = currentResolved;
-  } else {
-    // Different hostname - MUST re-resolve and revalidate
-    // This is a synchronous check; actual resolution happens in the caller
-    resolved = { hostname: redirectHost, ipv4: [], ipv6: [], valid: false };
-  }
-
-  return { canonical, resolved };
+  return { canonical };
 }
 
 /**
@@ -242,23 +228,25 @@ export async function acquireUrl(
           throw redirectValidation;
         }
 
-        const { canonical, resolved: redirectResolved } = redirectValidation;
+        const { canonical } = redirectValidation;
 
-        // If hostname changed, resolve and validate the new hostname
-        if (!canReuseResolution(currentResolved!.hostname, canonical.parsed.hostname)) {
-          const newResolved = await resolveAndValidate(canonical.parsed.hostname);
-          if (!newResolved.valid) {
-            redirectChain.push({
-              url: canonical.url,
-              canonicalUrl: canonical,
-              statusCode,
-              validated: false,
-              blockedReason: newResolved.error?.message,
-            });
-            throw newResolved.error!;
-          }
-          currentResolved = newResolved;
+        // Re-resolve and re-validate DNS for EVERY redirect hop.
+        // This mitigates DNS rebinding where the same hostname resolves to
+        // different IPs between validation and connection.
+        // Note: A TOCTOU window still exists between resolveAndValidate() and fetch();
+        // fully eliminating it would require a custom HTTP client that binds to a validated IP.
+        const newResolved = await resolveAndValidate(canonical.parsed.hostname);
+        if (!newResolved.valid) {
+          redirectChain.push({
+            url: canonical.url,
+            canonicalUrl: canonical,
+            statusCode,
+            validated: false,
+            blockedReason: newResolved.error?.message,
+          });
+          throw newResolved.error!;
         }
+        currentResolved = newResolved;
 
         // Record successful redirect hop
         redirectChain.push({
