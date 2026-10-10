@@ -11,8 +11,8 @@ import type { AcquiredPage } from "@/lib/acquisition/types";
 import type { StructuredContent } from "@/lib/acquisition/structuredExtract";
 import type { EducationalEvidence } from "@/lib/evidence/types";
 import { MockSupabaseClient } from "@/lib/phase6-integration/mock-supabase";
-
 import type { VerificationResult } from "@/lib/verification/types";
+import { PersistenceError } from "@/lib/persistence/types";
 
 export interface PipelineResult {
   cleanedDocument: ReturnType<typeof buildCleanedDocument>;
@@ -165,7 +165,9 @@ async function mockPersistVerifiedResource(
     if (error) {
       throw new PersistenceError("DOMAIN_SCORE_LOOKUP_FAILED", "Failed", { domain: sourceDomain, error: error.message });
     }
-    domainScore = data?.score ?? 2;
+    // Mock returns DbRow which has unknown properties; narrow for the expected shape
+    const domainScoreData = data as { score: number } | null;
+    domainScore = domainScoreData?.score ?? 2;
   }
 
   const licenseStatus = callerMetadata?.licenseStatus ?? "link_only";
@@ -274,7 +276,11 @@ async function mockPersistVerifiedResource(
         throw new PersistenceError("RESOURCE_INSERT_FAILED", "Failed to insert resource", { error: insertError.message });
       }
 
-      resourceId = created.id ?? "";
+      if (!created) {
+        throw new PersistenceError("RESOURCE_INSERT_FAILED", "Insert succeeded but no resource returned");
+      }
+      // created is typed as TRow | null where TRow has id: string
+      resourceId = (created as { id: string }).id;
       resourceIsNew = true;
     }
 
@@ -324,7 +330,11 @@ async function mockPersistVerifiedResource(
       throw new PersistenceError("VERIFICATION_INSERT_FAILED", "Failed to insert verification record", { error: vrError.message });
     }
 
-    if (!existingVerificationId) existingVerificationId = vr.id;
+    if (!vr) {
+      throw new PersistenceError("VERIFICATION_INSERT_FAILED", "Insert succeeded but no verification record returned");
+    }
+
+    if (!existingVerificationId) existingVerificationId = (vr as { id: string }).id;
     isExactRetry = false;
   }
 
@@ -351,6 +361,10 @@ async function mockPersistVerifiedResource(
         throw new PersistenceError("MAPPING_UPSERT_FAILED", "Failed to upsert resource mapping", { error: mappingError.message });
       }
 
+      if (!newMapping) {
+        throw new PersistenceError("MAPPING_UPSERT_FAILED", "Insert succeeded but no mapping returned");
+      }
+
       resourceMapping = { id: newMapping.id, resourceId, understandingId: target.understandingId, coverageConfidence: "medium", isNew: true };
     } else {
       resourceMapping = { id: existingMapping.id, resourceId, understandingId: target.understandingId, coverageConfidence: "medium", isNew: false };
@@ -367,21 +381,42 @@ async function mockPersistVerifiedResource(
     throw new PersistenceError("RESOURCE_LOOKUP_FAILED", "Failed to fetch final resource", { error: finalError.message });
   }
 
+  if (!finalResource) {
+    throw new PersistenceError("RESOURCE_LOOKUP_FAILED", "Resource not found after persistence");
+  }
+
+  // finalResource from mock has DbRow type (string index signature), access properties safely
+  const resourceRow = finalResource as {
+    id: string;
+    url: string;
+    title: string;
+    source_domain: string | null;
+    resource_type: string;
+    license_status: "cc_open" | "link_only" | "unknown_review_needed";
+    embed_allowed: boolean;
+    content_type_verified: boolean;
+    ai_note: string | null;
+    status: "draft" | "approved" | "rejected";
+    node_id: string | null;
+    major_understanding_id: string | null;
+    created_at: string;
+  };
+
   return {
     resource: {
-      id: finalResource.id,
-      url: finalResource.url,
-      title: finalResource.title,
-      sourceDomain: finalResource.source_domain,
-      resourceType: finalResource.resource_type,
-      licenseStatus: finalResource.license_status,
-      embedAllowed: finalResource.embed_allowed,
-      contentTypeVerified: finalResource.content_type_verified,
-      aiNote: finalResource.ai_note,
-      status: finalResource.status,
-      nodeId: finalResource.node_id,
-      majorUnderstandingId: finalResource.major_understanding_id,
-      createdAt: finalResource.created_at,
+      id: resourceRow.id,
+      url: resourceRow.url,
+      title: resourceRow.title,
+      sourceDomain: resourceRow.source_domain,
+      resourceType: resourceRow.resource_type,
+      licenseStatus: resourceRow.license_status,
+      embedAllowed: resourceRow.embed_allowed,
+      contentTypeVerified: resourceRow.content_type_verified,
+      aiNote: resourceRow.ai_note,
+      status: resourceRow.status,
+      nodeId: resourceRow.node_id,
+      majorUnderstandingId: resourceRow.major_understanding_id,
+      createdAt: resourceRow.created_at,
       isNew: resourceIsNew,
     },
     verificationRecord: {

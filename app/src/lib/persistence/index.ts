@@ -35,6 +35,7 @@ async function getDomainScore(supabase: ReturnType<typeof getServiceClient>, dom
     .from("domain_scores")
     .select("score")
     .eq("domain", domain)
+    .returns<{ score: number }[]>()
     .maybeSingle();
 
   if (error) {

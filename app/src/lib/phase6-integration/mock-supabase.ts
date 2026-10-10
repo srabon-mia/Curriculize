@@ -12,7 +12,10 @@ interface DbRow {
   [key: string]: unknown;
 }
 
-class MockQueryBuilder {
+// Type for tracking the expected row shape from .returns() - can be a single row or array
+type RowShape = DbRow | DbRow[];
+
+class MockQueryBuilder<TRow extends RowShape = DbRow> {
   private tables: Map<string, DbRow[]>;
   private tableName: string;
   private selectedColumns: string = "*";
@@ -72,6 +75,12 @@ class MockQueryBuilder {
     return this;
   }
 
+  // No-op at runtime, exists for type compatibility with Supabase PostgrestBuilder
+  // Returns a new builder with the specified row type for type-safe chaining
+  returns<TNewRow extends RowShape>(): MockQueryBuilder<TNewRow> {
+    return this as unknown as MockQueryBuilder<TNewRow>;
+  }
+
   update(data: DbRow): this {
     // Store update data; applied when terminal op (single/execute) runs
     this.isUpdateChain = true;
@@ -79,7 +88,7 @@ class MockQueryBuilder {
     return this;
   }
 
-  maybeSingle(): { data: DbRow | null; error: Error | null } {
+  maybeSingle(): { data: TRow | null; error: Error | null } {
     if (this.isUpdateChain && this.insertData) {
       // Update chain: apply to all matching rows
       const filtered = this._filter();
@@ -87,7 +96,7 @@ class MockQueryBuilder {
         Object.assign(row, this.insertData);
       }
       const result = filtered[0]
-        ? { data: this._project({ ...filtered[0], ...this.insertData }), error: null }
+        ? { data: this._project({ ...filtered[0], ...this.insertData }) as TRow, error: null }
         : { data: null, error: null };
       this._resetChain();
       return result;
@@ -98,17 +107,17 @@ class MockQueryBuilder {
       const row = table.find(r => r.id === this.lastInsertId);
       if (row) {
         this._resetChain();
-        return { data: this._project({ ...row }), error: null };
+        return { data: this._project({ ...row }) as TRow, error: null };
       }
       this._resetChain();
       return { data: null, error: null };
     }
     const results = this._filter();
     if (results.length === 0) return { data: null, error: null };
-    return { data: this._project(results[0]), error: null };
+    return { data: this._project(results[0]) as TRow, error: null };
   }
 
-  single(): { data: DbRow | null; error: Error | null } {
+  single(): { data: TRow | null; error: Error | null } {
     if (this.isUpdateChain && this.insertData) {
       // Update chain: apply to all matching rows
       const filtered = this._filter();
@@ -116,7 +125,7 @@ class MockQueryBuilder {
         Object.assign(row, this.insertData);
       }
       const result = filtered[0]
-        ? { data: this._project({ ...filtered[0], ...this.insertData }), error: null }
+        ? { data: this._project({ ...filtered[0], ...this.insertData }) as TRow, error: null }
         : { data: null, error: new Error("No rows found") };
       this._resetChain();
       return result;
@@ -127,7 +136,7 @@ class MockQueryBuilder {
       const row = table.find(r => r.id === this.lastInsertId);
       if (row) {
         this._resetChain();
-        return { data: this._project({ ...row }), error: null };
+        return { data: this._project({ ...row }) as TRow, error: null };
       }
       this._resetChain();
       return { data: null, error: new Error("No rows found") };
@@ -135,17 +144,17 @@ class MockQueryBuilder {
     const results = this._filter();
     if (results.length === 0) return { data: null, error: new Error("No rows found") };
     if (results.length > 1) return { data: null, error: new Error("Multiple rows") };
-    return { data: this._project(results[0]), error: null };
+    return { data: this._project(results[0]) as TRow, error: null };
   }
 
-  execute(): { data: DbRow[]; error: Error | null } {
+  execute(): { data: TRow[]; error: Error | null } {
     if (this.isUpdateChain && this.insertData) {
       // Update chain: apply to all matching rows
       const filtered = this._filter();
       for (const row of filtered) {
         Object.assign(row, this.insertData);
       }
-      const result = { data: filtered.map((r) => this._project({ ...r, ...this.insertData! })), error: null };
+      const result = { data: filtered.map((r) => this._project({ ...r, ...this.insertData! })) as TRow[], error: null };
       this._resetChain();
       return result;
     }
@@ -155,12 +164,12 @@ class MockQueryBuilder {
       const row = table.find(r => r.id === this.lastInsertId);
       if (row) {
         this._resetChain();
-        return { data: [this._project({ ...row })], error: null };
+        return { data: [this._project({ ...row }) as TRow], error: null };
       }
       this._resetChain();
       return { data: [], error: null };
     }
-    return { data: this._filter().map((r) => this._project(r)), error: null };
+    return { data: this._filter().map((r) => this._project(r) as TRow), error: null };
   }
 
   private _resetChain(): void {
