@@ -170,10 +170,10 @@ class MockQueryBuilder {
   }
 
   private _filter(): DbRow[] {
-    let result = [...this.getTableRows()];
+    let result: DbRow[] = [...this.getTableRows()];
 
     for (const { col, val } of this.eqFilters) {
-      result = result.filter((row) => {
+      result = result.filter((row: DbRow) => {
         if (col.includes("->>")) {
           const parts = col.split("->>");
           const jsonCol = parts[0];
@@ -187,7 +187,9 @@ class MockQueryBuilder {
               return false;
             }
           }
-          return (row as DbRow)[`_${jsonCol}_parsed`]?.[jsonKey] === val;
+          const parsedKey = `_${jsonCol}_parsed` as keyof DbRow;
+          const parsedObj = row[parsedKey] as Record<string, unknown> | undefined;
+          return parsedObj?.[jsonKey] === val;
         }
         return row[col] === val;
       });
@@ -243,7 +245,7 @@ export class MockSupabaseClient {
 
   insert(tableName: string, row: DbRow): DbRow {
     const table = this.tables.get(tableName) ?? [];
-    const newRow = { ...row, id: row.id ?? `mock-${table.length + 1}` };
+    const newRow: DbRow = { ...row, id: row.id ?? `mock-${table.length + 1}` };
     if (!newRow.created_at) newRow.created_at = new Date().toISOString();
     table.push(newRow);
     this.tables.set(tableName, table);
