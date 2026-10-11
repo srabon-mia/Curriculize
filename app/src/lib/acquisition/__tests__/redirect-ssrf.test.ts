@@ -144,3 +144,127 @@ describe("Acquisition redirect-chain contract", () => {
     expect(true).toBe(true);
   });
 });
+
+describe("preResolvedIps SSRF validation", () => {
+  test("rejects preResolvedIps with private IPv4", async () => {
+    await expect(
+      acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: ["10.0.0.1"], ipv6: [] },
+      })
+    ).rejects.toThrow("preResolvedIps contains blocked IP: 10.0.0.1");
+  });
+
+  test("rejects preResolvedIps with loopback IPv4", async () => {
+    await expect(
+      acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: ["127.0.0.1"], ipv6: [] },
+      })
+    ).rejects.toThrow("preResolvedIps contains blocked IP: 127.0.0.1");
+  });
+
+  test("rejects preResolvedIps with link-local IPv4", async () => {
+    await expect(
+      acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: ["169.254.1.1"], ipv6: [] },
+      })
+    ).rejects.toThrow("preResolvedIps contains blocked IP: 169.254.1.1");
+  });
+
+  test("rejects preResolvedIps with cloud metadata IPv4", async () => {
+    await expect(
+      acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: ["169.254.169.254"], ipv6: [] },
+      })
+    ).rejects.toThrow("preResolvedIps contains blocked IP: 169.254.169.254");
+  });
+
+  test("rejects preResolvedIps with IPv6 loopback", async () => {
+    await expect(
+      acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: [], ipv6: ["::1"] },
+      })
+    ).rejects.toThrow("preResolvedIps contains blocked IP: ::1");
+  });
+
+  test("rejects preResolvedIps with IPv6 link-local", async () => {
+    await expect(
+      acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: [], ipv6: ["fe80::1"] },
+      })
+    ).rejects.toThrow("preResolvedIps contains blocked IP: fe80::1");
+  });
+
+  test("rejects preResolvedIps with IPv6 ULA", async () => {
+    await expect(
+      acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: [], ipv6: ["fd00::1"] },
+      })
+    ).rejects.toThrow("preResolvedIps contains blocked IP: fd00::1");
+  });
+
+  test("rejects preResolvedIps with IPv4-mapped private IPv6", async () => {
+    await expect(
+      acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: [], ipv6: ["::ffff:10.0.0.1"] },
+      })
+    ).rejects.toThrow("preResolvedIps contains blocked IP: ::ffff:10.0.0.1");
+  });
+
+  test("rejects preResolvedIps with IPv4-mapped loopback IPv6", async () => {
+    await expect(
+      acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: [], ipv6: ["::ffff:127.0.0.1"] },
+      })
+    ).rejects.toThrow("preResolvedIps contains blocked IP: ::ffff:127.0.0.1");
+  });
+
+  test("rejects preResolvedIps with IPv4-mapped metadata IPv6", async () => {
+    await expect(
+      acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: [], ipv6: ["::ffff:169.254.169.254"] },
+      })
+    ).rejects.toThrow("preResolvedIps contains blocked IP: ::ffff:169.254.169.254");
+  });
+
+  test("allows preResolvedIps with public IPv4 (no blocked IP error)", async () => {
+    // Should not throw blocked IP error for public IPs
+    // (may succeed or fail for other reasons like DNS/connection)
+    try {
+      await acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: ["8.8.8.8"], ipv6: [] },
+      });
+    } catch (err: unknown) {
+      // If it throws, it should NOT be a blocked IP error
+      if (err instanceof AcquisitionError) {
+        expect(err.code).not.toBe("BLOCKED_URL");
+        expect(err.message).not.toContain("preResolvedIps contains blocked IP");
+      }
+    }
+  });
+
+  test("allows preResolvedIps with public IPv6 (no blocked IP error)", async () => {
+    try {
+      await acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: [], ipv6: ["2001:4860:4860::8888"] },
+      });
+    } catch (err: unknown) {
+      if (err instanceof AcquisitionError) {
+        expect(err.code).not.toBe("BLOCKED_URL");
+        expect(err.message).not.toContain("preResolvedIps contains blocked IP");
+      }
+    }
+  });
+
+  test("allows preResolvedIps with public IPv4-mapped IPv6 (no blocked IP error)", async () => {
+    try {
+      await acquireUrl("http://example.com", {
+        preResolvedIps: { ipv4: [], ipv6: ["::ffff:8.8.8.8"] },
+      });
+    } catch (err: unknown) {
+      if (err instanceof AcquisitionError) {
+        expect(err.code).not.toBe("BLOCKED_URL");
+        expect(err.message).not.toContain("preResolvedIps contains blocked IP");
+      }
+    }
+  });
+});

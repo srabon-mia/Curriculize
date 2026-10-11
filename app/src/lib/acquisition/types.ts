@@ -78,7 +78,7 @@ export interface AcquisitionOptions {
   userAgent?: string;
   /** Whether to follow redirects (default: true) */
   followRedirects?: boolean;
-  /** Pre-resolved IPs to use (for testing or pinning) */
+  /** Pre-resolved IPs to use for IP pinning. When provided, all IPs are validated against the SSRF blocklist before use. */
   preResolvedIps?: { ipv4: string[]; ipv6: string[] };
 }
 

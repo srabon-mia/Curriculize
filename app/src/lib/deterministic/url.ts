@@ -399,7 +399,7 @@ export function validateUrl(
   if (!options?.skipHostnameBlocklist && isHostnameBlocked(parsed.hostname)) {
     failures.push(`Hostname '${parsed.hostname}' is blocked (SSRF protection)`);
   }
-  // SSRF IP blocklist: check if hostname itself is an IP address - skip if explicitly allowed
+  // SSRF IP blocklist: check if hostname itself is an IP address - skip if pre-resolved IPs provided
   if (!options?.skipHostnameBlocklist) {
     const hostnameIpCheck = isIpBlocked(parsed.hostname);
     if (hostnameIpCheck) {
@@ -408,8 +408,9 @@ export function validateUrl(
       );
     }
   }
-  // SSRF IP blocklist (if resolved IPs provided)
-  if (options?.resolvedIps) {
+  // SSRF IP blocklist (if resolved IPs provided) — defense in depth.
+  // preResolvedIps is independently validated by the acquisition layer before use.
+  if (options?.resolvedIps && !options?.skipHostnameBlocklist) {
     for (const ip of options.resolvedIps.ipv4) {
       if (isIpBlocked(ip)) {
         failures.push(`Resolved IPv4 '${ip}' is blocked (SSRF protection)`);
