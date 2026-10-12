@@ -81,6 +81,14 @@ class MockQueryBuilder<TRow extends RowShape = DbRow> {
     return this as unknown as MockQueryBuilder<TNewRow>;
   }
 
+  /** Make the query builder awaitable (thenable) for `await supabase.from(...).select().eq(...)` */
+  then<TResult1, TResult2>(
+    onFulfilled?: (value: { data: TRow[]; error: Error | null }) => TResult1 | PromiseLike<TResult1>,
+    onRejected?: (reason: unknown) => TResult2 | PromiseLike<TResult2>
+  ): Promise<TResult1 | TResult2> {
+    return Promise.resolve(this.execute()).then(onFulfilled, onRejected);
+  }
+
   update(data: DbRow): this {
     // Store update data; applied when terminal op (single/execute) runs
     this.isUpdateChain = true;
@@ -247,6 +255,11 @@ export class MockSupabaseClient {
     this.tables.set("resource_mappings", []);
     this.tables.set("domain_scores", []);
   }
+
+  // Auth mock for testing routes that use authentication
+  auth = {
+    getUser: vi.fn().mockResolvedValue({ data: { user: { id: "test-user-id", email: "test@example.com" } }, error: null }),
+  };
 
   from(tableName: string): MockQueryBuilder {
     return new MockQueryBuilder(this.tables, tableName);

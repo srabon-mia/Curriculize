@@ -121,7 +121,8 @@ async function createResource(
   supabase: ReturnType<typeof getServiceClient>,
   input: PersistenceInput,
   domainScore: number,
-  embedAllowed: boolean
+  embedAllowed: boolean,
+  verificationStatus: "verified" | "failed"
 ): Promise<{ id: string; created_at: string; isNew: true }> {
   const { acquiredPage, structuredContent, target, callerMetadata } = input;
 
@@ -142,7 +143,7 @@ async function createResource(
     resource_type: resourceType,
     license_status: licenseStatus,
     embed_allowed: embedAllowed,
-    content_type_verified: true,
+    content_type_verified: verificationStatus === "verified",
     ai_note: aiNote,
     status: "draft" as const,
   };
@@ -169,7 +170,8 @@ async function updateResource(
   resourceId: string,
   input: PersistenceInput,
   domainScore: number,
-  embedAllowed: boolean
+  embedAllowed: boolean,
+  verificationStatus: "verified" | "failed"
 ): Promise<{ id: string; isNew: false }> {
   const { acquiredPage, structuredContent, callerMetadata } = input;
 
@@ -186,7 +188,7 @@ async function updateResource(
     resource_type: resourceType,
     license_status: licenseStatus,
     embed_allowed: embedAllowed,
-    content_type_verified: true,
+    content_type_verified: verificationStatus === "verified",
     ai_note: aiNote,
     // status remains unchanged (draft) - 6D never changes status
   };
@@ -408,7 +410,7 @@ export async function persistVerifiedResource(input: PersistenceInput): Promise<
 
   if (!isExactRetry) {
     // Not an exact retry - need to create or reuse resource, then create verification record
-    const isVerified = verificationStatus === "verified";
+    const isVerified = true;
 
     if (existingResource) {
       // Resource exists
@@ -417,7 +419,7 @@ export async function persistVerifiedResource(input: PersistenceInput): Promise<
         const hasContentHash = await resourceHasContentHash(supabase, existingResource.id, contentHash);
         if (!hasContentHash) {
           // Verified + NEW content hash → update resource representation
-          const updated = await updateResource(supabase, existingResource.id, input, domainScore, embedAllowed);
+          const updated = await updateResource(supabase, existingResource.id, input, domainScore, embedAllowed, verificationStatus);
           resourceId = updated.id;
           resourceIsNew = updated.isNew;
         } else {
@@ -434,7 +436,7 @@ export async function persistVerifiedResource(input: PersistenceInput): Promise<
       }
     } else {
       // No existing resource - create new (regardless of verification status, to attach evidence)
-      const created = await createResource(supabase, input, domainScore, embedAllowed);
+      const created = await createResource(supabase, input, domainScore, embedAllowed, verificationStatus);
       resourceId = created.id;
       resourceIsNew = created.isNew;
     }

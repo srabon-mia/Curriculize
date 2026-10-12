@@ -242,12 +242,95 @@ describe("Phase 6 Integration Pipeline (5 → 6A → 6B → 6C → 6D)", () => {
       expect(result.verificationRecord.status).toBe("failed");
       expect(result.verificationRecord.isExactRetry).toBe(false);
 
+      // content_type_verified should be false for failed verification (bug fix)
+      expect(result.resource.contentTypeVerified).toBe(false);
+
       // Evidence persisted even for failed
       const vrRows = mockClient.getRows("verification_records");
       expect(vrRows.length).toBe(1);
       expect(vrRows[0].content_evidence).toBe(
         JSON.stringify(pipeline.educationalEvidence.interpreted)
       );
+    });
+
+    test("TEST 2b — New resource + successful verification → content_type_verified is true", async () => {
+      const fixture = FIXTURE_MAP.STANDARD_EDUCATIONAL;
+      const target = { nodeId: "node-verified-new" };
+      const mockClient = new MockSupabaseClient();
+
+      const { result, pipeline } = await runFullPipelineWithMockDb(
+        fixture,
+        target,
+        "job-verified-new",
+        undefined,
+        5,
+        mockClient
+      );
+
+      expect(pipeline.verificationResult.status).toBe("verified");
+      expect(result.resource.isNew).toBe(true);
+      expect(result.resource.contentTypeVerified).toBe(true);
+      expect(result.verificationRecord.status).toBe("verified");
+    });
+
+    test("TEST 2c — Existing verified resource + failed verification → content_type_verified remains true", async () => {
+      const fixture = FIXTURE_MAP.STANDARD_EDUCATIONAL;
+      const target = { nodeId: "node-fail-existing" };
+      const mockClient = new MockSupabaseClient();
+
+      // First: create a verified resource
+      const { result: verifiedResult } = await runFullPipelineWithMockDb(
+        fixture, target, "job-verified", undefined, 5, mockClient
+      );
+      expect(verifiedResult.resource.isNew).toBe(true);
+      expect(verifiedResult.resource.contentTypeVerified).toBe(true);
+      const originalTitle = verifiedResult.resource.title;
+
+      // Second: same target, but empty content (fails verification)
+      const { result: failedResult } = await runFullPipelineWithMockDb(
+        FIXTURE_MAP.EMPTY_CONTENT, target, "job-failed", undefined, 5, mockClient
+      );
+
+      // Existing resource should NOT be updated or downgraded
+      expect(failedResult.resource.isNew).toBe(false);
+      expect(failedResult.resource.title).toBe(originalTitle);
+      expect(failedResult.resource.status).toBe("draft");
+      expect(failedResult.resource.contentTypeVerified).toBe(true); // unchanged
+      expect(failedResult.verificationRecord.status).toBe("failed");
+
+      const vrRows = mockClient.getRows("verification_records");
+      expect(vrRows.length).toBe(2);
+      expect(vrRows.some((r) => r.status === "verified")).toBe(true);
+      expect(vrRows.some((r) => r.status === "failed")).toBe(true);
+    });
+
+    test("TEST 2d — Existing resource + successful verification with new content hash → content_type_verified is true", async () => {
+      const target = { nodeId: "node-content-change" };
+      const mockClient = new MockSupabaseClient();
+
+      // First acquisition with verified content
+      const { result: resultA } = await runFullPipelineWithMockDb(
+        FIXTURE_MAP.STANDARD_EDUCATIONAL, target, "job-content-A", undefined, 5, mockClient
+      );
+      expect(resultA.resource.isNew).toBe(true);
+      expect(resultA.resource.contentTypeVerified).toBe(true);
+
+      // Second acquisition: different content (verified) → resource should be updated
+      const { result: resultB } = await runFullPipelineWithMockDb(
+        FIXTURE_MAP.CHANGED_CONTENT, target, "job-content-B", undefined, 5, mockClient
+      );
+
+      expect(resultB.resource.isNew).toBe(false);
+      expect(resultB.resource.contentTypeVerified).toBe(true);
+      expect(resultB.resource.title).toBe("Quadratic Equations - Updated");
+
+      const vrRows = mockClient.getRows("verification_records");
+      expect(vrRows.length).toBe(2);
+      expect(vrRows[0].content_hash).toBe(FIXTURE_MAP.STANDARD_EDUCATIONAL.contentHash);
+      expect(vrRows[1].content_hash).toBe(FIXTURE_MAP.CHANGED_CONTENT.contentHash);
+
+      // Same resource, different VRs
+      expect(vrRows[0].resource_id).toBe(vrRows[1].resource_id);
     });
 
     test("TEST 3 — Same acquisition job + same content hash (exact retry)", async () => {

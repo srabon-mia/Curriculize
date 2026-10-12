@@ -230,7 +230,7 @@ async function mockPersistVerifiedResource(
               resource_type: callerMetadata?.resourceType ?? "other",
               license_status: licenseStatus,
               embed_allowed: embedAllowed,
-              content_type_verified: true,
+              content_type_verified: isVerified,
               ai_note: callerMetadata?.aiNote ?? null,
             })
             .eq("id", existingResource.id)
@@ -262,7 +262,7 @@ async function mockPersistVerifiedResource(
         resource_type: callerMetadata?.resourceType ?? "other",
         license_status: licenseStatus,
         embed_allowed: embedAllowed,
-        content_type_verified: true,
+        content_type_verified: isVerified,
         ai_note: callerMetadata?.aiNote ?? null,
         status: "draft" as const,
       };
