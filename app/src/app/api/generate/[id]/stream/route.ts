@@ -300,7 +300,7 @@ export async function GET(
                 embed_allowed: false,
                 ai_note: c.ai_note ?? null,
                 content_type_verified: true,
-                status: "approved",
+                status: "draft",
               }));
 
             if (resources.length > 0) {
@@ -418,7 +418,7 @@ export async function GET(
                   embed_allowed: false,
                   ai_note: candidate.ai_note ?? null,
                   content_type_verified: true,
-                  status: "approved",
+                  status: "draft",
                 }));
 
                 if (resources.length > 0) {
