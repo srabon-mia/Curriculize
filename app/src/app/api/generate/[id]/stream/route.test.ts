@@ -329,7 +329,7 @@ describe("Generation Stream - Resource Status Regression (Route Integration)", (
       for (const resource of call.resources) {
         expect(resource.status).toBe("draft");
         expect(resource.status).not.toBe("approved");
-        expect(resource.content_type_verified).toBe(true);
+        expect(resource.content_type_verified).toBe(false);
         expect(resource.node_id).toBeTruthy();
         expect(resource.major_understanding_id).toBeNull();
       }
@@ -352,7 +352,7 @@ describe("Generation Stream - Resource Status Regression (Route Integration)", (
       for (const resource of call.resources) {
         expect(resource.status).toBe("draft");
         expect(resource.status).not.toBe("approved");
-        expect(resource.content_type_verified).toBe(true);
+        expect(resource.content_type_verified).toBe(false);
         expect(resource.major_understanding_id).toBeTruthy();
         expect(resource.node_id).toBeNull();
       }

@@ -299,7 +299,7 @@ export async function GET(
                 license_status: c.license_status ?? "link_only",
                 embed_allowed: false,
                 ai_note: c.ai_note ?? null,
-                content_type_verified: true,
+                content_type_verified: false, // Phase 12: replace with persistVerifiedResource() after verified acquisition pipeline exists
                 status: "draft",
               }));
 
@@ -417,7 +417,7 @@ export async function GET(
                   license_status: candidate.license_status ?? "link_only",
                   embed_allowed: false,
                   ai_note: candidate.ai_note ?? null,
-                  content_type_verified: true,
+                  content_type_verified: false, // Phase 12: replace with persistVerifiedResource() after verified acquisition pipeline exists
                   status: "draft",
                 }));
 
