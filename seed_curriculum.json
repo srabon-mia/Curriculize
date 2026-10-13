@@ -28,7 +28,26 @@
         { "key": "I.13", "code": "3.1n", "description": "The average atomic mass of an element is the weighted average of the masses of its naturally occurring isotopes." }
       ],
       "real_world_connections": ["flame tests", "neon lights", "fireworks", "forensic analysis", "spectral analysis of stars", "lasers"],
-      "resources": []
+      "resources": [
+        {
+          "url": "https://www.mrpalermo.com/unit-6-subatomic-particles.html",
+          "title": "Mr. Palermo: Subatomic Particles Review",
+          "resource_type": "text",
+          "source_domain": "mrpalermo.com",
+          "license_status": "cc_open",
+          "seed_key": "atomic-1",
+          "ai_note": "[SEED:demo-2026] Subatomic particles, nuclear structure, isotopes — matches NYSED 3.1c–3.1f, 3.1m–3.1n"
+        },
+        {
+          "url": "https://openstax.org/books/chemistry-2e/pages/2-introduction",
+          "title": "OpenStax Chemistry 2e: Chapter 2 Introduction — Atoms, Molecules, and Ions",
+          "resource_type": "textbook",
+          "source_domain": "openstax.org",
+          "license_status": "cc_open",
+          "seed_key": "atomic-2",
+          "ai_note": "[SEED:demo-2026] Atomic theory, subatomic particles, nuclear structure — matches NYSED 3.1a–3.1c, 3.1h"
+        }
+      ]
     },
     {
       "node_id": "topic-2",
@@ -46,7 +65,26 @@
         { "key": "II.9", "code": "3.1bb", "description": "The succession of elements across the same period demonstrates the same characteristic trends." }
       ],
       "real_world_connections": ["similar properties/uses for elements in the same family", "semiconductors in solid state electronics", "alloys as superconductors", "metallurgy", "recovery of metals", "allotropes (oxygen gas vs. ozone; coal vs. graphite vs. diamond)"],
-      "resources": []
+      "resources": [
+        {
+          "url": "https://www.mrpalermo.com/unit-7-periodicity.html",
+          "title": "Mr. Palermo: Periodicity Review",
+          "resource_type": "text",
+          "source_domain": "mrpalermo.com",
+          "license_status": "cc_open",
+          "seed_key": "periodic-1",
+          "ai_note": "[SEED:demo-2026] Periodic trends, groups, periods, valence electrons — matches NYSED 3.1y, 3.1z, 3.1aa, 3.1bb"
+        },
+        {
+          "url": "https://openstax.org/books/chemistry-2e/pages/2-5-the-periodic-table",
+          "title": "OpenStax Chemistry 2e: 2.5 The Periodic Table",
+          "resource_type": "textbook",
+          "source_domain": "openstax.org",
+          "license_status": "cc_open",
+          "seed_key": "periodic-2",
+          "ai_note": "[SEED:demo-2026] Periodic table organization, periodic trends — matches NYSED 3.1y, 3.1z, 3.1aa, 3.1bb"
+        }
+      ]
     },
     {
       "node_id": "topic-3",
@@ -63,7 +101,26 @@
         { "key": "III.8", "code": "3.2b", "description": "Types of chemical reactions include synthesis, decomposition, single replacement, and double replacement." }
       ],
       "real_world_connections": ["reading food/beverage labels", "recovery of metals from ores", "electroplating", "corrosion", "precipitation reactions", "dangers of mixing household chemicals (bleach + ammonia)", "airbag inflation explosives"],
-      "resources": []
+      "resources": [
+        {
+          "url": "https://www.mrpalermo.com/unit-9-moles--stoichiometry.html",
+          "title": "Mr. Palermo: Moles & Stoichiometry Review",
+          "resource_type": "text",
+          "source_domain": "mrpalermo.com",
+          "license_status": "cc_open",
+          "seed_key": "stoich-1",
+          "ai_note": "[SEED:demo-2026] Mole concept, molar mass, stoichiometry, reaction types — matches NYSED 3.3a–3.3f, 3.2b"
+        },
+        {
+          "url": "https://openstax.org/books/chemistry-2e/pages/3-1-formula-mass-and-the-mole-concept",
+          "title": "OpenStax Chemistry 2e: 3.1 Formula Mass and the Mole Concept",
+          "resource_type": "textbook",
+          "source_domain": "openstax.org",
+          "license_status": "cc_open",
+          "seed_key": "stoich-2",
+          "ai_note": "[SEED:demo-2026] Formula mass, molar mass, mole concept — matches NYSED 3.3e, 3.3f"
+        }
+      ]
     },
     {
       "node_id": "topic-4",

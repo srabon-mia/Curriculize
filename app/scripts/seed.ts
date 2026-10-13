@@ -58,6 +58,7 @@ async function seedCurriculum() {
         source_attribution: raw.curriculum.source_attribution,
         source_url: raw.curriculum.source_url,
         notes: raw.curriculum.notes,
+        status: "published", // ensure published for demo visibility
       })
       .eq("id", curriculumId);
     console.log(`  Updated existing curriculum (${curriculumId})`);
@@ -71,7 +72,7 @@ async function seedCurriculum() {
         source_attribution: raw.curriculum.source_attribution,
         source_url: raw.curriculum.source_url,
         notes: raw.curriculum.notes,
-        status: "draft", // stays draft until manually reviewed + published
+        status: "published", // published for demo visibility
       })
       .select("id")
       .single();
@@ -121,6 +122,88 @@ async function seedCurriculum() {
 
     console.log(`  Topic "${node.title}": ${muList.length} major understandings`);
   }
+
+  // Seed curated demo resources for topics 1-3.
+  // Uses external_key for idempotent upserts (requires migration 0004).
+  console.log("  Seeding curated demo resources...");
+  const nodeIds: string[] = [];
+  for (const node of raw.nodes) {
+    const { data: nodeRow } = await supabase
+      .from("nodes")
+      .select("id")
+      .eq("curriculum_id", curriculumId)
+      .eq("external_key", node.node_id)
+      .single();
+    if (nodeRow) nodeIds.push(nodeRow.id);
+  }
+
+  // Collect all seed resources from the JSON
+  const seedResources: Array<{
+    node_id: string;
+    external_key: string;
+    url: string;
+    title: string;
+    source_domain: string;
+    resource_type: string;
+    license_status: string;
+    ai_note: string;
+  }> = [];
+
+  for (const node of raw.nodes) {
+    const resources = node.resources ?? [];
+    const nodeId = nodeIds.find((_, i) => raw.nodes[i].node_id === node.node_id);
+    if (!nodeId) continue;
+    for (const res of resources) {
+      seedResources.push({
+        node_id: nodeId,
+        external_key: `seed:demo-2026:${node.node_id}:${res.seed_key}`,
+        url: res.url,
+        title: res.title,
+        source_domain: res.source_domain,
+        resource_type: res.resource_type,
+        license_status: res.license_status,
+        ai_note: res.ai_note,
+      });
+    }
+  }
+
+  // Upsert resources using external_key for idempotency
+  // embed_allowed=false for demo: external links are sufficient; no iframe embedding needed.
+  // content_type_verified=false because no automated verification pipeline ran.
+  // status=approved because these are human-curated, pre-approved for the demo.
+  for (const res of seedResources) {
+    // Domain score lookup retained for potential future use, but embed_allowed is hardcoded false for demo.
+    const { data: domainScore } = await supabase
+      .from("domain_scores")
+      .select("score")
+      .eq("domain", res.source_domain)
+      .maybeSingle();
+
+    const score = domainScore?.score ?? 2;
+    const _embedAllowed = res.license_status === "cc_open" && score >= 4; // computed but not used for demo
+
+    const { error: resError } = await supabase.from("resources").upsert(
+      {
+        external_key: res.external_key,
+        node_id: res.node_id,
+        major_understanding_id: null,
+        url: res.url,
+        title: res.title,
+        source_domain: res.source_domain,
+        resource_type: res.resource_type,
+        license_status: res.license_status,
+        embed_allowed: false, // external links only for demo
+        content_type_verified: false, // no automated verification pipeline ran
+        ai_note: res.ai_note,
+        status: "approved", // human-curated, pre-approved for the demo
+      },
+      { onConflict: "external_key" }
+    );
+
+    if (resError) throw resError;
+  }
+
+  console.log(`  Seeded ${seedResources.length} curated demo resources.`);
 
   console.log("Curriculum seed complete.\n");
 }
