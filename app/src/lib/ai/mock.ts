@@ -140,7 +140,29 @@ export class MockProvider implements AIProvider {
   async complete(prompt: string, options: AICompleteOptions = {}): Promise<AICompleteResult> {
     this.recordCall("complete", prompt, options);
     const response = this.getResponse(prompt);
-    await this.applyDelay(response.delayMs);
+
+    // Handle timeoutMs if provided (creates an internal AbortSignal)
+    let signal = options.signal;
+    if (options.timeoutMs && options.timeoutMs > 0) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), options.timeoutMs);
+      // Clean up timeout on signal abort
+      signal?.addEventListener("abort", () => clearTimeout(timeoutId), { once: true });
+      signal = controller.signal;
+    }
+
+    // Combine signal handling with delay
+    if (signal) {
+      await new Promise<void>((resolve, reject) => {
+        const timeoutId = setTimeout(() => resolve(), response.delayMs || 0);
+        signal.addEventListener("abort", () => {
+          clearTimeout(timeoutId);
+          reject(new DOMException("Aborted", "AbortError"));
+        }, { once: true });
+      });
+    } else {
+      await this.applyDelay(response.delayMs);
+    }
 
     if (response.error) {
       throw response.error;

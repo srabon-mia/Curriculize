@@ -138,7 +138,8 @@ export class AnthropicProvider implements AIProvider {
    */
   private async requestWithRetry<T>(
     requestBody: AnthropicRequest,
-    maxAttempts = 4
+    maxAttempts = 4,
+    signal?: AbortSignal
   ): Promise<T> {
     let lastError: Error | null = null;
 
@@ -150,7 +151,25 @@ export class AnthropicProvider implements AIProvider {
         if (this.debug) {
           console.log(`[Anthropic] Rate limited, waiting ${waitMs / 1000}s before retry ${attempt}...`);
         }
-        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        try {
+          await new Promise((resolve, reject) => {
+            const timeout = setTimeout(resolve, waitMs);
+            if (signal) {
+              signal.addEventListener("abort", () => {
+                clearTimeout(timeout);
+                reject(new DOMException("Aborted", "AbortError"));
+              }, { once: true });
+            }
+          });
+        } catch (err) {
+          if (err instanceof DOMException && err.name === "AbortError") {
+            throw new AIError("ABORTED", "Request aborted", {
+              retryable: false,
+              provider: "anthropic",
+            });
+          }
+          throw err;
+        }
       }
 
       try {
@@ -162,6 +181,7 @@ export class AnthropicProvider implements AIProvider {
             "anthropic-version": ANTHROPIC_API_VERSION,
           },
           body: JSON.stringify(requestBody),
+          signal,
         });
 
         if (response.status === 429) {
@@ -272,7 +292,7 @@ export class AnthropicProvider implements AIProvider {
    */
   async complete(prompt: string, options: AICompleteOptions = {}): Promise<AICompleteResult> {
     const request = this.buildRequest(prompt, options);
-    const response = await this.requestWithRetry<AnthropicResponse>(request);
+    const response = await this.requestWithRetry<AnthropicResponse>(request, 4, options.signal);
 
     const text = this.extractText(response);
 

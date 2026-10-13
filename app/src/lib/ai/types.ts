@@ -14,7 +14,8 @@ export type AIErrorCode =
   | "INVALID_REQUEST"
   | "MODEL_ERROR"
   | "NETWORK_ERROR"
-  | "UNKNOWN_ERROR";
+  | "UNKNOWN_ERROR"
+  | "ABORTED";
 
 /**
  * Provider-agnostic error class.
@@ -53,6 +54,10 @@ export interface AICompleteOptions {
   model?: string;
   /** System prompt */
   systemPrompt?: string;
+  /** Optional AbortSignal for cancellation */
+  signal?: AbortSignal;
+  /** Optional timeout in milliseconds (alternative to signal) */
+  timeoutMs?: number;
 }
 
 /**
