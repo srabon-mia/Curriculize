@@ -29,6 +29,11 @@ function ResourceLink({ resource }: { resource: Resource }) {
   const typeColor =
     RESOURCE_TYPE_COLOR[resource.resource_type] ?? RESOURCE_TYPE_COLOR.other;
 
+  // Strip internal seed marker from student-facing description
+  const displayNote = resource.ai_note
+    ? resource.ai_note.replace(/^\[SEED:demo-2026\]\s*/, "").trim()
+    : null;
+
   return (
     <div className="flex items-start gap-3 py-2.5 border-b border-[#F0EDE3] last:border-0">
       <span
@@ -50,9 +55,9 @@ function ResourceLink({ resource }: { resource: Resource }) {
             {resource.source_domain}
           </span>
         )}
-        {resource.ai_note && (
+        {displayNote && (
           <p className="text-xs text-[#8A8578] mt-0.5 italic">
-            {resource.ai_note}
+            {displayNote}
           </p>
         )}
       </div>
