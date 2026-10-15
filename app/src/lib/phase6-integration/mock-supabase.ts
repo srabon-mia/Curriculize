@@ -21,31 +21,37 @@ class MockQueryBuilder<TRow extends RowShape = DbRow> {
   private selectedColumns: string = "*";
   private eqFilters: Array<{ col: string; val: unknown }> = [];
   private inFilters: Array<{ col: string; vals: unknown[] }> = [];
-  private orderCol: string | null = null;
-  private orderAsc: boolean = true;
+  private orderCols: Array<{ col: string; asc: boolean }> = [];
   private limitN: number | null = null;
-  private insertData: DbRow | null = null;
+  private insertData: DbRow | DbRow[] | null = null;
   private lastInsertId: string | null = null;
   private isUpdateChain: boolean = false;
+  private isDeleteChain: boolean = false;
+  private client: MockSupabaseClient;
 
-  constructor(tables: Map<string, DbRow[]>, tableName: string) {
+  constructor(tables: Map<string, DbRow[]>, tableName: string, client: MockSupabaseClient) {
     this.tables = tables;
     this.tableName = tableName;
+    this.client = client;
   }
 
   private getTableRows(): DbRow[] {
     return this.tables.get(this.tableName) ?? [];
   }
 
-  insert(data: DbRow): this {
+  insert(data: DbRow | DbRow[]): this {
     this.isUpdateChain = false;
-    // Assign an ID if not present
-    const rowToInsert = { ...data, id: data.id ?? `mock-${Date.now()}-${Math.random().toString(36).slice(2, 9)}` };
-    this.insertData = rowToInsert;
-    this.lastInsertId = rowToInsert.id as string;
-    const table = this.getTableRows();
-    table.push(rowToInsert);
-    this.tables.set(this.tableName, table);
+    // Handle both single row and bulk insert (array)
+    if (Array.isArray(data)) {
+      const rowsToInsert = data.map(d => ({ ...d, id: d.id ?? `mock-${Date.now()}-${Math.random().toString(36).slice(2, 9)}` }));
+      this.insertData = rowsToInsert;
+      this.lastInsertId = rowsToInsert[0]?.id as string;
+    } else {
+      // Single row
+      const rowToInsert = { ...data, id: data.id ?? `mock-${Date.now()}-${Math.random().toString(36).slice(2, 9)}` };
+      this.insertData = rowToInsert;
+      this.lastInsertId = rowToInsert.id as string;
+    }
     return this;
   }
 
@@ -64,14 +70,24 @@ class MockQueryBuilder<TRow extends RowShape = DbRow> {
     return this;
   }
 
+  ilike(col: string, val: string): this {
+    // Store ilike filter similar to eq
+    this.eqFilters.push({ col, val: { type: "ilike", pattern: val } });
+    return this;
+  }
+
   order(col: string, opts?: { ascending?: boolean }): this {
-    this.orderCol = col;
-    this.orderAsc = opts?.ascending ?? true;
+    this.orderCols.push({ col, asc: opts?.ascending ?? true });
     return this;
   }
 
   limit(n: number): this {
     this.limitN = n;
+    return this;
+  }
+
+  delete(): this {
+    this.isDeleteChain = true;
     return this;
   }
 
@@ -104,25 +120,45 @@ class MockQueryBuilder<TRow extends RowShape = DbRow> {
         Object.assign(row, this.insertData);
       }
       const result = filtered[0]
-        ? { data: this._project({ ...filtered[0], ...this.insertData }) as TRow, error: null }
+        ? { data: (this as any)._project({ ...filtered[0], ...this.insertData }) as TRow, error: null }
         : { data: null, error: null };
       this._resetChain();
       return result;
     }
     if (this.insertData && this.lastInsertId) {
-      // Insert chain: return the newly inserted row only
+      // Insert chain: check failure injection first
+      if (!this.isUpdateChain && !this.isDeleteChain) {
+        if (this.client.shouldFailNext) {
+          this.client.shouldFailNext = false;
+          return { data: null, error: new Error(this.client.failMessage) };
+        }
+        if (this.client.shouldFailOnTable === this.tableName) {
+          this.client.shouldFailOnTable = null;
+          return { data: null, error: new Error(this.client.tableFailMessage) };
+        }
+      }
+      // Insert chain: insert the row(s) and return it
+      if (!this.isUpdateChain && !this.isDeleteChain) {
+        const table = this.getTableRows();
+        if (Array.isArray(this.insertData)) {
+          table.push(...this.insertData);
+        } else {
+          table.push(this.insertData);
+        }
+        this.tables.set(this.tableName, table);
+      }
       const table = this.getTableRows();
       const row = table.find(r => r.id === this.lastInsertId);
       if (row) {
         this._resetChain();
-        return { data: this._project({ ...row }) as TRow, error: null };
+        return { data: (this as any)._project({ ...row }) as TRow, error: null };
       }
       this._resetChain();
       return { data: null, error: null };
     }
     const results = this._filter();
     if (results.length === 0) return { data: null, error: null };
-    return { data: this._project(results[0]) as TRow, error: null };
+    return { data: (this as any)._project(results[0]) as TRow, error: null };
   }
 
   single(): { data: TRow | null; error: Error | null } {
@@ -133,18 +169,38 @@ class MockQueryBuilder<TRow extends RowShape = DbRow> {
         Object.assign(row, this.insertData);
       }
       const result = filtered[0]
-        ? { data: this._project({ ...filtered[0], ...this.insertData }) as TRow, error: null }
+        ? { data: (this as any)._project({ ...filtered[0], ...this.insertData }) as TRow, error: null }
         : { data: null, error: new Error("No rows found") };
       this._resetChain();
       return result;
     }
     if (this.insertData && this.lastInsertId) {
-      // Insert chain: return the newly inserted row only
+      // Insert chain: check failure injection first
+      if (!this.isUpdateChain && !this.isDeleteChain) {
+        if (this.client.shouldFailNext) {
+          this.client.shouldFailNext = false;
+          return { data: null, error: new Error(this.client.failMessage) };
+        }
+        if (this.client.shouldFailOnTable === this.tableName) {
+          this.client.shouldFailOnTable = null;
+          return { data: null, error: new Error(this.client.tableFailMessage) };
+        }
+      }
+      // Insert chain: insert the row(s) and return it
+      if (!this.isUpdateChain && !this.isDeleteChain) {
+        const table = this.getTableRows();
+        if (Array.isArray(this.insertData)) {
+          table.push(...this.insertData);
+        } else {
+          table.push(this.insertData);
+        }
+        this.tables.set(this.tableName, table);
+      }
       const table = this.getTableRows();
       const row = table.find(r => r.id === this.lastInsertId);
       if (row) {
         this._resetChain();
-        return { data: this._project({ ...row }) as TRow, error: null };
+        return { data: (this as any)._project({ ...row }) as TRow, error: null };
       }
       this._resetChain();
       return { data: null, error: new Error("No rows found") };
@@ -152,32 +208,76 @@ class MockQueryBuilder<TRow extends RowShape = DbRow> {
     const results = this._filter();
     if (results.length === 0) return { data: null, error: new Error("No rows found") };
     if (results.length > 1) return { data: null, error: new Error("Multiple rows") };
-    return { data: this._project(results[0]) as TRow, error: null };
+    return { data: (this as any)._project(results[0]) as TRow, error: null };
   }
 
   execute(): { data: TRow[]; error: Error | null } {
+    // Check for failure injection on insert chains
+    if (this.insertData && this.lastInsertId && !this.isUpdateChain && !this.isDeleteChain) {
+      if (this.client.shouldFailNext) {
+        this.client.shouldFailNext = false;
+        return { data: [], error: new Error(this.client.failMessage) };
+      }
+      if (this.client.shouldFailOnTable === this.tableName) {
+        this.client.shouldFailOnTable = null;
+        return { data: [], error: new Error(this.client.tableFailMessage) };
+      }
+    }
+
     if (this.isUpdateChain && this.insertData) {
+      // Check for failure injection on update chains
+      if (this.client.shouldFailOnTable === this.tableName) {
+        this.client.shouldFailOnTable = null;
+        return { data: [], error: new Error(this.client.tableFailMessage) };
+      }
       // Update chain: apply to all matching rows
       const filtered = this._filter();
       for (const row of filtered) {
         Object.assign(row, this.insertData);
       }
-      const result = { data: filtered.map((r) => this._project({ ...r, ...this.insertData! })) as TRow[], error: null };
+      const result = { data: filtered.map((r) => (this as any)._project({ ...r, ...this.insertData! })) as TRow[], error: null };
       this._resetChain();
       return result;
     }
     if (this.insertData && this.lastInsertId) {
-      // Insert chain: return the newly inserted row only
+      // Insert chain: insert the row(s) and return it
+      if (!this.isUpdateChain && !this.isDeleteChain) {
+        const table = this.getTableRows();
+        if (Array.isArray(this.insertData)) {
+          table.push(...this.insertData);
+        } else {
+          table.push(this.insertData);
+        }
+        this.tables.set(this.tableName, table);
+      }
       const table = this.getTableRows();
       const row = table.find(r => r.id === this.lastInsertId);
       if (row) {
         this._resetChain();
-        return { data: [this._project({ ...row }) as TRow], error: null };
+        return { data: [(this as any)._project({ ...row }) as TRow], error: null };
       }
       this._resetChain();
       return { data: [], error: null };
     }
-    return { data: this._filter().map((r) => this._project(r) as TRow), error: null };
+    if (this.isDeleteChain) {
+      // Delete chain: delete matching rows
+      const filtered = this._filter();
+      for (const row of filtered) {
+        const table = this.getTableRows();
+        const index = table.findIndex(r => r.id === row.id);
+        if (index !== -1) {
+          table.splice(index, 1);
+        }
+      }
+      this._resetChain();
+      return { data: [], error: null };
+    }
+    // Select query: apply limit if set
+    let filtered = this._filter();
+    if (this.limitN !== null) {
+      filtered = filtered.slice(0, this.limitN);
+    }
+    return { data: filtered.map((r) => (this as any)._project(r) as TRow), error: null };
   }
 
   private _resetChain(): void {
@@ -191,6 +291,8 @@ class MockQueryBuilder<TRow extends RowShape = DbRow> {
 
     for (const { col, val } of this.eqFilters) {
       result = result.filter((row: DbRow) => {
+        // Handle JSONB path queries (e.g., "notes->>acquisition_job_id") FIRST
+        // because row[col] will be undefined for such columns
         if (col.includes("->>")) {
           const parts = col.split("->>");
           const jsonCol = parts[0];
@@ -208,6 +310,22 @@ class MockQueryBuilder<TRow extends RowShape = DbRow> {
           const parsedObj = row[parsedKey] as Record<string, unknown> | undefined;
           return parsedObj?.[jsonKey] === val;
         }
+
+        const rowVal = row[col];
+        if (rowVal === undefined) return false;
+
+        // Check if this is an ilike filter
+        if (val && typeof val === "object" && val !== null && "type" in val && val.type === "ilike") {
+          const pattern = (val as unknown as { pattern: string }).pattern;
+          // Convert SQL ILIKE pattern to regex
+          // % matches any sequence of characters, _ matches single character
+          const regexPattern = pattern
+            .replace(/%/g, ".*")
+            .replace(/_/g, ".");
+          const regex = new RegExp(`^${regexPattern}$`, "i");
+          return typeof rowVal === "string" && regex.test(rowVal);
+        }
+
         return row[col] === val;
       });
     }
@@ -216,13 +334,17 @@ class MockQueryBuilder<TRow extends RowShape = DbRow> {
       result = result.filter((row) => vals.includes(row[col]));
     }
 
-    if (this.orderCol) {
+    if (this.orderCols.length > 0) {
       result.sort((a, b) => {
-        const aVal = a[this.orderCol!] as string;
-        const bVal = b[this.orderCol!] as string;
-        return this.orderAsc
-          ? new Date(aVal).getTime() - new Date(bVal).getTime()
-          : new Date(bVal).getTime() - new Date(aVal).getTime();
+        for (const { col, asc } of this.orderCols) {
+          const aVal = a[col] as string;
+          const bVal = b[col] as string;
+          const comparison = new Date(aVal).getTime() - new Date(bVal).getTime();
+          if (comparison !== 0) {
+            return asc ? comparison : -comparison;
+          }
+        }
+        return 0;
       });
     }
 
@@ -235,6 +357,10 @@ class MockQueryBuilder<TRow extends RowShape = DbRow> {
 
   private _project(row: DbRow): DbRow {
     if (this.selectedColumns === "*") return { ...row };
+    // Handle join syntax (e.g., "*, major_understandings(...)") by returning the row as-is
+    if (this.selectedColumns.includes("major_understandings") || this.selectedColumns.includes("(")) {
+      return { ...row };
+    }
     const cols = this.selectedColumns.split(",").map((c) => c.trim());
     const result: DbRow = {};
     for (const col of cols) {
@@ -249,11 +375,21 @@ export class MockSupabaseClient {
   private inserted: Array<{ table: string; row: DbRow }> = [];
   private updated: Array<{ table: string; id: string; data: DbRow }> = [];
 
+  // Failure injection properties
+  shouldFailNext: boolean = false;
+  failMessage: string = "Mock failure";
+  shouldFailOnTable: string | null = null;
+  tableFailMessage: string = "Mock failure";
+
   constructor() {
     this.tables.set("resources", []);
     this.tables.set("verification_records", []);
     this.tables.set("resource_mappings", []);
     this.tables.set("domain_scores", []);
+    this.tables.set("curriculum_sources", []);
+    this.tables.set("curricula", []);
+    this.tables.set("nodes", []);
+    this.tables.set("major_understandings", []);
   }
 
   // Auth mock for testing routes that use authentication
@@ -262,10 +398,20 @@ export class MockSupabaseClient {
   };
 
   from(tableName: string): MockQueryBuilder {
-    return new MockQueryBuilder(this.tables, tableName);
+    return new MockQueryBuilder(this.tables, tableName, this);
   }
 
   insert(tableName: string, row: DbRow): DbRow {
+    // Check for failure injection
+    if (this.shouldFailNext) {
+      this.shouldFailNext = false;
+      throw new Error(this.failMessage);
+    }
+    if (this.shouldFailOnTable === tableName) {
+      this.shouldFailOnTable = null;
+      throw new Error(this.tableFailMessage);
+    }
+
     const table = this.tables.get(tableName) ?? [];
     const newRow: DbRow = { ...row, id: row.id ?? `mock-${table.length + 1}` };
     if (!newRow.created_at) newRow.created_at = new Date().toISOString();
@@ -273,6 +419,12 @@ export class MockSupabaseClient {
     this.tables.set(tableName, table);
     this.inserted.push({ table: tableName, row: newRow });
     return newRow;
+  }
+
+  deleteFromTable(tableName: string): Promise<void> {
+    const table = this.tables.get(tableName) ?? [];
+    table.length = 0;
+    return Promise.resolve();
   }
 
   insertMultiple(tableName: string, rows: DbRow[]): { data: DbRow[]; error: null } {

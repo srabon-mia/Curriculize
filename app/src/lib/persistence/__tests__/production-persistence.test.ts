@@ -21,6 +21,7 @@ const mockClient = new MockSupabaseClient();
 
 vi.mock("@supabase/supabase-js", () => ({
   createClient: vi.fn(() => mockClient),
+  createServiceClient: vi.fn(() => mockClient),
 }));
 
 // Import AFTER mock is set up
