@@ -98,7 +98,7 @@ export function AddResourceForm({
     return (
       <button
         onClick={() => setOpen(true)}
-        className="text-sm px-3 py-1.5 rounded-md border border-dashed border-[#D8D4C8] text-[#8A8578] hover:border-[#B8753D] hover:text-[#B8753D] transition"
+        className="text-xs sm:text-sm font-medium px-3.5 py-2 rounded-lg border border-dashed border-border-default text-text-muted hover:border-brand-forest hover:text-brand-forest bg-surface-card hover:bg-canvas-subtle transition"
       >
         + Add resource
       </button>
@@ -108,10 +108,10 @@ export function AddResourceForm({
   return (
     <form
       onSubmit={handleSubmit}
-      className="rounded-md border border-[#E7E3D7] bg-white p-4 space-y-3"
+      className="rounded-xl border border-border-default bg-surface-card p-4 sm:p-5 space-y-3.5 shadow-2xs"
     >
       <div>
-        <label className="block text-xs uppercase tracking-wide text-[#8A8578] mb-1">
+        <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-1">
           URL
         </label>
         <input
@@ -120,12 +120,12 @@ export function AddResourceForm({
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           placeholder="https://..."
-          className="w-full rounded-md border border-[#D8D4C8] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#B8753D]/40 focus:border-[#B8753D]"
+          className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition"
         />
       </div>
 
       <div>
-        <label className="block text-xs uppercase tracking-wide text-[#8A8578] mb-1">
+        <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-1">
           Title
         </label>
         <input
@@ -134,19 +134,19 @@ export function AddResourceForm({
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           placeholder="e.g. Mr. Ting — Atomic Structure lesson"
-          className="w-full rounded-md border border-[#D8D4C8] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#B8753D]/40 focus:border-[#B8753D]"
+          className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition"
         />
       </div>
 
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className="block text-xs uppercase tracking-wide text-[#8A8578] mb-1">
+          <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-1">
             Type
           </label>
           <select
             value={resourceType}
             onChange={(e) => setResourceType(e.target.value as typeof resourceType)}
-            className="w-full rounded-md border border-[#D8D4C8] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#B8753D]/40"
+            className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition"
           >
             {RESOURCE_TYPES.map((t) => (
               <option key={t} value={t}>
@@ -157,13 +157,13 @@ export function AddResourceForm({
         </div>
 
         <div>
-          <label className="block text-xs uppercase tracking-wide text-[#8A8578] mb-1">
+          <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-1">
             License
           </label>
           <select
             value={licenseStatus}
             onChange={(e) => setLicenseStatus(e.target.value as typeof licenseStatus)}
-            className="w-full rounded-md border border-[#D8D4C8] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#B8753D]/40"
+            className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition"
           >
             {LICENSE_OPTIONS.map((o) => (
               <option key={o.value} value={o.value}>
@@ -174,14 +174,14 @@ export function AddResourceForm({
         </div>
       </div>
 
-      <p className="text-xs text-[#8A8578]">
+      <p className="text-xs text-text-muted leading-relaxed">
         Embedding is only ever enabled when license is &ldquo;CC / open licensed&rdquo; AND the
         domain has a known reputation score. Default to link-only unless you&rsquo;ve actually
         checked.
       </p>
 
       <div>
-        <label className="block text-xs uppercase tracking-wide text-[#8A8578] mb-1">
+        <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-1">
           Note (optional)
         </label>
         <input
@@ -189,24 +189,28 @@ export function AddResourceForm({
           value={aiNote}
           onChange={(e) => setAiNote(e.target.value)}
           placeholder="Why this resource, why here"
-          className="w-full rounded-md border border-[#D8D4C8] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#B8753D]/40 focus:border-[#B8753D]"
+          className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition"
         />
       </div>
 
-      {error && <p className="text-sm text-[#B8453D]">{error}</p>}
+      {error && (
+        <p className="text-sm text-status-error bg-status-error-bg border border-status-error/20 p-2.5 rounded-lg">
+          {error}
+        </p>
+      )}
 
-      <div className="flex gap-2">
+      <div className="flex gap-2.5 pt-1">
         <button
           type="submit"
           disabled={submitting}
-          className="text-sm px-4 py-2 rounded-md bg-[#1A1A18] text-white hover:bg-[#3D3A30] transition disabled:opacity-50"
+          className="text-xs sm:text-sm font-medium px-4 py-2 rounded-lg bg-brand-forest text-white hover:bg-brand-forest-hover transition disabled:opacity-50 shadow-xs"
         >
           {submitting ? "Adding…" : "Add to review queue"}
         </button>
         <button
           type="button"
           onClick={() => setOpen(false)}
-          className="text-sm px-4 py-2 rounded-md text-[#8A8578] hover:text-[#1A1A18] transition"
+          className="text-xs sm:text-sm font-medium px-4 py-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-canvas-subtle transition"
         >
           Cancel
         </button>

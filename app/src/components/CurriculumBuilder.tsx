@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useCallback } from "react";
+import { useState, useCallback } from "react";
 import type { NodeWithChildren, Resource, MajorUnderstanding } from "@/lib/curriculum-data";
 import { ResourceCard } from "./ResourceCard";
 import { AddResourceForm } from "./AddResourceForm";
@@ -119,15 +119,14 @@ export function CurriculumBuilder({
     });
   };
 
-  const selectedNode = useMemo(
-    () => initialNodes.find((n) => n.id === (selected?.type === "node" ? selected.id : selected?.nodeId)),
-    [initialNodes, selected]
+  const selectedNode = initialNodes.find(
+    (n) => n.id === (selected?.type === "node" ? selected.id : selected?.nodeId)
   );
 
-  const selectedMu: MajorUnderstanding | undefined = useMemo(() => {
-    if (selected?.type !== "mu" || !selectedNode) return undefined;
-    return selectedNode.major_understandings.find((mu) => mu.id === selected.id);
-  }, [selected, selectedNode]);
+  const selectedMu: MajorUnderstanding | undefined =
+    selected?.type === "mu" && selectedNode
+      ? selectedNode.major_understandings.find((mu) => mu.id === selected.id)
+      : undefined;
 
   const targetKey = selected
     ? selected.type === "node"
@@ -166,7 +165,7 @@ export function CurriculumBuilder({
   return (
     <div className="flex min-h-[calc(100vh-1px)]">
       {/* Left rail: topic tree */}
-      <nav className="w-80 shrink-0 border-r border-[#E7E3D7] bg-white overflow-y-auto">
+      <nav className="w-80 shrink-0 border-r border-border-default bg-surface-card overflow-y-auto">
         <ol>
           {initialNodes.map((node) => {
             const isExpanded = expandedNodeIds.has(node.id);
@@ -174,10 +173,10 @@ export function CurriculumBuilder({
             const barWidth = weightBarWidth(node.exam_weight_pct);
 
             return (
-              <li key={node.id} className="border-b border-[#F0EDE3]">
+              <li key={node.id} className="border-b border-border-subtle">
                 <div
                   className={`flex items-start gap-2 px-4 py-3 cursor-pointer transition ${
-                    isSelected ? "bg-[#FBF3E6]" : "hover:bg-[#FAFAF7]"
+                    isSelected ? "bg-brand-forest-subtle" : "hover:bg-canvas-subtle"
                   }`}
                   onClick={() => {
                     setSelected({ type: "node", id: node.id });
@@ -189,24 +188,24 @@ export function CurriculumBuilder({
                       e.stopPropagation();
                       toggleExpand(node.id);
                     }}
-                    className="mt-0.5 text-[#8A8578] hover:text-[#1A1A18] text-xs w-4 shrink-0"
+                    className="mt-0.5 text-text-muted hover:text-text-primary text-xs w-4 shrink-0"
                     aria-label={isExpanded ? "Collapse" : "Expand"}
                   >
                     {isExpanded ? "▾" : "▸"}
                   </button>
                   <div className="min-w-0 flex-1">
-                    <p className="font-serif text-sm leading-snug">
+                    <p className={`font-display text-sm leading-snug ${isSelected ? "font-semibold text-brand-forest" : "text-text-primary"}`}>
                       {node.order_index}. {node.title}
                     </p>
                     {node.exam_weight_pct && (
                       <div className="flex items-center gap-2 mt-1.5">
-                        <div className="h-1 flex-1 bg-[#F0EDE3] rounded-full overflow-hidden max-w-[80px]">
+                        <div className="h-1 flex-1 bg-border-subtle rounded-full overflow-hidden max-w-[80px]">
                           <div
-                            className="h-full bg-[#B8753D] rounded-full"
+                            className="h-full bg-brand-forest rounded-full"
                             style={{ width: `${(barWidth / 50) * 100}%` }}
                           />
                         </div>
-                        <span className="text-[10px] text-[#8A8578] tabular-nums">
+                        <span className="text-[10px] text-text-muted tabular-nums">
                           {node.exam_weight_pct}
                         </span>
                       </div>
@@ -215,7 +214,7 @@ export function CurriculumBuilder({
                 </div>
 
                 {isExpanded && (
-                  <ul className="pb-1">
+                  <ul className="pb-1 bg-surface-card/50">
                     {node.major_understandings.map((mu) => {
                       const muSelected = selected?.type === "mu" && selected.id === mu.id;
                       return (
@@ -224,11 +223,11 @@ export function CurriculumBuilder({
                             onClick={() => setSelected({ type: "mu", id: mu.id, nodeId: node.id })}
                             className={`w-full text-left px-4 pl-10 py-1.5 text-xs leading-snug transition ${
                               muSelected
-                                ? "bg-[#FBF3E6] text-[#1A1A18]"
-                                : "text-[#5A564A] hover:bg-[#FAFAF7]"
+                                ? "bg-brand-forest-subtle text-brand-forest font-medium"
+                                : "text-text-secondary hover:bg-canvas-subtle"
                             }`}
                           >
-                            <span className="text-[#B8753D] font-mono mr-1.5">
+                            <span className="text-brand-forest font-mono mr-1.5 font-semibold">
                               {mu.code ?? mu.external_key}
                             </span>
                             {mu.description.length > 70
@@ -247,21 +246,21 @@ export function CurriculumBuilder({
       </nav>
 
       {/* Right pane: detail + resources */}
-      <div className="flex-1 overflow-y-auto bg-[#FAFAF7]">
+      <div className="flex-1 overflow-y-auto bg-canvas-default">
         <div className="max-w-2xl mx-auto px-8 py-10">
-          {!selected && <p className="text-[#8A8578]">Select a topic to begin.</p>}
+          {!selected && <p className="text-text-muted">Select a topic to begin.</p>}
 
           {selected?.type === "node" && selectedNode && (
             <>
-              <p className="text-xs uppercase tracking-[0.18em] text-[#8A8578] mb-2">
+              <p className="text-xs uppercase tracking-[0.18em] text-text-muted mb-2 font-medium">
                 Topic {selectedNode.order_index}
                 {selectedNode.exam_weight_pct ? ` · ${selectedNode.exam_weight_pct} of exam` : ""}
               </p>
-              <h1 className="font-serif text-2xl mb-1">{selectedNode.title}</h1>
+              <h1 className="font-display text-2xl font-bold text-brand-navy mb-1">{selectedNode.title}</h1>
               {selectedNode.claim_statement && (
-                <p className="text-[#5A564A] mt-3 leading-relaxed">{selectedNode.claim_statement}</p>
+                <p className="text-text-secondary mt-3 leading-relaxed">{selectedNode.claim_statement}</p>
               )}
-              <p className="text-sm text-[#8A8578] mt-4">
+              <p className="text-sm text-text-muted mt-4">
                 {selectedNode.major_understandings.length} major understandings — select one on the
                 left to attach resources at that granularity, or add a resource for the whole topic
                 below.
@@ -271,31 +270,31 @@ export function CurriculumBuilder({
 
           {selected?.type === "mu" && selectedMu && selectedNode && (
             <>
-              <p className="text-xs uppercase tracking-[0.18em] text-[#8A8578] mb-2">
+              <p className="text-xs uppercase tracking-[0.18em] text-text-muted mb-2 font-medium">
                 {selectedNode.title} · {selectedMu.code ?? selectedMu.external_key}
               </p>
-              <h1 className="font-serif text-xl leading-snug">{selectedMu.description}</h1>
+              <h1 className="font-display text-xl font-bold text-brand-navy leading-snug">{selectedMu.description}</h1>
             </>
           )}
 
           {selected && (
             <div className="mt-8 space-y-4" key={refreshKey}>
-              <div className="flex items-center justify-between">
-                <h2 className="text-sm font-medium text-[#1A1A18] uppercase tracking-wide">
+              <div className="flex items-center justify-between gap-4 flex-wrap">
+                <h2 className="text-xs font-semibold text-text-muted uppercase tracking-wider">
                   Resources ({currentResources.length})
                 </h2>
-                <div className="flex gap-2">
+                <div className="flex gap-2 flex-wrap">
                   <button
                     onClick={() => handleDiscover("topic")}
                     disabled={discovering}
-                    className="text-xs px-3 py-1.5 rounded-md border border-[#D8D4C8] text-[#5A564A] hover:border-[#B8753D] hover:text-[#B8753D] transition disabled:opacity-50"
+                    className="text-xs px-3 py-1.5 rounded-lg border border-border-default bg-surface-card text-text-secondary hover:border-brand-forest hover:text-brand-forest transition disabled:opacity-50 shadow-2xs font-medium"
                   >
                     {discovering ? "Searching…" : "Find resources for topic"}
                   </button>
                   <button
                     onClick={() => handleDiscover("bulk")}
                     disabled={discovering}
-                    className="text-xs px-3 py-1.5 rounded-md bg-[#1A1A18] text-white hover:bg-[#3D3A30] transition disabled:opacity-50"
+                    className="text-xs px-3 py-1.5 rounded-lg bg-brand-navy text-white hover:bg-brand-navy/90 transition disabled:opacity-50 shadow-2xs font-medium"
                   >
                     {discovering ? "Searching…" : "Find all understandings"}
                   </button>
@@ -303,7 +302,7 @@ export function CurriculumBuilder({
                     <button
                       onClick={() => handleDiscover("understanding")}
                       disabled={discovering}
-                      className="text-xs px-3 py-1.5 rounded-md border border-[#D8D4C8] text-[#5A564A] hover:border-[#B8753D] hover:text-[#B8753D] transition disabled:opacity-50"
+                      className="text-xs px-3 py-1.5 rounded-lg border border-border-default bg-surface-card text-text-secondary hover:border-brand-forest hover:text-brand-forest transition disabled:opacity-50 shadow-2xs font-medium"
                     >
                       {discovering ? "Searching…" : "Find resources for this concept"}
                     </button>
@@ -312,13 +311,13 @@ export function CurriculumBuilder({
               </div>
 
               {discoverResult && (
-                <p className="text-xs text-[#3D7A4F] bg-[#E8F2EA] px-3 py-2 rounded-md">
+                <p className="text-xs text-status-success bg-status-success-bg border border-status-success/20 px-3 py-2 rounded-lg font-medium">
                   {discoverResult}
                 </p>
               )}
 
               {currentResources.length === 0 && (
-                <p className="text-sm text-[#8A8578]">No resources attached yet.</p>
+                <p className="text-sm text-text-muted">No resources attached yet.</p>
               )}
 
               {currentResources.map((r) => (

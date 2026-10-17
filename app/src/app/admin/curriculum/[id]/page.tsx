@@ -1,4 +1,5 @@
 import { notFound, redirect } from "next/navigation";
+import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import {
   getCurriculum,
@@ -38,19 +39,25 @@ export default async function CurriculumDetailPage({
   }
 
   return (
-    <div className="min-h-full bg-white">
-      <header className="border-b border-[#E7E3D7] px-6 py-3 flex items-center justify-between">
-        <div>
-          <a href="/admin" className="text-xs text-[#8A8578] hover:text-[#1A1A18]">
-            ← All curricula
-          </a>
-          <h1 className="font-serif text-lg leading-tight">{curriculum.title}</h1>
+    <div className="min-h-screen bg-canvas-default text-text-primary">
+      <header className="border-b border-border-default bg-surface-card px-6 py-3.5 flex items-center justify-between gap-4 sticky top-0 z-30">
+        <div className="min-w-0">
+          <Link
+            href="/admin"
+            className="text-xs font-medium text-text-secondary hover:text-brand-forest transition flex items-center gap-1 mb-0.5"
+          >
+            <span>←</span>
+            <span>All curricula</span>
+          </Link>
+          <h1 className="font-display text-lg sm:text-xl font-bold text-brand-navy leading-tight truncate">
+            {curriculum.title}
+          </h1>
         </div>
         <span
-          className={`text-xs px-2.5 py-1 rounded-full ${
+          className={`text-xs px-2.5 py-1 rounded-full font-medium capitalize border shrink-0 ${
             curriculum.status === "published"
-              ? "bg-[#E8F2EA] text-[#3D7A4F]"
-              : "bg-[#FBF3E6] text-[#B8753D]"
+              ? "bg-status-success-bg text-status-success border-status-success/20"
+              : "bg-status-warning-bg text-status-warning border-status-warning/20"
           }`}
         >
           {curriculum.status}
