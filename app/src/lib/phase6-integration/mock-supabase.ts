@@ -70,6 +70,23 @@ class MockQueryBuilder<TRow extends RowShape = DbRow> {
     return this;
   }
 
+  /**
+   * Supabase .or() filter string, e.g.
+   *   `node_id.in.(abc,def),major_understanding_id.in.(ghi,jkl)`
+   * Parse out each (col.in.(vals)) pair and register them as inFilters so the
+   * _filter step keeps them. Note: no spaces around commas/parens.
+   */
+  or(filterString: string): this {
+    const re = /(\w+)\.in\.[(]([^)]+)[)]/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(filterString)) !== null) {
+      const col = m[1];
+      const vals = m[2].split(",").map((s) => s.trim());
+      this.inFilters.push({ col, vals });
+    }
+    return this;
+  }
+
   ilike(col: string, val: string): this {
     // Store ilike filter similar to eq
     this.eqFilters.push({ col, val: { type: "ilike", pattern: val } });
