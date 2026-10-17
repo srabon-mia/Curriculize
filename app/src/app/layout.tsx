@@ -28,7 +28,7 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`h-full antialiased ${inter.variable} ${spaceGrotesk.variable}`}
+      className={`h-full antialiased scroll-smooth ${inter.variable} ${spaceGrotesk.variable}`}
     >
       <body className="min-h-full flex flex-col font-sans">{children}</body>
     </html>
