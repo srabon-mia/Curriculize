@@ -1,26 +1,26 @@
 "use client";
 
-import { useState, useMemo, useEffect  } from "react";
+import { useState, useMemo, useEffect } from "react";
 import type { NodeWithChildren, Resource } from "@/lib/curriculum-data";
 
 const RESOURCE_TYPE_LABEL: Record<string, string> = {
   video: "Video",
   text: "Reading",
   textbook: "Textbook",
-  problem_set: "Problem set",
-  reference_tool: "Reference",
-  practice_exam: "Practice exam",
+  problem_set: "Problem Set",
+  reference_tool: "Reference Tool",
+  practice_exam: "Practice Exam",
   other: "Resource",
 };
 
 const RESOURCE_TYPE_COLOR: Record<string, string> = {
-  video: "bg-[#E8EEF8] text-[#3D5FA0]",
-  text: "bg-[#F0EDE3] text-[#5A564A]",
-  textbook: "bg-[#F0EDE3] text-[#5A564A]",
-  problem_set: "bg-[#E8F2EA] text-[#3D7A4F]",
-  reference_tool: "bg-[#F5EFF8] text-[#6B4A8A]",
-  practice_exam: "bg-[#FBF3E6] text-[#B8753D]",
-  other: "bg-[#F0EDE3] text-[#5A564A]",
+  video: "bg-[#EBF5FB] text-[#1E5B94] border border-[#D4E6F1]",
+  text: "bg-canvas-subtle text-text-secondary border border-border-default",
+  textbook: "bg-canvas-subtle text-text-secondary border border-border-default",
+  problem_set: "bg-[#EAF7ED] text-[#166534] border border-[#CEEBD3]",
+  reference_tool: "bg-[#F5EEF8] text-[#6B21A8] border border-[#E9D5FF]",
+  practice_exam: "bg-[#FEF3E2] text-[#B45309] border border-[#FCD34D]",
+  other: "bg-canvas-subtle text-text-secondary border border-border-default",
 };
 
 function ResourceLink({ resource }: { resource: Resource }) {
@@ -35,28 +35,28 @@ function ResourceLink({ resource }: { resource: Resource }) {
     : null;
 
   return (
-    <div className="flex items-start gap-3 py-2.5 border-b border-[#F0EDE3] last:border-0">
+    <div className="flex items-start gap-3 py-2.5 border-b border-border-subtle last:border-0">
       <span
-        className={`shrink-0 text-xs px-2 py-0.5 rounded-full mt-0.5 ${typeColor}`}
+        className={`shrink-0 text-[11px] font-medium px-2.5 py-0.5 rounded-full mt-0.5 ${typeColor}`}
       >
         {typeLabel}
       </span>
-      <div className="min-w-0">
+      <div className="min-w-0 flex-1">
         <a
           href={resource.url}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-sm font-medium text-[#1A1A18] hover:text-[#B8753D] underline decoration-[#D8D4C8] underline-offset-2 break-words"
+          className="text-sm font-medium text-text-primary hover:text-brand-forest underline decoration-border-default hover:decoration-brand-forest underline-offset-2 break-words transition-colors"
         >
           {resource.title}
         </a>
         {resource.source_domain && (
-          <span className="text-xs text-[#8A8578] ml-2">
-            {resource.source_domain}
+          <span className="text-xs font-mono text-text-tertiary ml-2">
+            ({resource.source_domain})
           </span>
         )}
         {displayNote && (
-          <p className="text-xs text-[#8A8578] mt-0.5 italic">
+          <p className="text-xs text-text-secondary mt-0.5 italic">
             {displayNote}
           </p>
         )}
@@ -89,7 +89,7 @@ export function CurriculumViewer({
     async function poll() {
       const res = await fetch(`/api/curricula/${curriculumId}/progress`);
       if (!res.ok) return;
-      const data = await res.json() as {
+      const data = (await res.json()) as {
         total: number;
         with_resources: number;
         complete: boolean;
@@ -144,24 +144,68 @@ export function CurriculumViewer({
     };
   }, [nodes, selectedNodeId]);
 
-  const selectedNode = useMemo(
-    () => nodes.find((n) => n.id === selectedNodeId),
+  const selectedNodeIndex = useMemo(
+    () => nodes.findIndex((n) => n.id === selectedNodeId),
     [nodes, selectedNodeId]
   );
+
+  const selectedNode = useMemo(
+    () => nodes[selectedNodeIndex],
+    [nodes, selectedNodeIndex]
+  );
+
+  const prevNode = selectedNodeIndex > 0 ? nodes[selectedNodeIndex - 1] : null;
+  const nextNode =
+    selectedNodeIndex >= 0 && selectedNodeIndex < nodes.length - 1
+      ? nodes[selectedNodeIndex + 1]
+      : null;
 
   // Collect all resources for the selected node: node-level ones first,
   // then per-understanding ones (shown inline beneath each understanding).
   const nodeResources = selectedNode
-    ? (resourcesByTarget[`node:${selectedNode.id}`] ?? [])
+    ? resourcesByTarget[`node:${selectedNode.id}`] ?? []
     : [];
 
   return (
-    <div className="flex min-h-[calc(100vh-65px)]">
-      {/* Left rail */}
-      <nav className="w-72 shrink-0 border-r border-[#E7E3D7] bg-white overflow-y-auto sticky top-0 h-[calc(100vh-65px)]">
-        <p className="px-5 pt-5 pb-2 text-xs uppercase tracking-[0.15em] text-[#8A8578]">
-          Topics
-        </p>
+    <div className="flex flex-col md:flex-row flex-1 min-h-[calc(100vh-65px)]">
+      {/* Mobile Topic Switcher (< 768px) */}
+      <div className="md:hidden border-b border-border-default bg-surface-card px-4 py-3 sticky top-[65px] z-20 shadow-xs">
+        <label
+          htmlFor="mobile-topic-selector"
+          className="block text-[11px] font-semibold uppercase tracking-wider text-text-secondary mb-1"
+        >
+          Select Topic ({selectedNode?.order_index} of {nodes.length})
+        </label>
+        <div className="relative">
+          <select
+            id="mobile-topic-selector"
+            value={selectedNodeId}
+            onChange={(e) => setSelectedNodeId(e.target.value)}
+            className="w-full rounded-lg border border-border-default bg-surface-card px-3 py-2 text-sm font-medium text-text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest appearance-none pr-8 cursor-pointer shadow-xs"
+          >
+            {nodes.map((node) => (
+              <option key={node.id} value={node.id}>
+                {node.order_index}. {node.title}{" "}
+                {node.exam_weight_pct ? `(${node.exam_weight_pct})` : ""}
+              </option>
+            ))}
+          </select>
+          <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3 text-text-tertiary text-xs">
+            ▾
+          </span>
+        </div>
+      </div>
+
+      {/* Desktop Left Rail (>= 768px) */}
+      <nav className="w-72 lg:w-80 shrink-0 border-r border-border-default bg-surface-card overflow-y-auto sticky top-[65px] h-[calc(100vh-65px)] hidden md:block">
+        <div className="px-5 pt-5 pb-3 flex items-center justify-between border-b border-border-subtle">
+          <p className="text-xs font-display font-semibold uppercase tracking-[0.16em] text-text-secondary">
+            Curriculum Topics
+          </p>
+          <span className="text-xs font-mono text-text-tertiary">
+            {nodes.length} units
+          </span>
+        </div>
         <ol>
           {nodes.map((node) => {
             const isSelected = node.id === selectedNodeId;
@@ -179,36 +223,37 @@ export function CurriculumViewer({
             return (
               <li key={node.id}>
                 <button
+                  type="button"
                   onClick={() => setSelectedNodeId(node.id)}
-                  className={`w-full text-left px-5 py-3.5 border-b border-[#F0EDE3] transition ${
+                  className={`w-full text-left px-5 py-4 border-b border-border-subtle transition-all ${
                     isSelected
-                      ? "bg-[#FBF3E6] border-l-2 border-l-[#B8753D]"
-                      : "hover:bg-[#FAFAF7] border-l-2 border-l-transparent"
+                      ? "bg-brand-aqua-tint/40 border-l-[3px] border-l-brand-forest"
+                      : "hover:bg-canvas-subtle border-l-[3px] border-l-transparent"
                   }`}
                 >
                   <p
-                    className={`font-serif text-sm leading-snug ${
-                      isSelected ? "text-[#1A1A18]" : "text-[#3A3730]"
+                    className={`font-display text-sm leading-snug font-semibold ${
+                      isSelected ? "text-brand-navy" : "text-text-primary"
                     }`}
                   >
                     {node.order_index}. {node.title}
                   </p>
-                  <div className="flex items-center gap-2 mt-1">
-                    <span className="text-[10px] text-[#8A8578]">
-                      {muCount} concepts
+                  <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                    <span className="text-[11px] text-text-tertiary">
+                      {muCount} concept{muCount !== 1 ? "s" : ""}
                     </span>
                     {resourceCount > 0 && (
                       <>
-                        <span className="text-[#D8D4C8]">·</span>
-                        <span className="text-[10px] text-[#B8753D]">
+                        <span className="text-border-default">·</span>
+                        <span className="text-[11px] font-medium text-brand-forest">
                           {resourceCount} resource{resourceCount !== 1 ? "s" : ""}
                         </span>
                       </>
                     )}
                     {node.exam_weight_pct && (
                       <>
-                        <span className="text-[#D8D4C8]">·</span>
-                        <span className="text-[10px] text-[#8A8578]">
+                        <span className="text-border-default">·</span>
+                        <span className="text-[11px] font-mono text-text-tertiary">
                           {node.exam_weight_pct}
                         </span>
                       </>
@@ -221,109 +266,139 @@ export function CurriculumViewer({
         </ol>
       </nav>
 
-      {/* Right pane */}
+      {/* Right Content Pane */}
       <div className="flex-1 overflow-y-auto">
         {selectedNode && (
-          <div className="max-w-2xl mx-auto px-8 py-10">
+          <div className="max-w-3xl mx-auto px-6 sm:px-10 py-8 sm:py-10">
             {/* Topic header */}
-            <div className="mb-8">
-              <p className="text-xs uppercase tracking-[0.18em] text-[#8A8578] mb-1">
+            <div className="mb-8 pb-6 border-b border-border-subtle">
+              <p className="text-xs font-display font-semibold uppercase tracking-[0.18em] text-brand-forest mb-2">
                 Topic {selectedNode.order_index}
                 {selectedNode.exam_weight_pct &&
                   ` · ${selectedNode.exam_weight_pct} of exam`}
               </p>
-              <h2 className="font-serif text-3xl leading-tight">
+              <h2 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-brand-navy leading-tight">
                 {selectedNode.title}
               </h2>
+              {selectedNode.claim_statement && (
+                <p className="text-sm text-text-secondary mt-2.5 leading-relaxed italic">
+                  {selectedNode.claim_statement}
+                </p>
+              )}
             </div>
 
-            {/* Topic-level resources (apply to whole topic, not a specific understanding) */}
-            {nodeResources.length > 0 && (() => {
+            {/* Topic-level resources */}
+            {nodeResources.length > 0 &&
+              (() => {
                 const learning = nodeResources.filter(
-                    (r) => r.resource_type !== "problem_set" && r.resource_type !== "practice_exam"
+                  (r) =>
+                    r.resource_type !== "problem_set" &&
+                    r.resource_type !== "practice_exam"
                 );
                 const practice = nodeResources.filter(
-                    (r) => r.resource_type === "problem_set" || r.resource_type === "practice_exam"
+                  (r) =>
+                    r.resource_type === "problem_set" ||
+                    r.resource_type === "practice_exam"
                 );
                 return (
-                    <div className="mb-8 space-y-2">
+                  <div className="mb-8 space-y-4">
                     {learning.length > 0 && (
-                        <div className="rounded-md border border-[#E7E3D7] bg-white px-5 py-4">
-                        <p className="text-xs uppercase tracking-wide text-[#8A8578] mb-3">
-                            Learning resources
+                      <div className="rounded-xl border border-border-default bg-surface-card p-5 shadow-xs">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-text-secondary mb-3 flex items-center gap-1.5">
+                          <span>📚</span>
+                          <span>Unit Learning Resources</span>
                         </p>
-                        {learning.map((r) => (
+                        <div className="divide-y divide-border-subtle">
+                          {learning.map((r) => (
                             <ResourceLink key={r.id} resource={r} />
-                        ))}
+                          ))}
                         </div>
+                      </div>
                     )}
                     {practice.length > 0 && (
-                        <div className="rounded-md border border-[#E7E3D7] bg-white px-5 py-4">
-                        <p className="text-xs uppercase tracking-wide text-[#8A8578] mb-3">
-                            Practice problems
+                      <div className="rounded-xl border border-border-default bg-surface-card p-5 shadow-xs">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-text-secondary mb-3 flex items-center gap-1.5">
+                          <span>✍️</span>
+                          <span>Unit Practice Problems</span>
                         </p>
-                        {practice.map((r) => (
+                        <div className="divide-y divide-border-subtle">
+                          {practice.map((r) => (
                             <ResourceLink key={r.id} resource={r} />
-                        ))}
+                          ))}
                         </div>
+                      </div>
                     )}
-                    </div>
+                  </div>
                 );
-                })()}
+              })()}
 
             {/* Major understandings, each with their own resources */}
-            <div className="space-y-6">
-              {selectedNode.major_understandings.map((mu, i) => {
-                const muResources =
-                  resourcesByTarget[`mu:${mu.id}`] ?? [];
+            <div className="space-y-4">
+              <div className="mb-2">
+                <p className="text-xs font-display font-semibold uppercase tracking-[0.16em] text-text-tertiary">
+                  Key Concepts & Understandings
+                </p>
+              </div>
+
+              {selectedNode.major_understandings.map((mu) => {
+                const muResources = resourcesByTarget[`mu:${mu.id}`] ?? [];
 
                 return (
-                  <div key={mu.id} className="group">
-                    <div className="flex items-baseline gap-3 mb-2">
-                      <span className="shrink-0 font-mono text-xs text-[#B8753D] bg-[#FBF3E6] px-2 py-0.5 rounded">
+                  <div
+                    key={mu.id}
+                    className="rounded-xl border border-border-default bg-surface-card p-5 shadow-xs transition hover:border-border-hover"
+                  >
+                    <div className="flex items-start gap-3">
+                      <span className="shrink-0 font-mono text-xs font-semibold text-brand-forest bg-brand-aqua-tint px-2.5 py-1 rounded border border-brand-aqua/40">
                         {mu.code ?? mu.external_key}
                       </span>
-                      <p className="text-[#1A1A18] leading-relaxed">
+                      <p className="text-sm sm:text-base text-text-primary leading-relaxed font-normal flex-1">
                         {mu.description}
                       </p>
                     </div>
 
-                    {muResources.length > 0 && (() => {
-                        
-                    const learning = muResources.filter(
-                        (r) => r.resource_type !== "problem_set" && r.resource_type !== "practice_exam"
-                    );
-                    const practice = muResources.filter(
-                        (r) => r.resource_type === "problem_set" || r.resource_type === "practice_exam"
-                    );
-                    return (
-                        <div className="mt-2 space-y-2">
-                        {learning.length > 0 && (
-                            <div className="rounded-md border border-[#E7E3D7] bg-white px-4 py-1">
-                            <p className="text-[10px] uppercase tracking-wide text-[#8A8578] pt-2 pb-1">
-                                Learning resources
-                            </p>
-                            {learning.map((r) => (
-                                <ResourceLink key={r.id} resource={r} />
-                            ))}
-                            </div>
-                        )}
-                        {practice.length > 0 && (
-                            <div className="rounded-md border border-[#E7E3D7] bg-white px-4 py-1">
-                            <p className="text-[10px] uppercase tracking-wide text-[#8A8578] pt-2 pb-1">
-                                Practice problems
-                            </p>
-                            {practice.map((r) => (
-                                <ResourceLink key={r.id} resource={r} />
-                            ))}
-                            </div>
-                        )}
-                        </div>
-                    );
-                    })()}
+                    {muResources.length > 0 &&
+                      (() => {
+                        const learning = muResources.filter(
+                          (r) =>
+                            r.resource_type !== "problem_set" &&
+                            r.resource_type !== "practice_exam"
+                        );
+                        const practice = muResources.filter(
+                          (r) =>
+                            r.resource_type === "problem_set" ||
+                            r.resource_type === "practice_exam"
+                        );
+                        return (
+                          <div className="mt-3.5 pt-3 border-t border-border-subtle space-y-3">
+                            {learning.length > 0 && (
+                              <div>
+                                <p className="text-[11px] font-semibold uppercase tracking-wider text-text-tertiary mb-1">
+                                  Learning resources
+                                </p>
+                                {learning.map((r) => (
+                                  <ResourceLink key={r.id} resource={r} />
+                                ))}
+                              </div>
+                            )}
+                            {practice.length > 0 && (
+                              <div>
+                                <p className="text-[11px] font-semibold uppercase tracking-wider text-text-tertiary mb-1">
+                                  Practice exercises
+                                </p>
+                                {practice.map((r) => (
+                                  <ResourceLink key={r.id} resource={r} />
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+
                     {muResources.length === 0 && (
-                      <p className="text-xs text-[#8A8578] mt-1 italic">
-                        Finding resources…
+                      <p className="text-xs text-text-tertiary mt-2.5 italic flex items-center gap-1.5">
+                        <span>⏳</span>
+                        <span>Finding verified resources…</span>
                       </p>
                     )}
                   </div>
@@ -336,15 +411,39 @@ export function CurriculumViewer({
               selectedNode.major_understandings.every(
                 (mu) => (resourcesByTarget[`mu:${mu.id}`] ?? []).length === 0
               ) && (
-                <div className="mt-6 rounded-md border border-dashed border-[#D8D4C8] px-6 py-8 text-center">
-                  <p className="text-sm text-[#8A8578]">
-                    No resources added for this topic yet.
+                <div className="mt-8 rounded-xl border border-dashed border-border-default bg-surface-card px-6 py-10 text-center">
+                  <p className="text-sm text-text-secondary">
+                    No resources verified for this topic yet. The discovery process runs in the background.
                   </p>
                 </div>
               )}
+
+            {/* Mobile Topic Navigation Footer */}
+            <div className="mt-10 pt-6 border-t border-border-default flex items-center justify-between gap-3 md:hidden">
+              {prevNode ? (
+                <button
+                  type="button"
+                  onClick={() => setSelectedNodeId(prevNode.id)}
+                  className="text-xs font-medium px-3.5 py-2.5 rounded-lg border border-border-default bg-surface-card hover:bg-canvas-subtle transition flex items-center gap-1 text-text-secondary shadow-xs"
+                >
+                  ← Topic {prevNode.order_index}
+                </button>
+              ) : (
+                <div />
+              )}
+              {nextNode ? (
+                <button
+                  type="button"
+                  onClick={() => setSelectedNodeId(nextNode.id)}
+                  className="text-xs font-medium px-3.5 py-2.5 rounded-lg bg-brand-forest text-white hover:bg-brand-forest-hover transition flex items-center gap-1 shadow-xs ml-auto"
+                >
+                  Topic {nextNode.order_index} →
+                </button>
+              ) : null}
+            </div>
           </div>
         )}
       </div>
     </div>
   );
-}
+}
