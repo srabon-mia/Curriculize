@@ -1,12 +1,149 @@
-"use client";
-
 import Link from "next/link";
+import { getCurricula, type Curriculum } from "../lib/curriculum-data";
 import { GenerateForm } from "../components/GenerateForm";
 import { StudentHeader } from "../components/StudentHeader";
 import { StudentFooter } from "../components/StudentFooter";
 import { HeroProductPreview } from "../components/HeroProductPreview";
 
-export default function LandingPage() {
+// Force dynamic rendering so the curriculum list is always fresh.
+export const dynamic = "force-dynamic";
+
+// ─── Featured Curricula Section ──────────────────────────────────────────────
+
+function CurriculumCard({ c }: { c: Curriculum }) {
+  return (
+    <article>
+      <Link
+        href={`/curriculum/${c.id}`}
+        className="group flex flex-col justify-between h-full rounded-2xl border border-border-default bg-surface-card p-6 transition-all duration-200 hover:border-brand-forest hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:ring-offset-2"
+      >
+        <div>
+          {/* Card top: subject badge + source type */}
+          <div className="flex items-center justify-between gap-2 mb-4">
+            {c.subject ? (
+              <span className="text-xs font-medium px-2.5 py-0.5 rounded-full bg-brand-aqua-tint text-brand-navy border border-brand-aqua/40">
+                {c.subject}
+              </span>
+            ) : (
+              <span />
+            )}
+            <span className="text-[11px] font-mono text-text-tertiary uppercase tracking-wide">
+              {c.source_type === "adapted" ? "Official syllabus" : "AI organized"}
+            </span>
+          </div>
+
+          {/* Title */}
+          <h3 className="font-display text-xl font-bold text-brand-navy group-hover:text-brand-forest transition-colors leading-snug mb-2">
+            {c.title}
+          </h3>
+
+          {/* Attribution */}
+          {c.source_attribution && (
+            <p className="text-xs text-text-secondary mt-1.5 flex items-center gap-1">
+              <span>Adapted from</span>
+              <span className="font-medium text-text-primary">{c.source_attribution}</span>
+            </p>
+          )}
+        </div>
+
+        {/* Card footer */}
+        <div className="pt-4 mt-5 border-t border-border-subtle flex items-center justify-between text-sm">
+          <span className="text-xs text-text-tertiary">Published study guide</span>
+          <span className="font-semibold text-brand-forest flex items-center gap-1 group-hover:translate-x-0.5 transition-transform text-sm">
+            Open guide <span aria-hidden="true">→</span>
+          </span>
+        </div>
+      </Link>
+    </article>
+  );
+}
+
+function FeaturedCurricula({ curricula }: { curricula: Curriculum[] }) {
+  const featured = curricula.slice(0, 4);
+
+  return (
+    <section className="border-t border-border-subtle bg-canvas-subtle/40 py-16 sm:py-20 px-6">
+      <div className="max-w-6xl mx-auto">
+        {/* Section header */}
+        <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-10">
+          <div>
+            <p className="text-xs font-display font-semibold uppercase tracking-[0.18em] text-brand-forest mb-2">
+              Learning Paths
+            </p>
+            <h2 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-brand-navy mb-2">
+              Explore learning paths
+            </h2>
+            <p className="text-sm sm:text-base text-text-secondary max-w-xl leading-relaxed">
+              Structured study guides built around official syllabi and free educational resources
+              — organized by topic, concept, and learning objective.
+            </p>
+          </div>
+          <Link
+            href="/curriculum"
+            className="shrink-0 inline-flex items-center gap-1.5 text-sm font-semibold text-brand-forest hover:text-brand-forest-hover hover:underline transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:ring-offset-2 rounded"
+          >
+            View all guides →
+          </Link>
+        </div>
+
+        {/* Grid or empty state */}
+        {featured.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-border-default bg-surface-card p-12 text-center max-w-md mx-auto">
+            <div className="w-12 h-12 rounded-xl bg-brand-aqua-tint border border-brand-aqua/30 flex items-center justify-center mx-auto mb-4">
+              <svg
+                className="w-6 h-6 text-brand-forest"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={1.75}
+                aria-hidden="true"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25"
+                />
+              </svg>
+            </div>
+            <p className="font-display font-semibold text-text-primary mb-1">
+              No guides published yet
+            </p>
+            <p className="text-sm text-text-secondary mb-5 leading-relaxed">
+              Be the first to generate a structured learning path.
+            </p>
+            <a
+              href="#generate"
+              className="inline-flex items-center justify-center px-5 py-2.5 rounded-xl bg-brand-forest text-white text-sm font-semibold hover:bg-brand-forest-hover transition shadow-sm"
+            >
+              Create a learning path
+            </a>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 xl:grid-cols-4 gap-5">
+            {featured.map((c) => (
+              <CurriculumCard key={c.id} c={c} />
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// ─── Page ─────────────────────────────────────────────────────────────────────
+
+export default async function LandingPage() {
+  // Server-side data fetch. getCurricula() uses next/headers (server-only).
+  // On error, render an empty-state section rather than crashing the homepage.
+  let publishedCurricula: Curriculum[] = [];
+  try {
+    const all = await getCurricula();
+    publishedCurricula = all.filter((c) => c.status === "published");
+  } catch {
+    // Database unavailable — homepage renders with empty curriculum section.
+    // Do not surface internal errors to visitors.
+  }
+
   return (
     <div className="min-h-screen bg-canvas-default text-text-primary flex flex-col justify-between">
       <StudentHeader />
@@ -84,6 +221,9 @@ export default function LandingPage() {
           </div>
         </section>
 
+        {/* Featured Curricula Section — live data, server-rendered */}
+        <FeaturedCurricula curricula={publishedCurricula} />
+
         {/* Dedicated Generator Section */}
         <section
           id="generate"
@@ -103,14 +243,14 @@ export default function LandingPage() {
               </p>
             </div>
 
-            {/* Centered Generator Form Card */}
+            {/* Centered Generator Form Card — GenerateForm is unchanged */}
             <div className="max-w-2xl mx-auto bg-surface-card rounded-2xl border border-border-default shadow-sm p-6 sm:p-8 text-left transition-all">
               <GenerateForm />
             </div>
           </div>
         </section>
 
-        {/* How it works Section (Preserved Supporting Content) */}
+        {/* How it works Section */}
         <section className="border-t border-border-subtle bg-canvas-default py-16 sm:py-20 px-6">
           <div className="max-w-5xl mx-auto">
             <div className="text-center sm:text-left mb-10">
@@ -167,7 +307,7 @@ export default function LandingPage() {
                 href="/curriculum"
                 className="inline-flex items-center gap-1.5 text-sm font-medium text-brand-forest hover:text-brand-forest-hover hover:underline transition"
               >
-                Browse already published curricula →
+                Browse all published curricula →
               </Link>
             </div>
           </div>
