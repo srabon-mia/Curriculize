@@ -141,7 +141,7 @@ class MockChain {
         console.log(`[MOCK] Found ${records.length} verification records for canonical_url: ${this.query.eq.canonical_url}`);
         return Promise.resolve({ data: records, error: null });
       }
-      if (this.query.eq?.resource_id && this.query.eq?.["notes->>acquisition_job_id"]) {
+      if (this.query.eq?.resource_id && this.query.eq?.acquisition_job_id) {
         return Promise.resolve({ data: { id: "existing-vr", content_hash: "abc123hash-0" }, error: null });
       }
       if (this.query.eq?.resource_id && this.query.eq?.content_hash) {

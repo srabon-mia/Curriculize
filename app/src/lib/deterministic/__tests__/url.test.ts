@@ -420,3 +420,103 @@ describe("Trailing-dot hostname SSRF protection", () => {
     expect(isHostnameBlocked("example.com.")).toBe(false);
   });
 });
+
+describe("Phase 9 migration canonical URL backfill differences", () => {
+  // These tests demonstrate the differences between the TypeScript canonicalizeUrl
+  // function and the PostgreSQL regex-based backfill used in migration 0006.
+  // They document the gaps but do not test the migration directly (no DB access).
+
+  test("hostname lowercasing: SQL lower() lowercases entire URL, not just hostname", () => {
+    const tsResult = canonicalizeUrl("https://Example.COM:80/PATH?QUERY=VALUE#FRAG");
+    // TS: keeps protocol 'https:' (unchanged), lowercases hostname to 'example.com',
+    //     port :80 is NOT default for HTTPS (default is :443), so it is KEPT,
+    //     fragment removed, path/query case preserved
+    // result: 'https://example.com:80/PATH?QUERY=VALUE'
+    expect(tsResult).not.toBeNull();
+    expect(tsResult?.url).toBe("https://example.com:80/PATH?QUERY=VALUE");
+
+    // SQL backfill approximation (regex only, no full URL parser):
+    // lower('https://Example.COM:80/PATH?QUERY=VALUE#FRAG') ->
+    //   'https://example.com:80/path?query=value#frag'
+    // regexp_replace('^https?://', '', 'i') ->
+    //   'example.com:80/path?query=value#frag'
+    // regexp_replace('#.*$', '') ->
+    //   'example.com:80/path?query=value'
+    // regexp_replace('(:80|:443)(/|$)', '\2') ->
+    //   'example.com/path?query=value'
+    const sqlApprox = 'example.com/path?query=value';
+    expect(sqlApprox).toBe("example.com/path?query=value");
+
+    // Documented differences:
+    // 1. TS preserves case in path/query: 'PATH?QUERY=VALUE'
+    // 2. TS keeps protocol 'https:', SQL strips scheme entirely
+    // 3. TS keeps port :80 for HTTPS (not default), SQL removes :80 unconditionally
+    // 4. SQL backfill lowercases path/query: 'path?query=value'
+  });
+
+  test("default port removal: SQL regex lacks protocol context", () => {
+    // Case 1: HTTP with :80 - should be removed
+    const httpResult = canonicalizeUrl("http://example.com:80/path");
+    expect(httpResult).not.toBeNull();
+    expect(httpResult?.url).toBe("http://example.com/path");
+
+    // Case 2: HTTPS with :443 - should be removed
+    const httpsResult = canonicalizeUrl("https://example.com:443/path");
+    expect(httpsResult).not.toBeNull();
+    expect(httpsResult?.url).toBe("https://example.com/path");
+
+    // Case 3: HTTP with :443 (non-standard for HTTP) - should NOT be removed
+    const http443Result = canonicalizeUrl("http://example.com:443/path");
+    expect(http443Result).not.toBeNull();
+    expect(http443Result?.url).toBe("http://example.com:443/path");
+
+    // SQL regex (:80|:443)(/|$) would incorrectly remove :443 from HTTP URLs.
+    // This demonstrates why the SQL backfill is approximate.
+  });
+
+  test("query parameter sorting: SQL does not sort, TypeScript does", () => {
+    const tsResult = canonicalizeUrl("https://example.com/path?z=1&a=2&m=3");
+    expect(tsResult).not.toBeNull();
+    expect(tsResult?.parsed.search).toBe("?a=2&m=3&z=1"); // Sorted alphabetically
+
+    // SQL backfill does NOT sort query parameters.
+    // Input after scheme/host/fragment/port stripping: 'example.com/path?z=1&a=2&m=3'
+    // SQL leaves it as-is: 'example.com/path?z=1&a=2&m=3'
+  });
+
+  test("path normalization: SQL does not resolve . and .., TypeScript does", () => {
+    const tsResult = canonicalizeUrl("https://example.com/a/./b/../c");
+    expect(tsResult).not.toBeNull();
+    expect(tsResult?.parsed.pathname).toBe("/a/c"); // Resolved . and ..
+
+    // SQL backfill does NOT normalize path.
+    // Input after scheme/host/fragment/port stripping: 'example.com/a/./b/../c'
+    // SQL leaves it as-is: 'example.com/a/./b/../c'
+  });
+
+  test("combined example: demonstrating cumulative differences", () => {
+    const input = "https://Example.COM:80/a/./b/../c?z=1&a=2#section";
+
+    // TypeScript canonicalizeUrl:
+    // 1. new URL() -> hostname='Example.COM', port='80', pathname='/a/./b/../c', search='?z=1&a=2', hash='#section'
+    // 2. protocol check: passes (https:)
+    // 3. hostname lowercasing: 'example.com'
+    // 4. port removal: port 80 is NOT default for HTTPS, so it is KEPT
+    // 5. fragment removal: hash=''
+    // 6. query sorting: '?a=2&z=1'
+    // 7. path normalization: '/a/c'
+    // result: 'https://example.com:80/a/c?a=2&z=1'
+    const tsResult = canonicalizeUrl(input);
+    expect(tsResult).not.toBeNull();
+    expect(tsResult?.url).toBe("https://example.com:80/a/c?a=2&z=1");
+
+    // SQL backfill approximation:
+    // lower() -> 'https://example.com:80/a/./b/../c?z=1&a=2#section'
+    // strip scheme -> 'example.com:80/a/./b/../c?z=1&a=2#section'
+    // strip fragment -> 'example.com:80/a/./b/../c?z=1&a=2'
+    // strip :80 -> 'example.com/a/./b/../c?z=1&a=2'
+    // result: 'example.com/a/./b/../c?z=1&a=2' (path not normalized, query not sorted, port incorrectly removed)
+    const sqlApprox = "example.com/a/./b/../c?z=1&a=2";
+    expect(sqlApprox).toBe("example.com/a/./b/../c?z=1&a=2");
+  });
+});

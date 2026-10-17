@@ -160,6 +160,7 @@ function setupExistingVerifiedResource(mockClient: MockSupabaseClient, overrides
     expires_at: null,
     status: "verified",
     notes: JSON.stringify({ acquisition_job_id: jobId }),
+    acquisition_job_id: jobId,
     created_at: "2024-01-15T10:00:00.000Z",
   });
 }

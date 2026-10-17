@@ -241,13 +241,13 @@ async function createOrReuseVerificationRecord(
   const { acquiredPage, verificationResult, acquisitionJobId } = input;
 
   // Check for exact retry: same job ID + same content hash
-  // Use order+limit(1) for deterministic lookup instead of relying on unique constraint
+  // Use the dedicated acquisition_job_id column (notes is text, not jsonb)
   if (acquisitionJobId) {
     const { data: existingVR } = await supabase
       .from("verification_records")
       .select("id, content_hash")
       .eq("resource_id", resourceId)
-      .eq("notes->>acquisition_job_id", acquisitionJobId)
+      .eq("acquisition_job_id", acquisitionJobId)
       .order("created_at", { ascending: false })
       .limit(1);
 
@@ -266,7 +266,8 @@ async function createOrReuseVerificationRecord(
   // Prepare content_evidence with serialized educational evidence
   const contentEvidence = JSON.stringify(input.educationalEvidence.interpreted);
 
-  // Prepare notes with acquisition job ID if provided
+  // Prepare notes with acquisition job ID if provided (preserved as text for backward compat;
+  // the dedicated acquisition_job_id column below is the canonical retry-dedup key)
   const notes = acquisitionJobId
     ? JSON.stringify({ acquisition_job_id: acquisitionJobId })
     : null;
@@ -295,6 +296,8 @@ async function createOrReuseVerificationRecord(
     expires_at: null,
     status: verificationResult.status,
     notes,
+    // Dedicated typed column (text) used by the uq_vr_exact_retry index for retry dedup
+    acquisition_job_id: acquisitionJobId ?? null,
   };
 
   const { data, error } = await supabase
@@ -394,7 +397,7 @@ export async function persistVerifiedResource(input: PersistenceInput): Promise<
       .from("verification_records")
       .select("id, content_hash")
       .eq("resource_id", existingResource.id)
-      .eq("notes->>acquisition_job_id", input.acquisitionJobId)
+      .eq("acquisition_job_id", input.acquisitionJobId)
       .order("created_at", { ascending: false })
       .limit(1);
 
