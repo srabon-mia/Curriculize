@@ -1,5 +1,6 @@
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
+import { notesMatchRequest } from "@/lib/curriculum/finder";
 
 const supabase = createServiceClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -15,17 +16,41 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "topic is required" }, { status: 400 });
   }
 
-  // Cache check — normalize topic to catch "AP Chemistry" vs "ap chemistry"
-  const normalized = topic.trim().toLowerCase();
-  const { data: existing } = await supabase
+  // Warm-path cache — serve an existing published curriculum for an identical
+  // student request, skipping AI generation entirely. Lookup is EXACT on two
+  // signals (no fuzzy substring matching across topics):
+  //   1. title === topic (case-insensitive; precise, NOT `%topic%`). The prior
+  //      `%normalized%` ilike could return the wrong curriculum (e.g. "Chemistry"
+  //      matching "Organic Chemistry").
+  //   2. curricula.notes (the 6 generate-form fields persisted as JSON at
+  //      creation time) === the request's fields. `topic` is intentionally not
+  //      in notes — it is matched via (1). Different student inputs never match.
+  //
+  // No schema change required: `title` and the text `notes` column already capture
+  // every GenerateForm field, so an identical re-submission reproduces byte-identical JSON.
+  const { data: publishedMatches, error: cacheError } = await supabase
     .from("curricula")
-    .select("id, status")
-    .ilike("title", `%${normalized}%`)
+    .select("id, notes")
     .eq("status", "published")
-    .maybeSingle();
+    .ilike("title", topic.trim())
+    .order("created_at", { ascending: false });
 
-  if (existing) {
-    return NextResponse.json({ curriculum_id: existing.id, cached: true });
+  // Fail open: a transient cache-lookup failure must not block generation.
+  if (!cacheError && publishedMatches) {
+    for (const row of publishedMatches) {
+      if (
+        notesMatchRequest(row.notes, {
+          grade_level,
+          difficulty,
+          existing_knowledge,
+          learning_goal,
+          time_available,
+          added_context,
+        })
+      ) {
+        return NextResponse.json({ curriculum_id: row.id, cached: true });
+      }
+    }
   }
 
   // Create a pending curriculum record
