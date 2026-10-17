@@ -1,10 +1,23 @@
 import type { Metadata } from "next";
+import { Space_Grotesk, Inter } from "next/font/google";
 import "./globals.css";
 
+const spaceGrotesk = Space_Grotesk({
+  subsets: ["latin"],
+  variable: "--font-space-grotesk",
+  display: "swap",
+});
+
+const inter = Inter({
+  subsets: ["latin"],
+  variable: "--font-inter",
+  display: "swap",
+});
+
 export const metadata: Metadata = {
-  title: "Chemistry Curriculum — NYS Regents (Honors)",
+  title: "Curriculum Generator — Human-Curated Study Guides",
   description:
-    "A curated, human-sourced guide to NYS Regents Physical Setting/Chemistry, adapted for specialized high school rigor.",
+    "Generate structured, topic-by-topic study guides compiled from verified, human-curated educational web resources, or browse published curricula.",
 };
 
 export default function RootLayout({
@@ -13,8 +26,12 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className="h-full antialiased">
+    <html
+      lang="en"
+      className={`h-full antialiased ${inter.variable} ${spaceGrotesk.variable}`}
+    >
       <body className="min-h-full flex flex-col font-sans">{children}</body>
     </html>
   );
 }
+
