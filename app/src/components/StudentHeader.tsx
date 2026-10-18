@@ -53,7 +53,7 @@ export function StudentHeader() {
                 : "text-text-secondary hover:text-text-primary hover:bg-canvas-subtle"
             }`}
           >
-            About
+            About Us
           </Link>
         </nav>
       </div>
