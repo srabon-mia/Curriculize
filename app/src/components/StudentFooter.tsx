@@ -26,12 +26,6 @@ export function StudentFooter() {
           >
             Browse curricula
           </Link>
-          <Link
-            href="/admin"
-            className="hover:text-text-primary text-text-tertiary transition"
-          >
-            Admin
-          </Link>
         </div>
         <p className="text-[11px] text-text-tertiary">Free to use · No subscriptions or paid tiers</p>
       </div>
