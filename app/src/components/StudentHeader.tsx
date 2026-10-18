@@ -17,32 +17,43 @@ export function StudentHeader() {
           <span className="w-8 h-8 rounded-lg bg-brand-forest flex items-center justify-center text-white font-display font-bold text-sm shadow-sm group-hover:bg-brand-forest-hover transition">
             C
           </span>
-          <span className="font-display font-semibold text-base sm:text-lg tracking-tight text-brand-navy">
+          <span className="hidden font-display font-semibold text-base tracking-tight text-brand-navy sm:inline sm:text-lg">
             Curriculum Generator
           </span>
         </Link>
 
         {/* Navigation Links */}
-        <nav className="flex items-center gap-2 sm:gap-4">
+        <nav aria-label="Main navigation" className="flex items-center gap-1 sm:gap-4">
           <Link
             href="/"
-            className={`text-sm font-medium px-3 py-1.5 rounded-md transition ${
+            className={`text-xs sm:text-sm font-medium px-2 sm:px-3 py-1.5 rounded-md transition ${
               pathname === "/"
                 ? "text-brand-forest bg-brand-aqua-tint/60"
                 : "text-text-secondary hover:text-text-primary hover:bg-canvas-subtle"
             }`}
           >
-            Start learning
+            <span className="sm:hidden">Start</span><span className="hidden sm:inline">Start learning</span>
           </Link>
           <Link
             href="/curriculum"
-            className={`text-sm font-medium px-3 py-1.5 rounded-md transition ${
+            className={`text-xs sm:text-sm font-medium px-2 sm:px-3 py-1.5 rounded-md transition ${
               pathname.startsWith("/curriculum")
                 ? "text-brand-forest bg-brand-aqua-tint/60"
                 : "text-text-secondary hover:text-text-primary hover:bg-canvas-subtle"
             }`}
           >
-            Browse paths
+            <span className="sm:hidden">Browse</span><span className="hidden sm:inline">Browse paths</span>
+          </Link>
+          <Link
+            href="/about"
+            aria-current={pathname === "/about" ? "page" : undefined}
+            className={`text-xs sm:text-sm font-medium px-2 sm:px-3 py-1.5 rounded-md transition ${
+              pathname === "/about"
+                ? "text-brand-forest bg-brand-aqua-tint/60"
+                : "text-text-secondary hover:text-text-primary hover:bg-canvas-subtle"
+            }`}
+          >
+            About
           </Link>
         </nav>
       </div>

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Space_Grotesk, Inter } from "next/font/google";
 import "./globals.css";
+import { BackToTop } from "@/components/BackToTop";
 
 const spaceGrotesk = Space_Grotesk({
   subsets: ["latin"],
@@ -30,7 +31,10 @@ export default function RootLayout({
       lang="en"
       className={`h-full antialiased scroll-smooth ${inter.variable} ${spaceGrotesk.variable}`}
     >
-      <body className="min-h-full flex flex-col font-sans">{children}</body>
+      <body className="min-h-full flex flex-col font-sans">
+        {children}
+        <BackToTop />
+      </body>
     </html>
   );
 }
