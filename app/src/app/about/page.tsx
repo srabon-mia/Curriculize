@@ -37,7 +37,7 @@ export default function AboutPage() {
           </div>
         </section>
 
-        <section className="px-6 py-10 sm:py-14">
+        <section className="bg-surface-card px-6 py-10 sm:py-14">
           <div className="mx-auto grid max-w-5xl items-center gap-6 md:grid-cols-12 md:gap-8">
             <div className="md:col-span-5">
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-brand-forest">The idea</p>
@@ -81,7 +81,7 @@ export default function AboutPage() {
           </div>
         </section>
 
-        <section className="px-6 py-10 sm:py-14">
+        <section className="bg-canvas-default px-6 py-10 sm:py-14">
           <div className="mx-auto grid max-w-5xl gap-4 md:grid-cols-2">
             <article className="rounded-2xl border border-border-default bg-surface-card p-6 shadow-sm sm:p-7">
               <span aria-hidden="true" className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand-aqua-tint text-lg text-brand-forest">◎</span>
@@ -98,19 +98,19 @@ export default function AboutPage() {
           </div>
         </section>
 
-        <section className="px-6 pb-10 sm:pb-14">
+        <section className="bg-canvas-subtle/50 px-6 pb-10 sm:pb-14">
           <div className="mx-auto max-w-5xl rounded-2xl border border-border-default bg-surface-card px-5 py-5 shadow-sm sm:px-7">
             <p className="text-xs font-semibold uppercase tracking-[0.16em] text-brand-forest">A note on how paths are made</p>
             <p className="mt-2 text-sm leading-relaxed text-text-secondary">Some curricula use adapted structures; others may be AI-organized. Educational resources come from existing sources. Availability and fit vary, and resource checks do not mean an educator has reviewed or endorsed every item.</p>
           </div>
         </section>
 
-        <section className="border-t border-border-subtle bg-brand-navy px-6 py-9 text-white sm:py-11">
+        <section className="border-t border-brand-forest/20 bg-brand-forest px-6 py-9 text-white sm:py-11">
           <div className="mx-auto flex max-w-5xl flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
             <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-brand-aqua">Ready to get started?</p><h2 className="mt-1 font-display text-2xl font-bold">Choose a path that fits.</h2></div>
             <div className="flex flex-wrap gap-3">
-              <Link href="/#generate" className="inline-flex items-center justify-center gap-2 rounded-lg bg-brand-aqua px-4 py-2.5 text-sm font-semibold text-brand-navy transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-brand-navy">Build a Curriculum <span aria-hidden="true">→</span></Link>
-              <Link href="/curriculum" className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/30 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-brand-navy">Browse Existing Curricula <span aria-hidden="true">→</span></Link>
+              <Link href="/#generate" className="inline-flex items-center justify-center gap-2 rounded-lg bg-brand-aqua px-4 py-2.5 text-sm font-semibold text-brand-navy transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-brand-forest">Build a Curriculum <span aria-hidden="true">→</span></Link>
+              <Link href="/curriculum" className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/30 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-brand-forest">Browse Existing Curricula <span aria-hidden="true">→</span></Link>
             </div>
           </div>
         </section>

@@ -31,7 +31,7 @@ function CurriculumCard({ curriculum }: { curriculum: Curriculum }) {
 
 function FeaturedCurricula({ curricula, failed }: { curricula: Curriculum[]; failed: boolean }) {
   return (
-    <section id="curricula" className="scroll-mt-20 border-t border-border-subtle bg-canvas-subtle/40 px-6 py-14 sm:py-16">
+    <section id="curricula" className="scroll-mt-20 border-t border-border-subtle bg-canvas-default px-6 py-14 sm:py-16">
       <div className="mx-auto max-w-6xl">
         <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
@@ -136,7 +136,7 @@ async function LearningSections() {
 
   return (
     <>
-      <section className="border-y border-border-subtle bg-canvas-subtle/40 px-6 py-14 sm:py-16">
+      <section className="border-y border-border-subtle bg-surface-card px-6 py-14 sm:py-16">
         <div className="mx-auto max-w-6xl">
           <div className="mx-auto mb-9 max-w-3xl text-center">
             <p className="text-xs font-semibold uppercase tracking-[0.18em] text-brand-forest">Why a learning path helps</p>
@@ -196,7 +196,7 @@ export default function LandingPage() {
             </div>
           </div>
         </section>
-        <section id="generate" className="scroll-mt-20 border-y border-border-subtle bg-canvas-subtle/40 px-6 py-10 sm:py-12">
+        <section id="generate" className="scroll-mt-20 border-y border-border-subtle bg-canvas-subtle px-6 py-10 sm:py-12">
           <div className="mx-auto max-w-4xl">
             <h2 className="mb-5 font-display text-2xl font-bold tracking-tight text-brand-navy sm:text-3xl">Build a curriculum for your topic</h2>
               <div className="rounded-xl border border-border-default bg-surface-card p-5 shadow-sm sm:p-7">
