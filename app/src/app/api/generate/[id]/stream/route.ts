@@ -8,10 +8,7 @@ import {
   discoverVerifiedResource,
   type LearnParams,
 } from "@/lib/learningEngine";
-import {
-  createCache,
-  getCacheStore,
-} from "@/lib/cache";
+import { createCache } from "@/lib/cache";
 import { AcquisitionDedupTracker } from "@/lib/acquisition";
 
 export const maxDuration = 300;
