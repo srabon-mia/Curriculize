@@ -16,15 +16,14 @@ export default async function CurriculaIndexPage() {
       <main className="flex-1 max-w-5xl w-full mx-auto px-6 py-12 sm:py-16">
         <header className="mb-10 sm:mb-12">
           <p className="text-xs font-display font-semibold uppercase tracking-[0.18em] text-brand-forest mb-2.5">
-            Curated Study Guides
+            Published learning paths
           </p>
           <h1 className="font-display text-3xl sm:text-4xl font-bold tracking-tight text-brand-navy mb-3">
             Browse Curricula
           </h1>
           <p className="text-base text-text-secondary leading-relaxed max-w-2xl">
-            Human-sourced study guides built from real, verified educational resources.
-            Every curriculum is structured around trusted academic syllabi with
-            separate learning guides and practice problems.
+            Browse published curricula organized by subject. Each path may include
+            topics, key ideas, and available learning resources; coverage varies.
           </p>
         </header>
 
@@ -34,7 +33,7 @@ export default async function CurriculaIndexPage() {
               No curricula published yet
             </p>
             <p className="text-sm text-text-secondary mb-5">
-              Generate the first study guide using our curriculum builder.
+              Build a curriculum for a topic you want to learn, or check back as the catalog grows.
             </p>
             <Link
               href="/"
@@ -61,7 +60,7 @@ export default async function CurriculaIndexPage() {
                         <span />
                       )}
                       <span className="text-xs font-mono text-text-tertiary uppercase">
-                        {c.source_type === "adapted" ? "Official syllabus" : "AI organized"}
+                        {c.source_type === "adapted" ? "Adapted structure" : "AI-organized structure"}
                       </span>
                     </div>
 
@@ -71,7 +70,7 @@ export default async function CurriculaIndexPage() {
 
                     {c.source_attribution && (
                       <p className="text-xs text-text-secondary mt-2.5 flex items-center gap-1">
-                        <span>Adapted from</span>
+                        <span>Source:</span>
                         <span className="font-medium text-text-primary">
                           {c.source_attribution}
                         </span>
@@ -80,7 +79,7 @@ export default async function CurriculaIndexPage() {
                   </div>
 
                   <div className="pt-5 mt-4 border-t border-border-subtle flex items-center justify-between text-sm">
-                    <span className="text-xs text-text-tertiary">Verified study guide</span>
+                    <span className="text-xs text-text-tertiary">Published curriculum</span>
                     <span className="font-medium text-brand-forest flex items-center gap-1 group-hover:translate-x-0.5 transition-transform">
                       Explore guide <span aria-hidden="true">→</span>
                     </span>
@@ -95,4 +94,4 @@ export default async function CurriculaIndexPage() {
       <StudentFooter />
     </div>
   );
-}
+}
