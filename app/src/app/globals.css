@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 :root {
-  --background: #F8FAF8;
+  --background: #F2F8F3;
   --foreground: #111927;
 }
 
@@ -10,11 +10,11 @@
   --color-foreground: var(--foreground);
 
   /* Canvas & Surface Tokens */
-  --color-canvas-default: #F8FAF8;
-  --color-canvas-subtle: #F1F5F1;
+  --color-canvas-default: #F2F8F3;
+  --color-canvas-subtle: #EAF2EB;
   --color-surface-card: #FFFFFF;
   --color-surface-elevated: #FFFFFF;
-  --color-surface-muted: #EBF1EB;
+  --color-surface-muted: #E4EFE5;
 
   /* Brand Palette (Forest, Fresh Accent, Soft Aqua, Deep Navy) */
   --color-brand-forest: #176B3A;
@@ -31,9 +31,9 @@
   --color-text-inverse: #FFFFFF;
 
   /* Borders & Dividers */
-  --color-border-subtle: #E8ECE8;
-  --color-border-default: #DCE3DC;
-  --color-border-hover: #BAC6BA;
+  --color-border-subtle: #DEE9DF;
+  --color-border-default: #D0DFD2;
+  --color-border-hover: #AEBFAF;
   --color-border-focus: #176B3A;
 
   /* Semantic Status Indicators */
@@ -57,4 +57,16 @@
 body {
   background: var(--background);
   color: var(--foreground);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html:focus-within,
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

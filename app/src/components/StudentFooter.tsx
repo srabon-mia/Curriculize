@@ -2,24 +2,24 @@ import Link from "next/link";
 
 export function StudentFooter() {
   return (
-    <footer className="border-t border-border-subtle bg-surface-card">
+    <footer className="border-t border-white/10 bg-brand-navy text-white">
       <div className="max-w-6xl mx-auto px-6 py-14 sm:py-16">
-        {/* Three column layout */}
-        <div className="grid grid-cols-1 gap-10 md:gap-12 sm:grid-cols-2 lg:grid-cols-3">
+        {/* Brand and navigation */}
+        <div className="grid grid-cols-1 gap-10 md:gap-12 sm:grid-cols-2">
           {/* Left Column: Brand */}
           <div className="flex flex-col gap-5">
             <Link
               href="/"
-              className="flex items-center gap-2.5 text-text-primary hover:text-brand-forest transition group w-fit"
+              className="flex items-center gap-2.5 text-white hover:text-brand-aqua transition group w-fit"
             >
               <span className="flex h-8 w-8 shrink-0 rounded-lg bg-brand-forest text-white font-display font-bold text-sm shadow-sm transition group-hover:bg-brand-forest-hover">
                 C
               </span>
-              <span className="font-display font-semibold text-base sm:text-lg tracking-tight text-brand-navy">
+              <span className="font-display font-semibold text-base sm:text-lg tracking-tight text-white">
                 Curriculum Generator
               </span>
             </Link>
-            <p className="text-sm leading-relaxed text-text-secondary max-w-xs">
+            <p className="text-sm leading-relaxed text-white/75 max-w-xs">
               Structured study guides compiled with AI from verified, human-curated educational resources.
             </p>
             {/* GitHub icon below description */}
@@ -27,7 +27,7 @@ export function StudentFooter() {
               href="https://github.com/srabon-mia/Curriculum-Generator"
               target="_blank"
               rel="noopener noreferrer"
-              className="flex items-center justify-center w-8 h-8 rounded-full border border-brand-forest/50 text-brand-forest hover:bg-brand-forest/10 transition-colors"
+              className="flex items-center justify-center w-8 h-8 rounded-full border border-white/25 text-white/80 transition-colors hover:border-brand-aqua/60 hover:bg-white/10 hover:text-brand-aqua focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-aqua"
               aria-label="View on GitHub"
             >
               <svg
@@ -44,26 +44,26 @@ export function StudentFooter() {
           </div>
 
           {/* Right Column: Quick Links */}
-          <div className="flex flex-col gap-4 lg:col-start-3">
-            <h2 className="text-xs font-semibold uppercase tracking-[0.18em] text-text-tertiary">
+          <div className="flex flex-col gap-4">
+            <h2 className="text-xs font-semibold uppercase tracking-[0.18em] text-white/60">
               Quick Links
             </h2>
-            <div className="space-y-2">
+            <div className="space-y-2.5">
               <Link
-                href="/"
-                className="flex items-center gap-2 text-sm font-medium text-text-tertiary hover:text-brand-forest transition"
+                href="/about"
+                className="flex items-center gap-2 text-sm font-medium text-white/75 transition hover:text-brand-aqua focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-aqua"
               >
                 • About Us
               </Link>
               <Link
                 href="/curriculum"
-                className="flex items-center gap-2 text-sm font-medium text-text-tertiary hover:text-brand-forest transition"
+                className="flex items-center gap-2 text-sm font-medium text-white/75 transition hover:text-brand-aqua focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-aqua"
               >
                 • Browse Curricula
               </Link>
               <Link
-                href="/generate"
-                className="flex items-center gap-2 text-sm font-medium text-text-tertiary hover:text-brand-forest transition"
+                href="/#generate"
+                className="flex items-center gap-2 text-sm font-medium text-white/75 transition hover:text-brand-aqua focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-aqua"
               >
                 • Build a Curriculum
               </Link>
@@ -72,11 +72,11 @@ export function StudentFooter() {
         </div>
 
         {/* Bottom copyright row */}
-        <div className="mt-12 pt-8 border-t border-border-subtle flex flex-col sm:flex-row items-center justify-between gap-3">
-          <p className="text-xs text-text-tertiary">
+        <div className="mt-12 pt-8 border-t border-white/15 flex flex-col sm:flex-row items-center justify-between gap-3">
+          <p className="text-xs text-white/60">
             © {new Date().getFullYear()} Curriculum Generator. All rights reserved.
           </p>
-          <p className="text-xs text-text-tertiary">
+          <p className="text-xs text-white/60">
             Free to use · No subscriptions or paid tiers
           </p>
         </div>

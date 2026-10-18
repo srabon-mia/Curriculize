@@ -4,6 +4,15 @@ import { buildDiscoverPrompt, buildTopicBatchPrompt } from "@/lib/prompts/discov
 import { buildSourceDiscoveryPrompt } from "@/lib/prompts/sources";
 import type { NodeWithChildren } from "@/lib/curriculum-data";
 import { getAIProvider } from "@/lib/ai";
+import {
+  discoverVerifiedResource,
+  type LearnParams,
+} from "@/lib/learningEngine";
+import {
+  createCache,
+  getCacheStore,
+} from "@/lib/cache";
+import { AcquisitionDedupTracker } from "@/lib/acquisition";
 
 export const maxDuration = 300;
 
@@ -41,6 +50,50 @@ async function callAISources(prompt: string): Promise<string> {
     maxTokens: 2000,
   });
   return textResult.text;
+}
+
+/**
+ * Fetch the acquisition job id for this curriculum, if one exists.
+ * POST /api/generate creates a pending job (job_type='curriculum_generation')
+ * before opening the SSE stream; the job id is recorded against verification
+ * evidence for idempotent retry-dedup (Phase 9). When no job exists (e.g. job
+ * creation failed at POST time), returns undefined — persistence still works,
+ * it simply skips job-scoped retry dedup.
+ */
+async function getAcquisitionJobId(curriculumId: string): Promise<string | undefined> {
+  const { data } = await supabase
+    .from("acquisition_jobs")
+    .select("id")
+    .eq("curriculum_id", curriculumId)
+    .eq("job_type", "curriculum_generation")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return data?.id;
+}
+
+/** Normalize an AI discovery candidate into the Learning Engine input shape. */
+function toLearnParams(
+  candidate: Record<string, unknown>,
+  target: { nodeId?: string; understandingId?: string },
+  acquisitionJobId?: string,
+  aiNote?: string | null
+): LearnParams {
+  return {
+    candidate: {
+      url: String(candidate.url),
+      title: candidate.title ? String(candidate.title) : undefined,
+      resourceType: candidate.resource_type ? String(candidate.resource_type) : undefined,
+      licenseStatus: (candidate.license_status as
+        | "cc_open"
+        | "link_only"
+        | "unknown_review_needed"
+        | undefined) ?? "link_only",
+      aiNote: (candidate.ai_note as string | undefined) ?? aiNote ?? null,
+    },
+    target,
+    acquisitionJobId,
+  };
 }
 
 export async function GET(
@@ -212,7 +265,21 @@ export async function GET(
           console.log("Source discovery failed, continuing without prioritized sources:", err);
         }
 
-        // Step 4: Discover topic-level resources during generation
+        // Step 4: Discover topic-level resources during generation.
+        //
+        // Phase 12: candidates are routed through the Learning Engine
+        // (acquire → evidence → verify → persist) via discoverVerifiedResource(),
+        // not inserted directly. This writes every resource as status='draft'
+        // (pending admin approval) with content_type_verified derived from the
+        // deterministic verification gate — never hardcoded.
+        //
+        // A scoped cache + dedup tracker spans the topic loop AND the later
+        // background per-understanding batch so the same URL is acquired at
+        // most once within this generation request (Phase 11 cache keys).
+        const cache = createCache({ enabled: true, maxEntries: 200 });
+        const dedupTracker = new AcquisitionDedupTracker();
+        const acquisitionJobId = await getAcquisitionJobId(id);
+
         for (let i = 0; i < nodeIds.length; i++) {
           const { nodeId, node } = nodeIds[i];
 
@@ -287,24 +354,37 @@ export async function GET(
               }
             }
 
-            const resources = candidates
-              .filter((c) => c.url && c.title)
-              .map((c) => ({
-                node_id: nodeId,
-                major_understanding_id: null,
-                url: c.url,
-                title: c.title,
-                source_domain: c.source_domain ?? "",
-                resource_type: c.resource_type ?? "other",
-                license_status: c.license_status ?? "link_only",
-                embed_allowed: false,
-                ai_note: c.ai_note ?? null,
-                content_type_verified: false, // Phase 12: replace with persistVerifiedResource() after verified acquisition pipeline exists
-                status: "draft",
-              }));
+            const persisted = [];
+            for (const c of candidates.filter((c) => c.url && c.title)) {
+              const params = toLearnParams(
+                c as Record<string, unknown>,
+                { nodeId },
+                acquisitionJobId,
+                c.ai_note ?? null
+              );
+              try {
+                const out = await discoverVerifiedResource(params, {
+                  cache,
+                  dedupTracker,
+                });
+                if (out) {
+                  persisted.push(out);
+                }
+              } catch (routeErr) {
+                // acquireVerifyPersist already isolates per-candidate failures,
+                // but guard here so one unexpected error can't abort the topic.
+                console.log(
+                  `learnResource threw for ${c.url}:`,
+                  routeErr instanceof Error ? routeErr.message : routeErr
+                );
+              }
+            }
 
-            if (resources.length > 0) {
-              await supabase.from("resources").insert(resources);
+            if (persisted.length > 0) {
+              console.log(
+                `Topic "${node.title}": ${persisted.length}/${candidates.length} candidates persisted ` +
+                  `(verified: ${persisted.filter((p) => p.verificationStatus === "verified").length})`
+              );
             }
           } catch (err) {
             console.log(
@@ -407,22 +487,36 @@ export async function GET(
                     ? coveredMuIds
                     : muRows.map((m) => m.id);
 
-                const resources = targetMuIds.map((muId) => ({
-                  node_id: null,
-                  major_understanding_id: muId,
-                  url: candidate.url,
-                  title: candidate.title,
-                  source_domain: candidate.source_domain ?? "",
-                  resource_type: candidate.resource_type ?? "other",
-                  license_status: candidate.license_status ?? "link_only",
-                  embed_allowed: false,
-                  ai_note: candidate.ai_note ?? null,
-                  content_type_verified: false, // Phase 12: replace with persistVerifiedResource() after verified acquisition pipeline exists
-                  status: "draft",
-                }));
+                // Phase 12: persist each (candidate, understanding) pair through the
+                // Learning Engine so it goes through acquisition + verification +
+                // evidence before landing as a draft resource. The scoped cache
+                // makes re-acquiring the same URL (for other MUs) a cache hit, so
+                // this does not multiply network fetches. No dedup tracker here:
+                // a URL legitimately targets multiple understandings.
+                let batchPersisted = 0;
+                for (const muId of targetMuIds) {
+                  const params = toLearnParams(
+                    candidate as Record<string, unknown>,
+                    { understandingId: muId },
+                    acquisitionJobId,
+                    candidate.ai_note ?? null
+                  );
+                  try {
+                    const out = await discoverVerifiedResource(params, { cache });
+                    if (out) batchPersisted++;
+                  } catch (routeErr) {
+                    console.log(
+                      `learnResource threw for ${candidate.url} (mu ${muId}):`,
+                      routeErr instanceof Error ? routeErr.message : routeErr
+                    );
+                  }
+                }
 
-                if (resources.length > 0) {
-                  await supabase.from("resources").insert(resources);
+                if (batchPersisted > 0) {
+                  console.log(
+                    `Batch topic "${node.title}": ${batchPersisted}/${targetMuIds.length} ` +
+                      `MU mappings persisted for "${candidate.title}"`
+                  );
                 }
               }
             } catch (err) {

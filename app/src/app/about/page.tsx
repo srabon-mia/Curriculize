@@ -10,7 +10,7 @@ export const metadata: Metadata = {
 };
 
 const steps = [
-  ["01", "Pick a topic", "A class, exam, new skill, or something you’re curious about."],
+  ["01", "Pick a topic", "A class, hobby, new skill, or something you’re curious about."],
   ["02", "Look for a path", "Browse published curricula first; a new one is optional."],
   ["03", "Build one if needed", "If nothing suitable exists, request a curriculum for your topic."],
   ["04", "Explore and learn", "Move through topics and follow the resources connected to them."],
@@ -91,7 +91,7 @@ export default function AboutPage() {
             </article>
             <article className="rounded-2xl border border-brand-aqua/70 bg-brand-aqua-tint p-6 shadow-sm sm:p-7">
               <span aria-hidden="true" className="flex h-9 w-9 items-center justify-center rounded-lg bg-surface-card text-lg text-brand-forest">↗</span>
-              <p className="mt-4 text-xs font-semibold uppercase tracking-[0.16em] text-brand-forest">Our mission</p>
+              <p className="mt-4 text-xs font-semibold uppercase tracking-[0.16em] text-brand-forest">Our goal</p>
               <h2 className="mt-2 font-display text-xl font-bold text-brand-navy">Less time getting organized. More room to learn.</h2>
               <p className="mt-3 text-sm leading-relaxed text-text-secondary">Finding resources, choosing where to start, and arranging a learning journey can make a new subject feel like a lot. We want to make those first steps simpler.</p>
             </article>
