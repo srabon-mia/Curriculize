@@ -8,7 +8,7 @@ export function StudentHeader() {
 
   return (
     <header className="border-b border-border-subtle bg-surface-card/95 backdrop-blur-sm sticky top-0 z-40 transition-colors">
-      <div className="max-w-5xl mx-auto px-6 h-16 flex items-center justify-between">
+      <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
         {/* Brand */}
         <Link
           href="/"
@@ -32,7 +32,7 @@ export function StudentHeader() {
                 : "text-text-secondary hover:text-text-primary hover:bg-canvas-subtle"
             }`}
           >
-            Generator
+            Start learning
           </Link>
           <Link
             href="/curriculum"
@@ -42,7 +42,7 @@ export function StudentHeader() {
                 : "text-text-secondary hover:text-text-primary hover:bg-canvas-subtle"
             }`}
           >
-            Browse
+            Browse paths
           </Link>
           <Link
             href="/admin"

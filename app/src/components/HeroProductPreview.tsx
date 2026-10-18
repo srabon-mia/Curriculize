@@ -1,116 +1,102 @@
-export function HeroProductPreview() {
-  return (
-    <div className="relative w-full max-w-lg mx-auto lg:max-w-none">
-      {/* Background ambient glow using soft brand tints */}
-      <div
-        aria-hidden="true"
-        className="absolute -inset-1 rounded-3xl bg-gradient-to-tr from-brand-aqua/30 via-brand-forest/10 to-transparent blur-xl -z-10 opacity-70"
-      />
+import Link from "next/link";
 
-      <div className="bg-surface-card rounded-2xl border border-border-default shadow-sm hover:shadow-md transition-shadow overflow-hidden">
-        {/* Workspace Mock Header */}
-        <div className="border-b border-border-subtle bg-canvas-subtle/70 px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span className="w-2.5 h-2.5 rounded-full bg-border-hover" />
-            <span className="w-2.5 h-2.5 rounded-full bg-border-hover" />
-            <span className="w-2.5 h-2.5 rounded-full bg-border-hover" />
-            <span className="font-mono text-[11px] text-text-tertiary ml-2 hidden sm:inline">
-              curriculum / chemistry-regents
-            </span>
+type PreviewCurriculum = {
+  id: string;
+  title: string;
+  subject: string;
+  topics: {
+    title: string;
+    understandings: string[];
+    resources: { title: string; source_domain: string | null }[];
+  }[];
+};
+
+export function HeroProductPreview({
+  curriculum,
+}: {
+  curriculum: PreviewCurriculum | null;
+}) {
+  const firstTopic = curriculum?.topics[0];
+  const resources = firstTopic?.resources.slice(0, 2) ?? [];
+
+  return (
+    <div className="relative mx-auto w-full max-w-lg lg:max-w-none">
+      <div className="overflow-hidden rounded-2xl border border-border-default bg-surface-card shadow-lg shadow-brand-navy/5">
+        <div className="flex items-center justify-between gap-3 border-b border-border-subtle bg-canvas-subtle/70 px-5 py-4">
+          <div className="min-w-0">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-brand-forest">
+              {curriculum ? curriculum.subject || "Published curriculum" : "A clearer way to learn"}
+            </p>
+            <h2 className="mt-1 truncate font-display text-base font-semibold text-brand-navy">
+              {curriculum?.title ?? "A subject, organized"}
+            </h2>
           </div>
-          <span className="text-[11px] font-medium font-mono px-2 py-0.5 rounded bg-brand-aqua-tint text-brand-navy border border-brand-aqua/40">
-            Official Syllabus
+          <span aria-hidden="true" className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-brand-aqua-tint text-brand-forest">
+            <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5" stroke="currentColor" strokeWidth="1.7">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v16H6.5A2.5 2.5 0 0 0 4 21.5v-16ZM4 5.5V20m4-12h8m-8 4h5" />
+            </svg>
           </span>
         </div>
 
-        {/* Workspace Content */}
-        <div className="p-5 sm:p-6 space-y-4">
-          {/* Level 1: Curriculum & Active Topic */}
-          <div>
-            <div className="flex items-center justify-between text-xs text-text-tertiary mb-1">
-              <span className="font-mono uppercase tracking-wider text-[10px]">Topic 01 of 10</span>
-              <span className="font-mono text-[10px] text-brand-forest font-semibold">Exam Weight: 10–12%</span>
-            </div>
-            <h3 className="font-display text-lg font-bold text-brand-navy">
-              Atomic Concepts &amp; Structure
-            </h3>
-            <p className="text-xs text-text-secondary mt-0.5">
-              Subatomic particles, electron configurations, and periodic properties.
-            </p>
-          </div>
-
-          {/* Level 2: Major Understanding Card */}
-          <div className="bg-canvas-subtle/50 rounded-xl border border-border-subtle p-3.5 space-y-3">
-            <div className="flex items-start gap-2.5">
-              <span className="shrink-0 font-mono text-[11px] font-bold text-brand-forest bg-white px-2 py-0.5 rounded border border-border-default shadow-2xs">
-                MU 3.1a
-              </span>
-              <p className="text-xs text-text-primary leading-relaxed font-medium">
-                The modern model of the atom has evolved over time through experimental evidence by Thomson, Rutherford, and Bohr.
-              </p>
-            </div>
-
-            {/* Level 3: Curated Resources List */}
-            <div className="pt-2 border-t border-border-subtle/80 space-y-2">
-              <div className="text-[10px] font-semibold uppercase tracking-wider text-text-tertiary">
-                Curated Resources
-              </div>
-
-              {/* Resource 1: Video */}
-              <div className="flex items-center justify-between gap-2 p-2 rounded-lg bg-surface-card border border-border-subtle text-xs hover:border-brand-forest/30 transition-colors">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="shrink-0 text-[10px] font-medium px-2 py-0.5 rounded-full bg-[#EBF5FB] text-[#1E5B94] border border-[#D4E6F1]">
-                    Video
-                  </span>
-                  <span className="text-text-primary font-medium truncate text-xs">
-                    History of Atomic Chemistry
-                  </span>
+        <div className="space-y-4 p-5 sm:p-6">
+          {firstTopic ? (
+            <>
+              <div className="flex items-center gap-3">
+                <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-brand-aqua-tint font-mono text-xs font-semibold text-brand-forest">01</span>
+                <div className="min-w-0">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-text-tertiary">Start with a topic</p>
+                  <p className="truncate font-display text-sm font-semibold text-brand-navy">{firstTopic.title}</p>
                 </div>
-                <span className="shrink-0 font-mono text-[10px] text-text-tertiary">
-                  youtube.com
-                </span>
               </div>
 
-              {/* Resource 2: Textbook Reading */}
-              <div className="flex items-center justify-between gap-2 p-2 rounded-lg bg-surface-card border border-border-subtle text-xs hover:border-brand-forest/30 transition-colors">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="shrink-0 text-[10px] font-medium px-2 py-0.5 rounded-full bg-canvas-subtle text-text-secondary border border-border-default">
-                    Reading
-                  </span>
-                  <span className="text-text-primary font-medium truncate text-xs">
-                    OpenStax: The Structure of the Atom
-                  </span>
-                </div>
-                <span className="shrink-0 font-mono text-[10px] text-text-tertiary">
-                  openstax.org
-                </span>
-              </div>
+              <div className="ml-4 space-y-3 border-l border-brand-aqua pl-7">
+                {firstTopic.understandings.length > 0 ? firstTopic.understandings.map((understanding, index) => (
+                  <div key={`${index}-${understanding}`} className="rounded-lg border border-border-subtle bg-canvas-default px-3.5 py-3">
+                    <p className="text-[10px] font-semibold uppercase tracking-wider text-text-tertiary">Key idea {index + 1}</p>
+                    <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-text-primary">{understanding}</p>
+                  </div>
+                )) : (
+                  <p className="text-xs text-text-secondary">Explore the ideas that make up this topic.</p>
+                )}
 
-              {/* Resource 3: Practice Problem Set */}
-              <div className="flex items-center justify-between gap-2 p-2 rounded-lg bg-surface-card border border-border-subtle text-xs hover:border-brand-forest/30 transition-colors">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="shrink-0 text-[10px] font-medium px-2 py-0.5 rounded-full bg-[#EAF7ED] text-[#166534] border border-[#CEEBD3]">
-                    Practice
-                  </span>
-                  <span className="text-text-primary font-medium truncate text-xs">
-                    Atomic Models Problem Set &amp; Key
-                  </span>
-                </div>
-                <span className="shrink-0 font-mono text-[10px] text-text-tertiary">
-                  nysed.gov
-                </span>
+                {resources.length > 0 && (
+                  <div className="space-y-2 pt-1">
+                    <p className="text-[10px] font-semibold uppercase tracking-wider text-text-tertiary">Related resources</p>
+                    {resources.map((resource, index) => (
+                      <div key={`${index}-${resource.title}`} className="flex min-w-0 items-center gap-2 rounded-lg bg-brand-aqua-tint/50 px-3 py-2">
+                        <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand-forest" />
+                        <span className="truncate text-xs font-medium text-text-primary">{resource.title}</span>
+                        {resource.source_domain && <span className="hidden shrink-0 text-[10px] text-text-tertiary sm:inline">{resource.source_domain}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
-            </div>
-          </div>
-
-          {/* Subsequent Topic Peek */}
-          <div className="flex items-center justify-between px-3 py-2 rounded-lg border border-border-subtle bg-canvas-subtle/30 text-xs text-text-tertiary">
-            <div className="flex items-center gap-2">
-              <span className="font-mono text-[10px]">Topic 02</span>
-              <span className="font-medium text-text-secondary">Periodic Table &amp; Periodic Trends</span>
-            </div>
-            <span className="font-mono text-[10px]">4 concepts</span>
-          </div>
+              <Link href={`/curriculum/${curriculum.id}`} className="inline-flex text-xs font-semibold text-brand-forest hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:ring-offset-2">
+                Explore this curriculum <span aria-hidden="true" className="ml-1">→</span>
+              </Link>
+            </>
+          ) : (
+            <>
+              <div className="flex items-center gap-3 rounded-lg border border-border-subtle bg-canvas-default p-3.5">
+                <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-brand-aqua-tint font-mono text-xs font-semibold text-brand-forest">01</span>
+                <div><p className="font-display text-sm font-semibold text-brand-navy">Choose a topic</p><p className="text-xs text-text-secondary">Start with what you want to understand.</p></div>
+              </div>
+              <div className="ml-4 h-5 border-l border-brand-aqua" />
+              <div className="flex items-center gap-3 rounded-lg border border-border-subtle bg-canvas-default p-3.5">
+                <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-brand-aqua-tint font-mono text-xs font-semibold text-brand-forest">02</span>
+                <div><p className="font-display text-sm font-semibold text-brand-navy">See how ideas connect</p><p className="text-xs text-text-secondary">Move through topics and their key understandings.</p></div>
+              </div>
+              <div className="ml-4 h-5 border-l border-brand-aqua" />
+              <div className="flex items-center gap-3 rounded-lg border border-border-subtle bg-canvas-default p-3.5">
+                <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-brand-aqua-tint font-mono text-xs font-semibold text-brand-forest">03</span>
+                <div><p className="font-display text-sm font-semibold text-brand-navy">Explore related resources</p><p className="text-xs text-text-secondary">Find available learning material in context.</p></div>
+              </div>
+            </>
+          )}
+        </div>
+        <div className="border-t border-border-subtle px-5 py-3 text-[11px] text-text-tertiary sm:px-6">
+          {curriculum ? "A preview from a published curriculum" : "A simple view of the learning structure"}
         </div>
       </div>
     </div>
