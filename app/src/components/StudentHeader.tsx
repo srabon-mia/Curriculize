@@ -44,12 +44,6 @@ export function StudentHeader() {
           >
             Browse paths
           </Link>
-          <Link
-            href="/admin"
-            className="text-xs sm:text-sm font-medium px-3 py-1.5 rounded-md border border-border-default text-text-secondary hover:text-text-primary hover:border-border-hover transition ml-1"
-          >
-            Admin
-          </Link>
         </nav>
       </div>
     </header>
