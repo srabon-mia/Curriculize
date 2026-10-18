@@ -12,6 +12,8 @@ import { acquireUrl } from "./http";
 import { buildCleanedDocument, serializeCleanedDocument } from "./cleanedDocument";
 import { extractStructuredContentFromDoc, StructuredContent } from "./structuredExtract";
 import { AcquisitionError, isAcquisitionError } from "./errors";
+import { resourceExtractionKey } from "@/lib/cache/keys";
+import type { CacheStore } from "@/lib/cache/store";
 import type {
   AcquisitionOptions,
   AcquiredPage,
@@ -89,12 +91,29 @@ export function getCandidateDedupKey(candidate: DiscoveryCandidate): DedupKey | 
  * Acquire a single candidate with full pipeline.
  * Returns AcquisitionResult with success/error info.
  * Now includes StructuredContent from Phase 6A.
+ *
+ * @param candidate Discovery candidate to acquire
+ * @param options Acquisition options (affect output — included in cache key when cache provided)
+ * @param dedupTracker Optional in-memory deduplication tracker (within a single job)
+ * @param cache Optional Phase 11 cache store for resource-extraction caching.
+ *   When provided, checks cache before fetching and stores successful results.
+ *   Cache key includes URL + options hash so different extraction settings
+ *   produce different keys. Failed or partial results are never cached.
+ *   Disabled by default (pass getCacheStore() which is disabled, or createCache({enabled:true})).
  */
 export async function acquireCandidate(
   candidate: DiscoveryCandidate,
   options: AcquisitionOptions = {},
-  dedupTracker?: AcquisitionDedupTracker
+  dedupTracker?: AcquisitionDedupTracker,
+  cache?: CacheStore
 ): Promise<AcquisitionResult> {
+  // Phase 11: Check resource-extraction cache before any work
+  if (cache) {
+    const cacheKey = resourceExtractionKey(candidate.url, options);
+    const cached = cache.getRaw<AcquisitionResult>(cacheKey);
+    if (cached) return cached;
+  }
+
   // URL validation
   let canonical: CanonicalUrl;
   try {
@@ -176,13 +195,22 @@ export async function acquireCandidate(
   // Phase 6A output
   const structuredContent = extractStructuredContentFromDoc(doc);
 
-  return {
+  const result: AcquisitionResult = {
     candidate,
     success: true,
     acquiredPage: acquired,
     cleanedPage: cleaned,
     structuredContent,
   };
+
+  // Phase 11: Cache successful result (never cache failures).
+  // Uses the cache store's defaultTtlMs (falls back to store default or no expiry).
+  if (cache) {
+    const cacheKey = resourceExtractionKey(candidate.url, options);
+    cache.setRaw(cacheKey, result);
+  }
+
+  return result;
 }
 
 /**

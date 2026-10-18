@@ -48,9 +48,10 @@ vi.mock("undici", () => {
 
 import { acquireUrl, DEFAULT_ACQUISITION_OPTIONS } from "../http";
 import { cleanPage } from "../cleaner";
-import { acquireAndClean } from "../engine";
+import { acquireAndClean, acquireCandidate } from "../engine";
 import { AcquisitionError, isAcquisitionError } from "../errors";
 import type { AcquiredPage } from "../types";
+import { CacheStore } from "@/lib/cache/store";
 
 // Get the mock setter
 const { setMockImplementation } = await vi.importMock<{ setMockImplementation: (impl: any) => void }>("undici");
@@ -406,5 +407,164 @@ describe("Integration: Error propagation", () => {
       expect(isAcquisitionError(err)).toBe(true);
       if (isAcquisitionError(err)) expect(err.code).toBe("TIMEOUT");
     }
+  });
+});
+
+describe("Integration: Phase 11 resource-extraction caching", () => {
+  const candidate = { url: "http://example.com/cache-test" };
+  const options = { timeoutMs: 100 }; // Use short timeout for faster tests
+
+  // Helper to create a fresh cache store for each test
+  const createTestCache = () => new CacheStore({ enabled: true, maxEntries: 10 });
+
+  test("cache hit: repeated identical inputs reuse cached result", async () => {
+    const cache = createTestCache();
+    setMockImplementation(async () => createMockResponse({
+      statusCode: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: `<html><body>Test content</body></html>`
+    }));
+
+    // First call - should execute acquisition and cache result
+    const result1 = await acquireCandidate(candidate, options, undefined, cache);
+    expect(result1.success).toBe(true);
+    expect(result1.acquiredPage?.statusCode).toBe(200);
+    expect(result1.cleanedPage?.text).toContain("Test content");
+
+    // Second call with identical inputs - should reuse cached result (no HTTP call)
+    setMockImplementation(async () => {
+      throw new Error("HTTP call should not be made for cache hit");
+    });
+    const result2 = await acquireCandidate(candidate, options, undefined, cache);
+    expect(result2.success).toBe(true);
+    expect(result2.acquiredPage?.statusCode).toBe(200);
+    expect(result2.cleanedPage?.text).toContain("Test content");
+    // Verify it's the exact same object (cached)
+    expect(result2).toBe(result1);
+  });
+
+  test("cache miss: first call executes acquisition path", async () => {
+    const cache = createTestCache();
+    setMockImplementation(async () => createMockResponse({
+      statusCode: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: `<html><body>First call content</body></html>`
+    }));
+
+    const result = await acquireCandidate(candidate, options, undefined, cache);
+    expect(result.success).toBe(true);
+    expect(result.acquiredPage?.statusCode).toBe(200);
+    expect(result.cleanedPage?.text).toContain("First call content");
+  });
+
+  test("failed results are not cached", async () => {
+    const cache = createTestCache();
+    setMockImplementation(async () => createMockResponse({
+      statusCode: 404,
+      headers: { "content-type": "text/html" },
+      body: "Not found"
+    }));
+
+    const candidate404 = { url: "http://example.com/not-found" };
+    const result1 = await acquireCandidate(candidate404, options, undefined, cache);
+    expect(result1.success).toBe(false);
+    // Error shape: { code, message, details }
+    expect(result1.error?.code).toBe("HTTP_FAILURE");
+
+    // Second call should NOT return cached failure - should try again
+    setMockImplementation(async () => createMockResponse({
+      statusCode: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: `<html><body>Now it works</body></html>`
+    }));
+
+    const result2 = await acquireCandidate(candidate404, options, undefined, cache);
+    expect(result2.success).toBe(true);
+    expect(result2.cleanedPage?.text).toContain("Now it works");
+    // Not the same object - first was failure, second is success
+    expect(result2).not.toBe(result1);
+  });
+
+  test("different options produce different cache entries", async () => {
+    const cache = createTestCache();
+    const url = "http://example.com/options-test";
+
+    setMockImplementation(async () => createMockResponse({
+      statusCode: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: `<html><body>Content</body></html>`
+    }));
+
+    // Call with short timeout
+    const result1 = await acquireCandidate({ url }, { timeoutMs: 50 }, undefined, cache);
+    expect(result1.success).toBe(true);
+    expect(result1.cleanedPage?.text).toContain("Content");
+
+    // Change timeout - should NOT hit cache (different extraction behavior possible)
+    // The mock returns a different response to prove the cache was bypassed
+    setMockImplementation(async () => createMockResponse({
+      statusCode: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: `<html><body>Different options content</body></html>`
+    }));
+    const result2 = await acquireCandidate({ url }, { timeoutMs: 200 }, undefined, cache);
+    expect(result2.success).toBe(true);
+    // Different options should produce different cache keys, so second call executes
+    expect(result2).not.toBe(result1);
+    expect(result2.cleanedPage?.text).toContain("Different options content");
+  });
+
+  test("cache disabled by default preserves existing behavior", async () => {
+    const disabledCache = new CacheStore({ enabled: false });
+    setMockImplementation(async () => createMockResponse({
+      statusCode: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: `<html><body>Disabled cache test</body></html>`
+    }));
+
+    const result1 = await acquireCandidate(candidate, options, undefined, disabledCache);
+    expect(result1.success).toBe(true);
+    expect(result1.cleanedPage?.text).toContain("Disabled cache test");
+
+    // Second call with same disabled cache - should execute again (no caching)
+    setMockImplementation(async () => createMockResponse({
+      statusCode: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: `<html><body>Second call content</body></html>`
+    }));
+    const result2 = await acquireCandidate(candidate, options, undefined, disabledCache);
+    expect(result2.success).toBe(true);
+    expect(result2.cleanedPage?.text).toContain("Second call content");
+    // Different objects - no caching occurred
+    expect(result2).not.toBe(result1);
+  });
+
+  test("cache respects TTL expiration", async () => {
+    const cache = new CacheStore({ enabled: true, defaultTtlMs: 50 }); // 50ms TTL
+    setMockImplementation(async () => createMockResponse({
+      statusCode: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: `<html><body>Fresh content</body></html>`
+    }));
+
+    // First call - caches result
+    const result1 = await acquireCandidate(candidate, options, undefined, cache);
+    expect(result1.success).toBe(true);
+    expect(result1.cleanedPage?.text).toContain("Fresh content");
+
+    // Wait for TTL to expire
+    await new Promise(resolve => setTimeout(resolve, 60));
+
+    // Second call after TTL expiration - should execute again (cache expired)
+    setMockImplementation(async () => createMockResponse({
+      statusCode: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: `<html><body>Expired content</body></html>`
+    }));
+    const result2 = await acquireCandidate(candidate, options, undefined, cache);
+    expect(result2.success).toBe(true);
+    expect(result2.cleanedPage?.text).toContain("Expired content");
+    // Different objects - cache expired and was re-fetched
+    expect(result2).not.toBe(result1);
   });
 });
