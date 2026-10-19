@@ -4,6 +4,7 @@ import {
   getCurriculum,
   getNodesWithUnderstandings,
   getResourcesForTargets,
+  selectEligibleResources,
   type Resource,
 } from "@/lib/curriculum-data";
 import { CurriculumViewer } from "@/components/CurriculumViewer";
@@ -28,10 +29,10 @@ export default async function CurriculumViewerPage({
   );
   const allResources = await getResourcesForTargets(nodeIds, muIds);
 
-  const approved = allResources.filter((r) => r.status === "approved");
+  const eligible = selectEligibleResources(allResources);
 
   const resourcesByTarget: Record<string, Resource[]> = {};
-  for (const r of approved) {
+  for (const r of eligible) {
     const key = r.node_id
       ? `node:${r.node_id}`
       : `mu:${r.major_understanding_id}`;

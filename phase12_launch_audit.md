@@ -46,6 +46,7 @@
 | Frontend unchanged | ✅ **Verified by source** | `generate/[id]/page.tsx` consumes same SSE events; no changes to `GenerateForm.tsx` or `CurriculumViewer.tsx` |
 | Hardcoded `content_type_verified: false` / `status: "draft"` lines removed | ✅ **Verified by source** | Old pre-Phase-12 bug (commit d20d801) removed — route.ts:363-366 and 494-503 now call `discoverVerifiedResource` only |
 | Unused `getCacheStore` import removed | ✅ **Verified by source** | route.ts imports only `createCache` (line 11); `CreateCache` is used at route.ts:276 |
+2
 
 **Phase 12 acceptance criteria: FULLY MET.** All criteria verified by source inspection and automated tests.
 

@@ -516,3 +516,141 @@ export type {
 } from "./types";
 
 export { PersistenceError, validateResourceTarget } from "./types";
+
+/**
+ * Persist a verified resource with lease fencing.
+ * Calls the persist_with_fence RPC which atomically validates the job lease
+ * before persisting. This prevents stale owners from persisting resources
+ * after losing their lease.
+ *
+ * @param jobId The acquisition job ID
+ * @param claimToken The job's claim token
+ * @param input The persistence input (same as persistVerifiedResource)
+ * @returns The persistence result or null if lease validation fails
+ */
+export async function persistVerifiedResourceWithFence(
+  jobId: string,
+  claimToken: string,
+  input: PersistenceInput
+): Promise<PersistenceResult | null> {
+  const { createClient } = await import("@supabase/supabase-js");
+
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!
+  );
+
+  // Convert Learning Engine PersistenceInput to RPC input format
+  const rpcInput = {
+    acquiredPage: {
+      finalUrl: input.acquiredPage.finalUrl,
+      canonicalUrl: { url: input.acquiredPage.canonicalUrl.url },
+      contentHash: input.acquiredPage.contentHash,
+      statusCode: input.acquiredPage.statusCode,
+      acquiredAt: input.acquiredPage.acquiredAt,
+    },
+    structuredContent: {
+      metadata: {
+        title: input.structuredContent.metadata.title ?? null,
+        description: input.structuredContent.metadata.description ?? null,
+        author: input.structuredContent.metadata.author ?? null,
+        datePublished: input.structuredContent.metadata.datePublished ?? null,
+        language: input.structuredContent.metadata.language ?? null,
+      },
+    },
+    educationalEvidence: {
+      interpreted: input.educationalEvidence.interpreted,
+    },
+    verificationResult: {
+      status: input.verificationResult.status,
+      deterministicChecks: {
+        cleanedContentNonEmpty: input.verificationResult.deterministicChecks.cleanedContentNonEmpty,
+      },
+      advisorySignals: input.verificationResult.advisorySignals,
+      verifiedAt: input.verificationResult.verifiedAt,
+    },
+    target: input.target,
+    acquisitionJobId: input.acquisitionJobId ?? null,
+    callerMetadata: {
+      resourceType: input.callerMetadata?.resourceType ?? null,
+      licenseStatus: input.callerMetadata?.licenseStatus ?? null,
+      aiNote: input.callerMetadata?.aiNote ?? null,
+    },
+  };
+
+  const { data, error } = await supabase.rpc("persist_with_fence", {
+    p_job_id: jobId,
+    p_claim_token: claimToken,
+    p_input: rpcInput,
+  });
+
+  if (error) {
+    console.error("persistVerifiedResourceWithFence RPC error:", error.message);
+    return null;
+  }
+
+  if (data?.error) {
+    // Lease validation failed or other RPC error
+    console.warn(
+      `[persistence] persist_with_fence returned error: ${data.error}`
+    );
+    return null;
+  }
+
+  // Convert RPC response to PersistenceResult
+  const result = data as {
+    resource_id: string;
+    vr_id: string;
+    mapping_id: string | null;
+    is_exact_retry: boolean;
+  };
+
+  // Fetch the final resource for return
+  const { data: finalResource } = await supabase
+    .from("resources")
+    .select("*")
+    .eq("id", result.resource_id)
+    .single();
+
+  if (!finalResource) {
+    console.error("persistVerifiedResourceWithFence: failed to fetch created resource");
+    return null;
+  }
+
+  return {
+    resource: {
+      id: finalResource.id,
+      url: finalResource.url,
+      title: finalResource.title,
+      sourceDomain: finalResource.source_domain,
+      resourceType: finalResource.resource_type,
+      licenseStatus: finalResource.license_status,
+      embedAllowed: finalResource.embed_allowed,
+      contentTypeVerified: finalResource.content_type_verified,
+      aiNote: finalResource.ai_note,
+      status: finalResource.status,
+      nodeId: finalResource.node_id,
+      majorUnderstandingId: finalResource.major_understanding_id,
+      createdAt: finalResource.created_at,
+      isNew: !result.is_exact_retry,
+    },
+    verificationRecord: {
+      id: result.vr_id,
+      resourceId: result.resource_id,
+      status: "verified", // RPC only succeeds for verified content
+      contentHash: rpcInput.acquiredPage.contentHash,
+      canonicalUrl: rpcInput.acquiredPage.canonicalUrl.url,
+      verifiedAt: rpcInput.verificationResult.verifiedAt,
+      isExactRetry: result.is_exact_retry,
+    },
+    resourceMapping: result.mapping_id
+      ? {
+          id: result.mapping_id,
+          resourceId: result.resource_id,
+          understandingId: rpcInput.target.understandingId ?? "",
+          coverageConfidence: "medium" as const,
+          isNew: true,
+        }
+      : null,
+  };
+}

@@ -46,6 +46,7 @@ import { extractEducationalEvidence } from "@/lib/evidence";
 import { verifyContent, type VerificationResult } from "@/lib/verification";
 import {
   persistVerifiedResource,
+  persistVerifiedResourceWithFence,
   type PersistenceInput,
   type PersistenceResult,
   PersistenceError,
@@ -126,6 +127,11 @@ function toVerificationAcquiredPage(acquiredPage: AcquiredPage): VerificationInp
  *  4. persistVerifiedResource (6D) — inserts resource (status='draft',
  *     content_type_verified from verification) + verification_records evidence.
  *
+ * When `jobId` and `claimToken` are provided, uses the lease-fenced
+ * `persistVerifiedResourceWithFence` which atomically validates the job lease
+ * before persisting. This prevents stale owners from persisting after losing
+ * their lease.
+ *
  * Returns null on per-candidate failure (caller skips / continues).
  * Re-throws PersistenceError only when persistence itself throws — but in
  * practice all persistence throw paths represent candidate-level failures and
@@ -138,6 +144,10 @@ export async function discoverVerifiedResource(
   options?: {
     cache?: CacheStore;
     dedupTracker?: AcquisitionDedupTracker;
+    /** Optional job ID for lease-fenced persistence */
+    jobId?: string;
+    /** Optional claim token for lease-fenced persistence */
+    claimToken?: string;
   }
 ): Promise<LearnResult | null> {
   const discoveryCandidate: DiscoveryCandidate = {
@@ -196,7 +206,19 @@ export async function discoverVerifiedResource(
   };
 
   try {
-    const persistenceResult = await persistVerifiedResource(persistence);
+    // Use lease-fenced persistence when jobId and claimToken are provided
+    const persistenceResult = options?.jobId && options?.claimToken
+      ? await persistVerifiedResourceWithFence(options.jobId, options.claimToken, persistence)
+      : await persistVerifiedResource(persistence);
+
+    if (!persistenceResult) {
+      // Lease validation failed — the job lost its lease during persistence
+      console.warn(
+        `[learningEngine] lease validation failed for ${result.acquiredPage.finalUrl}, skipping candidate`
+      );
+      return null;
+    }
+
     return {
       resource: persistenceResult.resource,
       verificationStatus: verificationResult.status,

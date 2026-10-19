@@ -9,6 +9,12 @@ type Status = {
   step: string;
   current?: number;
   total?: number;
+  phase?: string;
+};
+
+type CompleteEvent = {
+  curriculum_id: string;
+  phase: "topics" | "background";
 };
 
 type LogEntry = {
@@ -38,6 +44,14 @@ export default function GeneratePage({
       const data = JSON.parse(e.data) as Status;
       setStatus(data);
       setLog((prev) => [...prev, { message: data.message, done: false }]);
+
+      if (data.step === "already_claimed") {
+        // Another generation is in progress for this curriculum — redirect
+        // to the curriculum page where the student can observe progress via
+        // polling (CurriculumViewer polls /api/curricula/[id]/progress).
+        es.close();
+        router.push(`/curriculum/${id}`);
+      }
     });
 
     es.addEventListener("skeleton", (e) => {
@@ -55,9 +69,22 @@ export default function GeneratePage({
       ]);
     });
 
-    es.addEventListener("complete", () => {
-      es.close();
-      router.push(`/curriculum/${id}`);
+    es.addEventListener("complete", (e) => {
+      const data = JSON.parse(e.data) as CompleteEvent;
+      if (data.phase === "background") {
+        // All generation complete (topic + background batch)
+        es.close();
+        router.push(`/curriculum/${id}`);
+      } else if (data.phase === "topics") {
+        // Topic-level resources done, background batch starting
+        setLog((prev) => [
+          ...prev.slice(0, -1),
+          {
+            message: "Topic-level resources found. Generating per-concept resources…",
+            done: false,
+          },
+        ]);
+      }
     });
 
     es.addEventListener("error", (e) => {

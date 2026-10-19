@@ -313,9 +313,6 @@ export async function processJob(job: JobClaimResult): Promise<void> {
       })
       .eq('id', curriculumId);
 
-    // Advance checkpoint: skeleton complete
-    await advanceCheckpoint(job.id, job.claim_token!, job.claim_version, 'skeleton', 0);
-
     // Step 3: Insert nodes and major understandings
     interface SkeletonNode {
       title: string;
@@ -326,13 +323,15 @@ export async function processJob(job: JobClaimResult): Promise<void> {
     const nodeIds: Array<{ nodeId: string; node: SkeletonNode }> = [];
 
     for (const node of skeleton.nodes) {
+      const topicExternalKey = `topic-${node.order_index}`;
       const { data: nodeRow } = await supabase
         .from('nodes')
-        .insert({
+        .upsert({
           curriculum_id: curriculumId,
           title: node.title,
           order_index: node.order_index,
-        })
+          external_key: topicExternalKey,
+        }, { onConflict: 'curriculum_id,external_key' })
         .select('id')
         .single();
 
@@ -346,12 +345,11 @@ export async function processJob(job: JobClaimResult): Promise<void> {
         order_index: i,
       }));
 
-      await supabase.from('major_understandings').insert(mus);
+      await supabase
+        .from('major_understandings')
+        .upsert(mus, { onConflict: 'node_id,external_key' });
       nodeIds.push({ nodeId: nodeRow.id, node });
     }
-
-    // Advance checkpoint: nodes inserted
-    await advanceCheckpoint(job.id, job.claim_token!, job.claim_version, 'nodes', 0);
 
     // Step 4: Source discovery
     const sourcesPrompt = buildSourceDiscoveryPrompt(
@@ -367,16 +365,13 @@ export async function processJob(job: JobClaimResult): Promise<void> {
       sourcesReservationId
     );
 
-    let discoveredSources: any[] = [];
+    let discoveredSources: DiscoveredSource[] = [];
     if (sourcesReservation.reserved) {
       const sourcesText = await callAISources(sourcesPrompt);
       discoveredSources = parseSources(sourcesText);
     }
 
-    // Advance checkpoint: sources discovered
-    await advanceCheckpoint(job.id, job.claim_token!, job.claim_version, 'sources', 0);
-
-    // Step 4: Topic-level resource discovery
+    // Step 5: Topic-level resource discovery
     for (let i = 0; i < nodeIds.length; i++) {
       const { nodeId, node } = nodeIds[i];
 
@@ -407,7 +402,7 @@ export async function processJob(job: JobClaimResult): Promise<void> {
         order_index: node.order_index,
         exam_weight_pct: null,
         claim_statement: null,
-        major_understandings: node.major_understandings.map((mu: any, idx: number) => ({
+        major_understandings: node.major_understandings.map((mu: SkeletonNode['major_understandings'][0], idx: number) => ({
         id: `temp-${node.order_index}-${idx}`,
         node_id: '',
         external_key: mu.code ?? null,
@@ -422,7 +417,7 @@ export async function processJob(job: JobClaimResult): Promise<void> {
         undefined,
         undefined,
         skeleton.title,
-        discoveredSources
+        discoveredSources.map((s) => s.domain)
       );
 
       const topicText = await callAIDiscover(topicPrompt);
