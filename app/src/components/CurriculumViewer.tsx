@@ -105,6 +105,10 @@ export function CurriculumViewer({
         const nodeRes = await fetch(`/api/resources?node_id=${selectedNodeId}`);
         if (nodeRes.ok) {
           const nodeData = await nodeRes.json();
+          // Apply eligibility gate: only approved + content_type_verified resources
+          const eligibleNodeResources = (nodeData.resources ?? []).filter(
+            (r: Resource) => r.status === "approved" && r.content_type_verified === true
+          );
           // Also fetch MU resources
           const currentNode = nodes.find((n) => n.id === selectedNodeId);
           if (currentNode) {
@@ -114,9 +118,12 @@ export function CurriculumViewer({
               );
               if (muRes.ok) {
                 const muData = await muRes.json();
+                const eligibleMuResources = (muData.resources ?? []).filter(
+                  (r: Resource) => r.status === "approved" && r.content_type_verified === true
+                );
                 setResourcesByTarget((prev) => ({
                   ...prev,
-                  [`mu:${mu.id}`]: muData.resources,
+                  [`mu:${mu.id}`]: eligibleMuResources,
                 }));
               }
             });
@@ -124,7 +131,7 @@ export function CurriculumViewer({
           }
           setResourcesByTarget((prev) => ({
             ...prev,
-            [`node:${selectedNodeId}`]: nodeData.resources,
+            [`node:${selectedNodeId}`]: eligibleNodeResources,
           }));
         }
       }

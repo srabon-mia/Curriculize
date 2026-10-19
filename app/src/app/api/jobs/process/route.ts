@@ -2,6 +2,10 @@ import { NextResponse } from 'next/server';
 import { claimNextJob, recoverStaleJobs } from '@/lib/acquisition/jobService';
 import { processJob } from '@/lib/acquisition/worker';
 
+// Match the stream route: 300s max duration (requires Vercel Pro).
+// cron-job.org must be configured with a timeout > 300s.
+export const maxDuration = 300;
+
 export async function POST(request: Request) {
   try {
     // Validate CRON_SECRET

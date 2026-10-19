@@ -432,13 +432,16 @@ describe("Discovery Route - Pipeline Integration", () => {
     expect(json.skipped).toBeGreaterThanOrEqual(0);
     expect(json.message).toContain("new resources persisted");
 
-    // Check that resources were inserted with draft status
+    // Check that resources were inserted with appropriate status
+    // Resources with educational evidence present should be auto-approved
     const resourceInserts = capturedInserts.filter(c => c.table === "resources");
     expect(resourceInserts.length).toBeGreaterThan(0);
 
     for (const call of resourceInserts) {
       for (const resource of call.resources) {
-        expect(resource.status).toBe("draft");
+        // Mock HTML contains Learning Objectives, Definitions, Practice Problems
+        // -> educationalEvidencePresent = true -> auto-approve
+        expect(resource.status).toBe("approved");
         expect(resource.content_type_verified).toBe(true); // verified content
         expect(resource.node_id).toBe("node-1");
         expect(resource.major_understanding_id).toBeNull();
@@ -459,7 +462,7 @@ describe("Discovery Route - Pipeline Integration", () => {
     }
   });
 
-  it("5. Newly created resources are counted as inserted and remain drafts", async () => {
+  it("5. Newly created resources with educational evidence are auto-approved", async () => {
     const request = createMockRequest({
       node_id: "node-1",
       curriculum_id: "test-curriculum-id"
@@ -470,14 +473,14 @@ describe("Discovery Route - Pipeline Integration", () => {
     expect(json.inserted).toBeGreaterThan(0);
 
     const resourceInserts = capturedInserts.filter(c => c.table === "resources");
-    let draftCount = 0;
+    let approvedCount = 0;
     for (const call of resourceInserts) {
       for (const resource of call.resources) {
-        if (resource.status === "draft") draftCount++;
+        if (resource.status === "approved") approvedCount++;
       }
     }
-    // All newly inserted resources should be drafts
-    expect(draftCount).toBe(json.inserted);
+    // All newly inserted resources should be approved (mock HTML has educational evidence)
+    expect(approvedCount).toBe(json.inserted);
   });
 
   it("6. Mixed candidates: success, failed acquisition, failed verification/persistence counted correctly", async () => {
@@ -1053,7 +1056,7 @@ describe("Discovery Route - Pipeline Integration", () => {
       expect(vrInserts.length).toBe(0);
     });
 
-    it("A5. Successful discovery retains existing Phase 7A response fields, deduplication, verification, and draft-only persistence behavior", async () => {
+    it("A5. Successful discovery retains existing Phase 7A response fields, deduplication, verification, and auto-approval behavior", async () => {
       // This test verifies that a successful discovery with timeout budget
       // still follows all the existing Phase 7A behavior.
 
@@ -1075,11 +1078,11 @@ describe("Discovery Route - Pipeline Integration", () => {
       expect(typeof json.unprocessed).toBe("number");
       expect(typeof json.message).toBe("string");
 
-      // Verify draft status
+      // Verify auto-approval status (mock HTML has educational evidence)
       const resourceInserts = capturedInserts.filter(c => c.table === "resources");
       for (const call of resourceInserts) {
         for (const resource of call.resources) {
-          expect(resource.status).toBe("draft");
+          expect(resource.status).toBe("approved");
         }
       }
 

@@ -924,6 +924,49 @@ export async function GET(
                   `(verified: ${persisted.filter((p) => p.verificationStatus === "verified").length})`
               );
             }
+
+            // Checkpoint: track this topic's completion for recovery.
+            // Only checkpoint after all required work for this topic has durably persisted.
+            try {
+              const checkpointOk = await advanceCheckpoint(
+                jobRecord!.id,
+                jobRecord!.claim_token,
+                jobRecord!.claim_version,
+                nodeId,
+                persisted.length
+              );
+              if (!checkpointOk) {
+                console.error(
+                  `[stream] advance_checkpoint returned false — ownership lost, stopping topic processing`
+                );
+                clearHeartbeat();
+                void failJob(
+                  jobRecord!.id,
+                  jobRecord!.claim_token,
+                  jobRecord!.claim_version,
+                  "Ownership lost at topic checkpoint"
+                );
+                send(controller, "error", {
+                  message: "Generation was interrupted — ownership of the job was lost. Please refresh to check for updates.",
+                });
+                controller.close();
+                return;
+              }
+            } catch (ckptErr) {
+              console.error("[stream] advance_checkpoint threw:", ckptErr);
+              clearHeartbeat();
+              void failJob(
+                jobRecord!.id,
+                jobRecord!.claim_token,
+                jobRecord!.claim_version,
+                `Checkpoint error: ${ckptErr instanceof Error ? ckptErr.message : String(ckptErr)}`
+              );
+              send(controller, "error", {
+                message: "Generation was interrupted — an error occurred during checkpoint. Please refresh to check for updates.",
+              });
+              controller.close();
+              return;
+            }
           } catch (err) {
             console.log(
               `Resource discovery failed for topic "${node.title}":`,

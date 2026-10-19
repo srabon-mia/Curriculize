@@ -351,6 +351,17 @@ export async function processJob(job: JobClaimResult): Promise<void> {
       nodeIds.push({ nodeId: nodeRow.id, node });
     }
 
+    // Read checkpoint to skip already-completed topics
+    const jobData = await getJobById(job.id);
+    const rawCompletedTopics =
+      (jobData?.result_data as { checkpoint?: { completedTopicIds: unknown } })?.checkpoint
+        ?.completedTopicIds;
+    const completedTopics = new Set(
+      Array.isArray(rawCompletedTopics)
+        ? rawCompletedTopics.filter((id): id is string => typeof id === "string")
+        : []
+    );
+
     // Step 4: Source discovery
     const sourcesPrompt = buildSourceDiscoveryPrompt(
       skeleton.title,
@@ -374,6 +385,12 @@ export async function processJob(job: JobClaimResult): Promise<void> {
     // Step 5: Topic-level resource discovery
     for (let i = 0; i < nodeIds.length; i++) {
       const { nodeId, node } = nodeIds[i];
+
+      // Skip already-completed topics (resume from checkpoint)
+      if (completedTopics.has(nodeId)) {
+        console.log(`[worker] Skipping topic ${nodeId} - already completed (checkpoint)`);
+        continue;
+      }
 
       // Reserve AI call for topic discovery
       const topicReservationId = crypto.randomUUID();

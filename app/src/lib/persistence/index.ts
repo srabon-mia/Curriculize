@@ -10,6 +10,7 @@ import type {
   PersistenceResult,
 } from "./types";
 import { validateResourceTarget, PersistenceError } from "./types";
+import { verifyContent, type VerificationResult } from "@/lib/verification";
 
 /** Supabase service role client for admin operations */
 function getServiceClient() {
@@ -51,6 +52,17 @@ async function getDomainScore(supabase: ReturnType<typeof getServiceClient>, dom
 /** Compute embed_allowed based on license status and domain score */
 function computeEmbedAllowed(licenseStatus: string, domainScore: number): boolean {
   return licenseStatus === "cc_open" && domainScore >= 4;
+}
+
+/**
+ * Determine if a resource should be auto-approved based on verification results.
+ * Stricter than basic verification: requires both verification pass AND
+ * presence of explicit educational signals (learning objectives, definitions, or exercises).
+ */
+function shouldAutoApprove(verificationResult: VerificationResult): boolean {
+  if (verificationResult.status !== "verified") return false;
+  // Advisory signal: educationalEvidencePresent indicates explicit educational content
+  return verificationResult.advisorySignals.educationalEvidencePresent === true;
 }
 
 /** Find existing resource by canonical URL + target context */
@@ -134,6 +146,9 @@ async function createResource(
   const licenseStatus = callerMetadata?.licenseStatus ?? "link_only";
   const aiNote = callerMetadata?.aiNote ?? null;
 
+  // Auto-approve if verification passes AND educational evidence is present
+  const autoApprove = shouldAutoApprove(input.verificationResult);
+
   const insertData = {
     node_id: target.nodeId ?? null,
     major_understanding_id: target.understandingId ?? null,
@@ -145,7 +160,7 @@ async function createResource(
     embed_allowed: embedAllowed,
     content_type_verified: verificationStatus === "verified",
     ai_note: aiNote,
-    status: "draft" as const,
+    status: autoApprove ? "approved" : "draft",
   };
 
   const { data, error } = await supabase
@@ -181,6 +196,9 @@ async function updateResource(
   const licenseStatus = callerMetadata?.licenseStatus ?? "link_only";
   const aiNote = callerMetadata?.aiNote ?? null;
 
+  // Auto-approve if verification passes AND educational evidence is present
+  const autoApprove = shouldAutoApprove(input.verificationResult);
+
   const updateData = {
     url: acquiredPage.finalUrl,
     title,
@@ -190,7 +208,7 @@ async function updateResource(
     embed_allowed: embedAllowed,
     content_type_verified: verificationStatus === "verified",
     ai_note: aiNote,
-    // status remains unchanged (draft) - 6D never changes status
+    status: autoApprove ? "approved" : "draft",
   };
 
   const { error } = await supabase
