@@ -1,20 +1,23 @@
 // @vitest-environment jsdom
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor, act } from "@testing-library/react";
+import { render, waitFor, act } from "@testing-library/react";
 import { useRouter } from "next/navigation";
 import GeneratePage from "./page";
 
-// Mock EventSource globally - jsdom doesn't have it by default
-function createMockEventSource() {
-  return {
-    addEventListener: vi.fn(),
-    close: vi.fn(),
-    readyState: 1, // EventSource.OPEN = 1
-  };
-}
+// Mock next/navigation
+vi.mock("next/navigation", () => ({
+  useRouter: vi.fn(),
+}));
 
-// Proper class-based mock for EventSource
+// Mock EventSource globally - jsdom doesn't have it by default
+const eventSourceInstances: Array<{
+  url: string;
+  addEventListener: ReturnType<typeof vi.fn>;
+  close: ReturnType<typeof vi.fn>;
+  readyState: number;
+}> = [];
+
 class MockEventSourceClass {
   url: string;
   addEventListener: ReturnType<typeof vi.fn>;
@@ -22,11 +25,16 @@ class MockEventSourceClass {
   readyState: number;
 
   constructor(url: string) {
-    const instance = createMockEventSource();
+    const instance = {
+      addEventListener: vi.fn(),
+      close: vi.fn(),
+      readyState: 1, // EventSource.OPEN = 1
+    };
     this.url = url;
     this.addEventListener = instance.addEventListener;
     this.close = instance.close;
     this.readyState = instance.readyState;
+    eventSourceInstances.push(this);
   }
 }
 
@@ -55,31 +63,47 @@ describe("GeneratePage - EventSource connection", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    eventSourceInstances.length = 0;
     mockRouter = { push: vi.fn() };
+    (useRouter as ReturnType<typeof vi.fn>).mockReturnValue(mockRouter);
   });
 
   afterEach(() => {
     vi.resetModules();
   });
 
-  it("creates EventSource on initial mount", async () => {
-    const { unmount } = render(<GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />);
+  it("creates EventSource on initial mount with correct URL", async () => {
+    const { unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
 
-    // Wait for EventSource to be created - just verify no error
+    // Wait for EventSource to be constructed
     await waitFor(() => {
-      expect(true).toBe(true);
+      expect(eventSourceInstances.length).toBe(1);
     });
+
+    // Assert the EventSource was constructed with the correct URL
+    expect(eventSourceInstances[0].url).toBe("/api/generate/test-curriculum-id/stream");
 
     unmount();
   });
 
-  it("cleans up EventSource on unmount", async () => {
-    const { unmount } = render(<GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />);
+  it("closes EventSource on unmount", async () => {
+    const { unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+
+    // Wait for EventSource to be constructed
+    await waitFor(() => {
+      expect(eventSourceInstances.length).toBe(1);
+    });
+
+    const instance = eventSourceInstances[0];
+    expect(instance.close).not.toHaveBeenCalled();
 
     unmount();
 
-    // The component should have called close on the EventSource
-    // This is verified by the fact that no errors are thrown
-    expect(true).toBe(true);
+    // Verify close was called on unmount
+    expect(instance.close).toHaveBeenCalledTimes(1);
   });
 });

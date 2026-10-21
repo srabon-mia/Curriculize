@@ -60,6 +60,7 @@ export default function GeneratePage({
       esRef.current = null;
     }
 
+    console.info('[GeneratePage] EventSource constructing for', id);
     const es = new EventSource(`/api/generate/${id}/stream`);
     esRef.current = es;
     yieldedHandledRef.current = false;
@@ -160,6 +161,7 @@ export default function GeneratePage({
 
   // Initial connection on mount
   useEffect(() => {
+    console.info('[GeneratePage] Initial effect running, calling connect()');
     connect();
   }, [connect]);
 
