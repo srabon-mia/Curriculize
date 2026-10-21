@@ -1,9 +1,12 @@
-import { createClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
+import { requireAdminApi } from "@/lib/auth";
 
 // GET /api/resources?node_id=... or ?major_understanding_id=...
+// Admin only: returns all resources including draft/rejected.
 export async function GET(request: Request) {
-  const supabase = await createClient();
+  const auth = await requireAdminApi();
+  if (auth.error) return auth.error;
+
   const { searchParams } = new URL(request.url);
   const nodeId = searchParams.get("node_id");
   const muId = searchParams.get("major_understanding_id");
@@ -15,7 +18,7 @@ export async function GET(request: Request) {
     );
   }
 
-  let query = supabase.from("resources").select("*");
+  let query = auth.supabase.from("resources").select("*");
   query = nodeId ? query.eq("node_id", nodeId) : query.eq("major_understanding_id", muId!);
 
   const { data, error } = await query.order("created_at", { ascending: false });
@@ -32,7 +35,9 @@ export async function GET(request: Request) {
 // embed-vs-link policy from Phase 0 -- nothing is embeddable or public
 // until explicitly reviewed and flipped by an admin.
 export async function POST(request: Request) {
-  const supabase = await createClient();
+  const auth = await requireAdminApi();
+  if (auth.error) return auth.error;
+
   const body = await request.json();
 
   const {
@@ -66,7 +71,7 @@ export async function POST(request: Request) {
   const resolvedLicenseStatus = license_status ?? "link_only";
 
   if (source_domain) {
-    const { data: domainScore } = await supabase
+    const { data: domainScore } = await auth.supabase
       .from("domain_scores")
       .select("score, category")
       .eq("domain", source_domain)
@@ -80,7 +85,7 @@ export async function POST(request: Request) {
     }
   }
 
-  const { data, error } = await supabase
+  const { data, error } = await auth.supabase
     .from("resources")
     .insert({
       node_id: node_id ?? null,

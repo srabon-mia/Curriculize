@@ -1,10 +1,12 @@
 import Link from "next/link";
 import { getCurricula } from "@/lib/curriculum-data";
 import { LogoutButton } from "@/components/LogoutButton";
+import { requireAdmin } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
 export default async function AdminHome() {
+  await requireAdmin();
   const curricula = await getCurricula();
 
   return (

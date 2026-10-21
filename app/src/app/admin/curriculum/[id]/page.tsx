@@ -1,6 +1,5 @@
-import { notFound, redirect } from "next/navigation";
+import { notFound } from "next/navigation";
 import Link from "next/link";
-import { createClient } from "@/lib/supabase/server";
 import {
   getCurriculum,
   getNodesWithUnderstandings,
@@ -8,6 +7,7 @@ import {
   type Resource,
 } from "@/lib/curriculum-data";
 import { CurriculumBuilder } from "@/components/CurriculumBuilder";
+import { requireAdmin } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -16,9 +16,7 @@ export default async function CurriculumDetailPage({
 }: {
   params: Promise<{ id: string }>;
 }) {
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) redirect("/login");
+  await requireAdmin();
 
   const { id } = await params;
 

@@ -1,12 +1,13 @@
-import { createClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
+import { requireAdminApi } from "@/lib/auth";
 
 // GET /api/curricula -- list curricula.
-// RLS handles visibility: published for anyone, drafts only for admins.
+// Admin only: returns all curricula including drafts.
 export async function GET() {
-  const supabase = await createClient();
+  const auth = await requireAdminApi();
+  if (auth.error) return auth.error;
 
-  const { data, error } = await supabase
+  const { data, error } = await auth.supabase
     .from("curricula")
     .select("*")
     .order("created_at", { ascending: false });
@@ -19,9 +20,11 @@ export async function GET() {
 }
 
 // POST /api/curricula -- create a new curriculum.
-// RLS will reject this for non-admins automatically.
+// Admin only.
 export async function POST(request: Request) {
-  const supabase = await createClient();
+  const auth = await requireAdminApi();
+  if (auth.error) return auth.error;
+
   const body = await request.json();
 
   const { title, subject, source_type, source_attribution, source_url, notes } = body;
@@ -33,7 +36,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const { data, error } = await supabase
+  const { data, error } = await auth.supabase
     .from("curricula")
     .insert({ title, subject, source_type, source_attribution, source_url, notes })
     .select()

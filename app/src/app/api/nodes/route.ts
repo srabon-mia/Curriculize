@@ -1,8 +1,10 @@
 import { createClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
+import { requireAdminApi } from "@/lib/auth";
 
 // GET /api/nodes?curriculum_id=... -- list nodes (with their major
 // understandings nested) for a given curriculum.
+// Public for published curricula (RLS enforced), admin for drafts.
 export async function GET(request: Request) {
   const supabase = await createClient();
   const { searchParams } = new URL(request.url);
@@ -38,8 +40,11 @@ export async function GET(request: Request) {
 }
 
 // POST /api/nodes -- create a node within a curriculum.
+// Admin only.
 export async function POST(request: Request) {
-  const supabase = await createClient();
+  const auth = await requireAdminApi();
+  if (auth.error) return auth.error;
+
   const body = await request.json();
 
   const { curriculum_id, title, order_index, external_key, exam_weight_pct, claim_statement } =
@@ -52,7 +57,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const { data, error } = await supabase
+  const { data, error } = await auth.supabase
     .from("nodes")
     .insert({
       curriculum_id,

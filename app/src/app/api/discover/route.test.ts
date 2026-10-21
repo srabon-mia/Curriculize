@@ -19,6 +19,8 @@ const verificationRecordsByCanonicalUrl: Map<string, any[]> = new Map();
 
 // Mock auth user - can be overridden per test
 let mockAuthUser: { id: string } | null = { id: "test-user" };
+// Mock admin status - can be overridden per test
+let mockIsAdmin = true;
 
 // Create a proper chain object using a class that returns itself
 class MockChain {
@@ -157,6 +159,13 @@ class MockChain {
   }
 
   maybeSingle() {
+    // Handle admins table check for admin authorization
+    if (this.table === "admins" && this.query.eq?.user_id) {
+      if (mockIsAdmin && mockAuthUser && this.query.eq.user_id === mockAuthUser.id) {
+        return Promise.resolve({ data: { user_id: mockAuthUser.id }, error: null });
+      }
+      return Promise.resolve({ data: null, error: null });
+    }
     return Promise.resolve({ data: null, error: null });
   }
 
@@ -368,6 +377,7 @@ describe("Discovery Route - Pipeline Integration", () => {
 
     // Reset auth user
     mockAuthUser = { id: "test-user" };
+    mockIsAdmin = true;
 
     // Create and set mock AI provider
     mockAIInstance = new MockProvider();

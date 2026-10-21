@@ -1,15 +1,16 @@
-import { createClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
+import { requireAdminApi } from "@/lib/auth";
 
 // PATCH /api/resources/[id] -- update a resource's review status.
-// RLS (admin-only writes) is the real enforcement here; this route
-// just validates the shape of the request.
+// Admin only.
 export async function PATCH(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const auth = await requireAdminApi();
+  if (auth.error) return auth.error;
+
   const { id } = await params;
-  const supabase = await createClient();
   const body = await request.json();
 
   const { status } = body;
@@ -21,7 +22,7 @@ export async function PATCH(
     );
   }
 
-  const { data, error } = await supabase
+  const { data, error } = await auth.supabase
     .from("resources")
     .update({ status })
     .eq("id", id)
@@ -39,10 +40,12 @@ export async function DELETE(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const { id } = await params;
-  const supabase = await createClient();
+  const auth = await requireAdminApi();
+  if (auth.error) return auth.error;
 
-  const { error } = await supabase
+  const { id } = await params;
+
+  const { error } = await auth.supabase
     .from("resources")
     .delete()
     .eq("id", id);

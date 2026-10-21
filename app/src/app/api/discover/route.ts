@@ -1,4 +1,3 @@
-import { createClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
 import { buildDiscoverPrompt } from "@/lib/prompts/discover";
 import { getNodesWithUnderstandings } from "@/lib/curriculum-data";
@@ -13,6 +12,7 @@ import {
 import { extractEducationalEvidence } from "@/lib/evidence";
 import { verifyContent } from "@/lib/verification";
 import { persistVerifiedResource, type PersistenceResult } from "@/lib/persistence";
+import { requireAdminApi } from "@/lib/auth";
 
 export const maxDuration = 60;
 
@@ -114,13 +114,10 @@ export async function POST(request: Request) {
     return Date.now() + minRequiredMs < deadlineMs;
   };
 
-  const supabase = await createClient();
+  const auth = await requireAdminApi();
+  if (auth.error) return auth.error;
 
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
+  const supabase = auth.supabase;
   const body = await request.json();
   const { node_id, curriculum_id, granularity, major_understanding_id } = body;
 
