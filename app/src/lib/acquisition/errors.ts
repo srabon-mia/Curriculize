@@ -16,7 +16,8 @@ export type AcquisitionErrorCode =
   | "UNSUPPORTED_CONTENT_TYPE"
   | "HTTP_FAILURE"
   | "MALFORMED_RESPONSE"
-  | "ACQUISITION_FAILED";
+  | "ACQUISITION_FAILED"
+  | "EMPTY_CONTENT";
 
 export interface AcquisitionErrorDetails {
   url?: string;

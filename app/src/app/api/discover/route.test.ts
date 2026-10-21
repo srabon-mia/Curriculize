@@ -733,8 +733,79 @@ describe("Discovery Route - Pipeline Integration", () => {
     }
   });
 
-  it("15. Failed verification resource is counted as inserted (draft, evidence preserved)", async () => {
-    // Override mock to return empty content (triggers failed verification)
+  it("15. Resource with content but no educational evidence passes verification but stays draft", async () => {
+    // Override mock to return content with words but NO educational evidence
+    // This tests the verification pass but auto-approval fail path
+    mockAIInstance.setDefaultResponse({
+      completeText: JSON.stringify([
+        {
+          url: "https://example.com/no-evidence",
+          title: "Plain Content Page",
+          resource_type: "text",
+          source_domain: "example.com",
+          ai_note: "Plain page",
+          license_status: "link_only"
+        },
+      ]),
+      usage: { inputTokens: 100, outputTokens: 50 },
+    });
+
+    // Mock acquisition to return content with words but NO educational evidence
+    const { acquireUrl } = await import("@/lib/acquisition/http");
+    (acquireUrl as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      finalUrl: "https://example.com/no-evidence",
+      canonicalUrl: { url: "https://example.com/no-evidence", parsed: new URL("https://example.com/no-evidence"), original: "https://example.com/no-evidence" },
+      statusCode: 200,
+      headers: { "content-type": "text/html" },
+      body: "<html><head><title>Plain Content Page</title></head><body><p>This is just regular text content without any learning objectives, definitions, or exercises.</p><p>It has words but no educational structure.</p></body></html>",
+      contentType: "text/html",
+      charset: "utf-8",
+      contentHash: "no-evidence-hash",
+      acquiredAt: new Date().toISOString(),
+      redirectChain: [],
+      resolvedIps: { ipv4: [], ipv6: [] },
+    });
+
+    const request = createMockRequest({
+      node_id: "node-1",
+      curriculum_id: "test-curriculum-id"
+    });
+    const response = await POST(request);
+    const json = await response.json();
+
+    // Should have 1 inserted (resource created, verification passes but no auto-approval)
+    // and 0 skipped
+    expect(response.status).toBe(200);
+    expect(json.inserted).toBe(1);
+    expect(json.skipped).toBe(0);
+
+    // Resource should be draft (no auto-approval without educational evidence)
+    // but content_type_verified = true (verification status = verified due to wordCount > 0)
+    const resourceInserts = capturedInserts.filter(c => c.table === "resources");
+    expect(resourceInserts.length).toBe(1);
+    for (const call of resourceInserts) {
+      for (const resource of call.resources) {
+        expect(resource.status).toBe("draft");
+        expect(resource.content_type_verified).toBe(true);
+      }
+    }
+
+    // Verification record should be verified (wordCount > 0 passes hard gate)
+    const vrInserts = capturedInserts.filter(c => c.table === "verification_records");
+    expect(vrInserts.length).toBe(1);
+    for (const call of vrInserts) {
+      for (const vr of call.resources) {
+        expect(vr.status).toBe("verified");
+      }
+    }
+
+    // Message should not imply approval
+    expect(json.message).not.toContain("approved");
+    expect(json.message).not.toContain("verified");
+  });
+
+  it("15b. Empty content page (0 words) fails at acquisition with EMPTY_CONTENT", async () => {
+    // Mock AI to return a candidate with empty content
     mockAIInstance.setDefaultResponse({
       completeText: JSON.stringify([
         {
@@ -749,7 +820,7 @@ describe("Discovery Route - Pipeline Integration", () => {
       usage: { inputTokens: 100, outputTokens: 50 },
     });
 
-    // Mock acquisition to return empty body (0 word count -> failed verification)
+    // Mock acquisition to return empty body (0 word count -> EMPTY_CONTENT acquisition failure)
     const { acquireUrl } = await import("@/lib/acquisition/http");
     (acquireUrl as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       finalUrl: "https://example.com/empty",
@@ -772,34 +843,16 @@ describe("Discovery Route - Pipeline Integration", () => {
     const response = await POST(request);
     const json = await response.json();
 
-    // Should have 1 inserted (resource created even though verification failed)
-    // and 0 skipped
+    // Should have 0 inserted (skipped at acquisition) and 1 skipped
     expect(response.status).toBe(200);
-    expect(json.inserted).toBe(1);
-    expect(json.skipped).toBe(0);
+    expect(json.inserted).toBe(0);
+    expect(json.skipped).toBe(1);
 
-    // Resource should be draft with content_type_verified = false
+    // No resource or verification record should be created
     const resourceInserts = capturedInserts.filter(c => c.table === "resources");
-    expect(resourceInserts.length).toBe(1);
-    for (const call of resourceInserts) {
-      for (const resource of call.resources) {
-        expect(resource.status).toBe("draft");
-        expect(resource.content_type_verified).toBe(false);
-      }
-    }
-
-    // Verification record should be failed
+    expect(resourceInserts.length).toBe(0);
     const vrInserts = capturedInserts.filter(c => c.table === "verification_records");
-    expect(vrInserts.length).toBe(1);
-    for (const call of vrInserts) {
-      for (const vr of call.resources) {
-        expect(vr.status).toBe("failed");
-      }
-    }
-
-    // Message should not imply approval
-    expect(json.message).not.toContain("approved");
-    expect(json.message).not.toContain("verified");
+    expect(vrInserts.length).toBe(0);
   });
 
   it("16. Persistence failure for one candidate does not block subsequent candidates", async () => {

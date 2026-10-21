@@ -192,6 +192,25 @@ export async function acquireCandidate(
   // Phase 5 output
   const cleaned = serializeCleanedDocument(doc);
 
+  // Fail fast: no extractable content (e.g., JS shells, consent pages, empty pages)
+  // This prevents wasting verification/persistence on unextractable sources.
+  if (cleaned.wordCount === 0) {
+    return {
+      candidate,
+      success: false,
+      error: {
+        code: "EMPTY_CONTENT",
+        message: "Page acquired successfully but no extractable text content found",
+        details: {
+          finalUrl: acquired.finalUrl,
+          statusCode: acquired.statusCode,
+          contentType: acquired.contentType,
+          title: cleaned.title,
+        },
+      },
+    };
+  }
+
   // Phase 6A output
   const structuredContent = extractStructuredContentFromDoc(doc);
 

@@ -11,9 +11,19 @@ import {
 import { createCache } from "@/lib/cache";
 import { AcquisitionDedupTracker } from "@/lib/acquisition";
 import { DEFAULT_BUDGET_LIMITS } from "@/lib/acquisition/jobTypes";
-import { reserveAICall } from "@/lib/acquisition/jobService";
+import {
+  reserveAICall,
+  releaseJobClaim,
+  saveJobSources,
+  getJobById
+} from "@/lib/acquisition/jobService";
 
 export const maxDuration = 300;
+
+// Maximum topics to process per SSE invocation before yielding.
+// Matches the durable worker's MAX_TOPICS_PER_INVOCATION to ensure
+// the job stays within the 300s Vercel limit and can resume via cron.
+const MAX_TOPICS_PER_SSE_INVOCATION = 2;
 
 const supabase = createServiceClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -799,6 +809,21 @@ export async function GET(
         const dedupTracker = new AcquisitionDedupTracker();
         const acquisitionJobId = jobRecord.id;
 
+        // Resume detection: read checkpoint to skip already-completed topics.
+        // This allows the SSE route to yield and resume like the durable worker.
+        const { getJobById } = await import("@/lib/acquisition/jobService");
+        const jobData = await getJobById(jobRecord.id);
+        const rawCompletedTopics =
+          (jobData?.result_data as { checkpoint?: { completedTopicIds: unknown } })?.checkpoint
+            ?.completedTopicIds;
+        const completedTopics = new Set(
+          Array.isArray(rawCompletedTopics)
+            ? rawCompletedTopics.filter((id): id is string => typeof id === "string")
+            : []
+        );
+
+        let topicsProcessedThisInvocation = 0;
+
         for (let i = 0; i < nodeIds.length; i++) {
           if (ownershipLost) {
             console.log(
@@ -819,6 +844,50 @@ export async function GET(
             return;
           }
           const { nodeId, node } = nodeIds[i];
+
+          // Skip already-completed topics (resume from checkpoint)
+          if (completedTopics.has(nodeId)) {
+            console.log(`[stream] Skipping topic ${nodeId} - already completed (checkpoint)`);
+            continue;
+          }
+
+          // Bounded work: yield when quota exhausted.
+          // releaseJobClaim sets status='pending' without consuming a retry,
+          // so the next SSE reconnect (or cron worker) can claim and resume.
+          if (topicsProcessedThisInvocation >= MAX_TOPICS_PER_SSE_INVOCATION) {
+            console.log(
+              `[stream] Topic quota (${MAX_TOPICS_PER_SSE_INVOCATION}) reached, releasing claim for next invocation`
+            );
+            const released = await releaseJobClaim(
+              jobRecord!.id,
+              jobRecord!.claim_token,
+              jobRecord!.claim_version
+            );
+            if (!released) {
+              console.log(
+                `[stream] release_job_claim returned false — ownership lost or yield refused; stopping`
+              );
+              // Re-read job state to determine why release failed
+              const jobState = await getJobById(jobRecord.id);
+              if (!jobState || jobState.status !== 'pending') {
+                // Ownership lost to another worker or job terminal — do not yield
+                console.error(
+                  `[stream] Job ${jobRecord!.id} is no longer in pending state (status: ${jobState?.status}), not sending yielded`
+                );
+                return;
+              }
+              // If still pending but release failed (yield cap), we can try again on reconnect
+            }
+            // Send yielded event so client knows to reconnect
+            send(controller, "yielded", {
+              message: "Processing quota reached. Resuming…",
+              topicsCompleted: topicsProcessedThisInvocation,
+              totalTopics: nodeIds.length,
+            });
+            controller.close();
+            return;
+          }
+          topicsProcessedThisInvocation++;
 
           send(controller, "status", {
             message: `Finding resources for: ${node.title}`,
@@ -1065,6 +1134,19 @@ export async function GET(
 
           const bgCurriculumTitle = curriculumRow?.title ?? updatedCurriculumTitle;
 
+          // Resume detection: read batch checkpoint to skip already-completed topics.
+          const batchJobData = await getJobById(jobRecord.id);
+          const rawCompletedBatchTopics =
+            (batchJobData?.result_data as { batchCheckpoint?: { completedTopicIds: unknown } })
+              ?.batchCheckpoint?.completedTopicIds;
+          const completedBatchTopics = new Set(
+            Array.isArray(rawCompletedBatchTopics)
+              ? rawCompletedBatchTopics.filter((id): id is string => typeof id === "string")
+              : []
+          );
+
+          let batchTopicsProcessedThisInvocation = 0;
+
           for (let i = 0; i < nodeIds.length; i++) {
             if (ownershipLost) {
               console.error(
@@ -1074,12 +1156,57 @@ export async function GET(
             }
             const { nodeId, node } = nodeIds[i];
 
+            // Skip topics whose batch discovery already completed (resume).
+            if (completedBatchTopics.has(nodeId)) {
+              console.log(`[stream] Skipping batch for topic ${nodeId} - already completed (batch checkpoint)`);
+              continue;
+            }
+
             const { data: muRows } = await supabase
               .from("major_understandings")
               .select("id, code, description, external_key")
               .eq("node_id", nodeId);
 
             if (!muRows || muRows.length === 0) continue;
+
+            // Bounded work: release the claim and yield to the next invocation
+            // once this invocation's batch quota is exhausted. releaseJobClaim sets
+            // status='pending' without consuming a retry, so the next SSE reconnect
+            // (or cron worker) can claim and resume.
+            if (batchTopicsProcessedThisInvocation >= MAX_TOPICS_PER_SSE_INVOCATION) {
+              console.log(
+                `[stream] Batch quota (${MAX_TOPICS_PER_SSE_INVOCATION}) reached, releasing claim for next invocation`
+              );
+              const released = await releaseJobClaim(
+                jobRecord!.id,
+                jobRecord!.claim_token,
+                jobRecord!.claim_version
+              );
+              if (!released) {
+                console.log(
+                  `[stream] release_job_claim returned false — ownership lost or yield refused; stopping background batch`
+                );
+                // Re-read job state to determine why release failed
+                const jobState = await getJobById(jobRecord.id);
+                if (!jobState || jobState.status !== 'pending') {
+                  // Ownership lost to another worker or job terminal — do not yield
+                  console.error(
+                    `[stream] Job ${jobRecord!.id} is no longer in pending state (status: ${jobState?.status}), not sending yielded`
+                  );
+                  return;
+                }
+                // If still pending but release failed (yield cap), we can try again on reconnect
+              }
+              // Send yielded event so client knows to reconnect
+              send(controller, "yielded", {
+                message: "Background batch quota reached. Resuming…",
+                topicsCompleted: batchTopicsProcessedThisInvocation,
+                totalTopics: nodeIds.length,
+              });
+              controller.close();
+              return;
+            }
+            batchTopicsProcessedThisInvocation++;
 
             let topicBatchPersisted = 0;
 

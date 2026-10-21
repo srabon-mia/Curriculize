@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useEffect, useState, use, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 
@@ -10,11 +10,18 @@ type Status = {
   current?: number;
   total?: number;
   phase?: string;
+  topicsCompleted?: number;
 };
 
 type CompleteEvent = {
   curriculum_id: string;
   phase: "topics" | "background";
+};
+
+type YieldedEvent = {
+  message: string;
+  topicsCompleted: number;
+  totalTopics: number;
 };
 
 type LogEntry = {
@@ -36,9 +43,26 @@ export default function GeneratePage({
   const [log, setLog] = useState<LogEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [skeletonTitle, setSkeletonTitle] = useState<string | null>(null);
+  const [terminalState, setTerminalState] = useState<"none" | "complete" | "failed">("none");
+  const terminalStateRef = useRef(terminalState);
+  terminalStateRef.current = terminalState;
+  const esRef = useRef<EventSource | null>(null);
+  const yieldedHandledRef = useRef(false);
 
-  useEffect(() => {
+  // Single connection manager - handles all lifecycle
+  const connect = useCallback(() => {
+    // Don't reconnect if we've reached a terminal state
+    if (terminalStateRef.current !== "none") return;
+
+    // Close any existing connection
+    if (esRef.current) {
+      esRef.current.close();
+      esRef.current = null;
+    }
+
     const es = new EventSource(`/api/generate/${id}/stream`);
+    esRef.current = es;
+    yieldedHandledRef.current = false;
 
     es.addEventListener("status", (e) => {
       const data = JSON.parse(e.data) as Status;
@@ -46,9 +70,6 @@ export default function GeneratePage({
       setLog((prev) => [...prev, { message: data.message, done: false }]);
 
       if (data.step === "already_claimed") {
-        // Another generation is in progress for this curriculum — redirect
-        // to the curriculum page where the student can observe progress via
-        // polling (CurriculumViewer polls /api/curricula/[id]/progress).
         es.close();
         router.push(`/curriculum/${id}`);
       }
@@ -72,11 +93,11 @@ export default function GeneratePage({
     es.addEventListener("complete", (e) => {
       const data = JSON.parse(e.data) as CompleteEvent;
       if (data.phase === "background") {
-        // All generation complete (topic + background batch)
+        setTerminalState("complete");
         es.close();
+        esRef.current = null;
         router.push(`/curriculum/${id}`);
       } else if (data.phase === "topics") {
-        // Topic-level resources done, background batch starting
         setLog((prev) => [
           ...prev.slice(0, -1),
           {
@@ -87,20 +108,76 @@ export default function GeneratePage({
       }
     });
 
-    es.addEventListener("error", (e) => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data) as {
-          message: string;
-        };
-        setError(data.message);
-      } catch {
-        setError("Something went wrong — please try again");
-      }
+    es.addEventListener("yielded", (e) => {
+      const data = JSON.parse(e.data) as YieldedEvent;
+      setLog((prev) => [
+        ...prev.slice(0, -1),
+        {
+          message: `${data.message} (${data.topicsCompleted}/${data.totalTopics} topics this session)`,
+          done: true,
+        },
+      ]);
+      yieldedHandledRef.current = true;
+      // Close current connection; reconnect will be triggered by the effect
       es.close();
+      esRef.current = null;
+    });
+
+    // Handle explicit "error" events from server (event type = "error", has data)
+    es.addEventListener("error", (e) => {
+      const event = e as MessageEvent;
+      // Only handle explicit error events with data
+      if (event.type === "error" && event.data) {
+        try {
+          const data = JSON.parse(event.data) as { message: string };
+          setError(data.message);
+          setTerminalState("failed");
+        } catch {
+          setError("Something went wrong — please try again");
+          setTerminalState("failed");
+        }
+        es.close();
+        esRef.current = null;
+      }
+      // Connection closures (readyState = CLOSED) without data are handled by close event
+    });
+
+    // Handle unexpected connection close (network failure, server crash, etc.)
+    es.addEventListener("close", () => {
+      // If we already handled an error event with data, don't double-handle
+      if (terminalStateRef.current === "failed") return;
+
+      // If connection closed and we didn't handle yielded/complete
+      if (es.readyState === EventSource.CLOSED && terminalStateRef.current === "none" && !yieldedHandledRef.current) {
+        // This is an unexpected disconnect (network failure, server crash, etc.)
+        setError("Connection lost. Retrying…");
+        setTerminalState("failed");
+      }
     });
 
     return () => es.close();
   }, [id, router]);
+
+  // Reconnect after a yielded event (when terminalState is still "none")
+  useEffect(() => {
+    if (terminalState !== "none") return;
+
+    // If we just handled a yielded event, reconnect
+    if (yieldedHandledRef.current) {
+      yieldedHandledRef.current = false;
+      connect();
+    }
+  }, [terminalState, connect]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (esRef.current) {
+        esRef.current.close();
+        esRef.current = null;
+      }
+    };
+  }, []);
 
   return (
     <main className="min-h-screen bg-canvas-default text-text-primary flex items-center justify-center px-6 py-12">
@@ -196,4 +273,4 @@ export default function GeneratePage({
       </div>
     </main>
   );
-}
+}

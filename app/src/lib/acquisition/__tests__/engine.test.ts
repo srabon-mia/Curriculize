@@ -115,3 +115,24 @@ describe("isAcquisitionError type guard", () => {
     expect(isAcquisitionError({ code: "TIMEOUT" })).toBe(false);
   });
 });
+
+describe("acquireCandidate: EMPTY_CONTENT error type", () => {
+  test("EMPTY_CONTENT error code exists and formats correctly", () => {
+    const err = new AcquisitionError("EMPTY_CONTENT", { url: "https://youtube.com/watch?v=123" });
+    expect(err.code).toBe("EMPTY_CONTENT");
+    expect(err.message).toContain("EMPTY_CONTENT");
+  });
+
+  test("EMPTY_CONTENT error includes diagnostic details", () => {
+    const err = new AcquisitionError("EMPTY_CONTENT", {
+      url: "https://example.com/empty",
+      statusCode: 200,
+      contentType: "text/html",
+      title: "Empty Page",
+    });
+    expect(err.details.url).toBe("https://example.com/empty");
+    expect(err.details.statusCode).toBe(200);
+    expect(err.details.contentType).toBe("text/html");
+    expect(err.details.title).toBe("Empty Page");
+  });
+});
