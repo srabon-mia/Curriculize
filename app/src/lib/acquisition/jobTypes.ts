@@ -50,6 +50,10 @@ export interface JobResultData {
     completedTopicIds: string[];
     updatedAt: string;
   };
+  batchCheckpoint?: {
+    completedTopicIds: string[];
+    updatedAt: string;
+  };
   [key: string]: unknown;
 }
 
@@ -253,7 +257,7 @@ export interface CreateJobAndCurriculumResponse {
 }
 
 export const DEFAULT_BUDGET_LIMITS: JobBudgetLimits = {
-  max_ai_calls: 12,
+  max_ai_calls: 32,
   max_total_candidates_per_job: 50,
   max_candidates_per_understanding: 5,
   max_fetch_attempts: 3,

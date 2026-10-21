@@ -64,7 +64,7 @@ export async function createJobAndCurriculum(
   };
 
   const budgets = {
-    max_ai_calls: 12,
+    max_ai_calls: 32,
     max_total_candidates_per_job: 50,
     max_candidates_per_understanding: 5,
     max_fetch_attempts: 3,
@@ -271,8 +271,90 @@ export async function failJob(
 }
 
 /**
- * Recover stale jobs (called by scheduler before claiming new work).
+ * Release a job claim back to 'pending' without consuming a retry count.
+ * The caller holds a valid claim_token and claim_version; the WHERE clause
+ * guards against stale claims. After this call the job is in 'pending' state
+ * and can be claimed again by the cron processor.
  */
+export async function releaseJobClaim(
+  jobId: string,
+  claimToken: string,
+  expectedClaimVersion: number
+): Promise<boolean> {
+  const supabase = getServiceClient();
+
+  const { data, error } = await supabase.rpc('release_job_claim', {
+    p_job_id: jobId,
+    p_claim_token: claimToken,
+    p_expected_claim_version: expectedClaimVersion,
+  });
+
+  if (error) {
+    console.error('Release job claim error:', error);
+    return false;
+  }
+
+  return data as boolean;
+}
+
+/**
+ * Persist discovered sources so a resumed invocation can skip the
+ * source-discovery AI call.
+ */
+export async function saveJobSources(
+  jobId: string,
+  claimToken: string,
+  expectedClaimVersion: number,
+  sources: Array<{ domain: string; name: string; why: string; best_for: string }>
+): Promise<boolean> {
+  const supabase = getServiceClient();
+
+  const { data, error } = await supabase.rpc('save_job_sources', {
+    p_job_id: jobId,
+    p_claim_token: claimToken,
+    p_expected_claim_version: expectedClaimVersion,
+    p_sources: sources,
+  });
+
+  if (error) {
+    console.error('Save job sources error:', error);
+    return false;
+  }
+
+  return data as boolean;
+}
+
+/**
+ * Advance the batch-phase checkpoint for per-understanding discovery.
+ * Uses a separate scope ('batchCheckpoint') from advance_checkpoint so that
+ * topic-level and batch-phase progress are tracked independently and can resume
+ * independently.
+ */
+export async function advanceBatchCheckpoint(
+  jobId: string,
+  claimToken: string,
+  expectedClaimVersion: number,
+  completedTopicId: string,
+  resourcesFound: number
+): Promise<boolean> {
+  const supabase = getServiceClient();
+
+  const { data, error } = await supabase.rpc('advance_batch_checkpoint', {
+    p_job_id: jobId,
+    p_claim_token: claimToken,
+    p_expected_claim_version: expectedClaimVersion,
+    p_completed_topic_id: completedTopicId,
+    p_resources_found: resourcesFound,
+  });
+
+  if (error) {
+    console.error('Advance batch checkpoint error:', error);
+    return false;
+  }
+
+  return data as boolean;
+}
+
 export async function recoverStaleJobs(): Promise<Array<{ id: string; status: string; retry_count: number }>> {
   const supabase = getServiceClient();
 

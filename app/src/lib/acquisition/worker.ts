@@ -10,9 +10,12 @@ import {
   reserveAICall,
   persistWithFence,
   advanceCheckpoint,
+  advanceBatchCheckpoint,
   completeJob,
   failJob,
   recoverStaleJobs,
+  releaseJobClaim,
+  saveJobSources,
   getJobById,
   DEFAULT_BUDGET_LIMITS,
   LEASE_RENEWAL_INTERVAL_MS,
@@ -31,6 +34,8 @@ import type { JobBudgetLimits, JobClaimResult } from '@/lib/acquisition/jobTypes
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+
+const MAX_TOPICS_PER_INVOCATION = 2;
 
 function getAdminClient() {
   return createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -268,87 +273,140 @@ export async function processJob(job: JobClaimResult): Promise<void> {
     }
 
     const curriculumNotes = curriculum.notes ? JSON.parse(curriculum.notes) as Record<string, unknown> : {};
-    const skeletonPrompt = buildSkeletonPrompt(
-      curriculum.title,
-      (curriculumNotes.grade_level as string) ?? 'high school',
-      (curriculumNotes.difficulty as string) ?? 'standard',
-      (curriculumNotes.existing_knowledge as string) ?? '',
-      (curriculumNotes.learning_goal as string) ?? 'understand the subject',
-      (curriculumNotes.time_available as string) ?? 'no time pressure',
-      (curriculumNotes.added_context as string) ?? ''
-    );
 
-    // Reserve AI call for skeleton
-    const skeletonReservationId = crypto.randomUUID();
-    const skeletonReservation = await reserveAICall(
-      job.id, job.claim_token!, job.claim_version,
-      maxAiCalls,
-      skeletonReservationId
-    );
+    // Step 2a: Resume detection - check if nodes already exist from a previous
+    // invocation. If they do, we skip skeleton generation to avoid re-spending
+    // an AI call and potentially producing a different topic list that would
+    // invalidate completedTopicIds checkpoint entries.
+    const { data: existingNodes } = await supabase
+      .from('nodes')
+      .select('*')
+      .eq('curriculum_id', curriculumId)
+      .order('order_index', { ascending: true });
 
-    if (!skeletonReservation.reserved) {
-      if (skeletonReservation.reason === 'budget_exhausted') {
-        const { completeJob } = await import('@/lib/acquisition/jobService');
-        await completeJob(job.id, job.claim_token!, job.claim_version, false);
-      }
-      return;
-    }
+    const structureExists = (existingNodes?.length ?? 0) > 0;
 
-    const skeletonText = await callAISkeleton(skeletonPrompt);
-    const skeleton = parseSkeleton(skeletonText);
-    if (!skeleton) {
-      const { failJob } = await import('@/lib/acquisition/jobService');
-      await failJob(job.id, job.claim_token!, job.claim_version, 'Failed to parse skeleton');
-      return;
-    }
-
-    // Update curriculum with skeleton info
-    await getAdminClient()
-      .from('curricula')
-      .update({
-        title: skeleton.title,
-        source_type: skeleton.source_type,
-        source_attribution: skeleton.source_attribution,
-        source_url: skeleton.source_url,
-      })
-      .eq('id', curriculumId);
-
-    // Step 3: Insert nodes and major understandings
-    interface SkeletonNode {
-      title: string;
-      order_index: number;
-      major_understandings: Array<{ code: string | null; description: string }>;
-    }
+    // Step 2b: Source discovery caching - reuse persisted sources if available
+    // to avoid re-spending the AI call on resume.
+    const jobState = await getJobById(job.id);
+    const persistedSources = (jobState?.result_data as { discoveredSources?: unknown })?.discoveredSources;
+    const cachedSources: DiscoveredSource[] = Array.isArray(persistedSources)
+      ? persistedSources.filter(
+          (s): s is DiscoveredSource =>
+            typeof s === "object" && s !== null && typeof (s as DiscoveredSource).domain === "string"
+        )
+      : [];
 
     const nodeIds: Array<{ nodeId: string; node: SkeletonNode }> = [];
+    // Title used in discovery prompts. On a fresh run this is the AI-generated
+    // skeleton title; on resume it is the title persisted by the earlier run.
+    let discoveryTitle = curriculum.title;
+    let skeleton: Skeleton | null = null;
 
-    for (const node of skeleton.nodes) {
-      const topicExternalKey = `topic-${node.order_index}`;
-      const { data: nodeRow } = await supabase
-        .from('nodes')
-        .upsert({
-          curriculum_id: curriculumId,
-          title: node.title,
-          order_index: node.order_index,
-          external_key: topicExternalKey,
-        }, { onConflict: 'curriculum_id,external_key' })
-        .select('id')
-        .single();
-
-      if (!nodeRow) continue;
-
-      const mus = node.major_understandings.map((mu: SkeletonNode['major_understandings'][0], i: number) => ({
-        node_id: nodeRow.id,
-        external_key: mu.code ?? `${node.order_index}.${i + 1}`,
-        code: mu.code,
-        description: mu.description,
-        order_index: i,
-      }));
-
-      await supabase
+    if (structureExists) {
+      // Reuse the persisted structure - no AI call, no re-insert.
+      const { data: existingMus } = await supabase
         .from('major_understandings')
-        .upsert(mus, { onConflict: 'node_id,external_key' });
-      nodeIds.push({ nodeId: nodeRow.id, node });
+        .select('id, node_id, code, description, order_index')
+        .in('node_id', (existingNodes ?? []).map((n) => n.id));
+
+      for (const node of existingNodes ?? []) {
+        const mus = (existingMus ?? [])
+          .filter((m) => m.node_id === node.id)
+          .sort((a, b) => a.order_index - b.order_index)
+          .map((m) => ({
+            code: m.code,
+            description: m.description,
+          }));
+
+        nodeIds.push({
+          nodeId: node.id,
+          node: {
+            title: node.title,
+            order_index: node.order_index,
+            major_understandings: mus,
+          },
+        });
+      }
+
+      console.log(`[worker] Resuming with ${nodeIds.length} existing topics (skeleton AI call skipped)`);
+    } else {
+      const skeletonPrompt = buildSkeletonPrompt(
+        curriculum.title,
+        (curriculumNotes.grade_level as string) ?? 'high school',
+        (curriculumNotes.difficulty as string) ?? 'standard',
+        (curriculumNotes.existing_knowledge as string) ?? '',
+        (curriculumNotes.learning_goal as string) ?? 'understand the subject',
+        (curriculumNotes.time_available as string) ?? 'no time pressure',
+        (curriculumNotes.added_context as string) ?? ''
+      );
+
+      // Reserve AI call for skeleton
+      const skeletonReservationId = crypto.randomUUID();
+      const skeletonReservation = await reserveAICall(
+        job.id, job.claim_token!, job.claim_version,
+        maxAiCalls,
+        skeletonReservationId
+      );
+
+      if (!skeletonReservation.reserved) {
+        if (skeletonReservation.reason === 'budget_exhausted') {
+          const { completeJob } = await import('@/lib/acquisition/jobService');
+          await completeJob(job.id, job.claim_token!, job.claim_version, false);
+        }
+        return;
+      }
+
+      const skeletonText = await callAISkeleton(skeletonPrompt);
+      const skeleton = parseSkeleton(skeletonText);
+      if (!skeleton) {
+        const { failJob } = await import('@/lib/acquisition/jobService');
+        await failJob(job.id, job.claim_token!, job.claim_version, 'Failed to parse skeleton');
+        return;
+      }
+
+      // Update curriculum with skeleton info
+      await getAdminClient()
+        .from('curricula')
+        .update({
+          title: skeleton.title,
+          source_type: skeleton.source_type,
+          source_attribution: skeleton.source_attribution,
+          source_url: skeleton.source_url,
+        })
+        .eq('id', curriculumId);
+
+      discoveryTitle = skeleton.title;
+
+      // Step 3: Insert nodes and major understandings
+      for (const node of skeleton.nodes) {
+        const topicExternalKey = `topic-${node.order_index}`;
+        const { data: nodeRow } = await supabase
+          .from('nodes')
+          .upsert({
+            curriculum_id: curriculumId,
+            title: node.title,
+            order_index: node.order_index,
+            external_key: topicExternalKey,
+          }, { onConflict: 'curriculum_id,external_key' })
+          .select('id')
+          .single();
+
+        if (!nodeRow) continue;
+
+        const mus = node.major_understandings.map((mu: SkeletonNode['major_understandings'][0], i: number) => ({
+          node_id: nodeRow.id,
+          external_key: mu.code ?? `${node.order_index}.${i + 1}`,
+          code: mu.code,
+          description: mu.description,
+          order_index: i,
+        }));
+
+        await supabase
+          .from('major_understandings')
+          .upsert(mus, { onConflict: 'node_id,external_key' });
+        nodeIds.push({ nodeId: nodeRow.id, node });
+      }
     }
 
     // Read checkpoint to skip already-completed topics
@@ -362,27 +420,41 @@ export async function processJob(job: JobClaimResult): Promise<void> {
         : []
     );
 
-    // Step 4: Source discovery
-    const sourcesPrompt = buildSourceDiscoveryPrompt(
-      skeleton.title,
-      (curriculumNotes.difficulty as string) ?? 'standard',
-      (curriculumNotes.learning_goal as string) ?? 'understand the subject'
-    );
+    // Step 4: Source discovery (one-time; cached in result_data for resume)
+    let discoveredSources: DiscoveredSource[] = cachedSources;
 
-    const sourcesReservationId = crypto.randomUUID();
-    const sourcesReservation = await reserveAICall(
-      job.id, job.claim_token!, job.claim_version,
-      maxAiCalls,
-      sourcesReservationId
-    );
+    if (discoveredSources.length === 0) {
+      const sourcesPrompt = buildSourceDiscoveryPrompt(
+        curriculum.title,
+        (curriculumNotes.difficulty as string) ?? 'standard',
+        (curriculumNotes.learning_goal as string) ?? 'understand the subject'
+      );
 
-    let discoveredSources: DiscoveredSource[] = [];
-    if (sourcesReservation.reserved) {
-      const sourcesText = await callAISources(sourcesPrompt);
-      discoveredSources = parseSources(sourcesText);
+      const sourcesReservationId = crypto.randomUUID();
+      const sourcesReservation = await reserveAICall(
+        job.id, job.claim_token!, job.claim_version,
+        maxAiCalls,
+        sourcesReservationId
+      );
+
+      if (sourcesReservation.reserved) {
+        const sourcesText = await callAISources(sourcesPrompt);
+        discoveredSources = parseSources(sourcesText);
+        // Persist so a resumed invocation does not re-spend this AI call.
+        await saveJobSources(
+          job.id, job.claim_token!, job.claim_version, discoveredSources
+        );
+      }
+    } else {
+      console.log(`[worker] Reusing ${discoveredSources.length} cached sources (source AI call skipped)`);
     }
 
     // Step 5: Topic-level resource discovery
+    // Bounded work: at most MAX_TOPICS_PER_INVOCATION new topics per invocation.
+    // Topics already recorded in the checkpoint are skipped, so a resumed
+    // invocation continues from where the previous one stopped.
+    let topicsProcessedThisInvocation = 0;
+
     for (let i = 0; i < nodeIds.length; i++) {
       const { nodeId, node } = nodeIds[i];
 
@@ -391,6 +463,28 @@ export async function processJob(job: JobClaimResult): Promise<void> {
         console.log(`[worker] Skipping topic ${nodeId} - already completed (checkpoint)`);
         continue;
       }
+
+      // Bounded work: release the claim and yield to the next cron invocation
+      // once this invocation's topic quota is exhausted. release_job_claim sets
+      // status='pending' without consuming a retry, so the next cron run can
+      // claim the job and resume from the checkpoint.
+      if (topicsProcessedThisInvocation >= MAX_TOPICS_PER_INVOCATION) {
+        console.log(
+          `[worker] Topic quota (${MAX_TOPICS_PER_INVOCATION}) reached, releasing claim for next cron run`
+        );
+        const released = await releaseJobClaim(job.id, job.claim_token!, job.claim_version);
+        if (!released) {
+          // release failed: claim already lost (stolen by another worker) OR
+          // release refused (e.g., yield cap reached). In either case, do not
+          // continue — the job will be reclaimed by the cron worker and resume
+          // from the checkpoint.
+          console.log(
+            `[worker] release_job_claim returned false — ownership lost or yield refused; yielding for next cron run`
+          );
+        }
+        return;
+      }
+      topicsProcessedThisInvocation++;
 
       // Reserve AI call for topic discovery
       const topicReservationId = crypto.randomUUID();
@@ -402,10 +496,8 @@ export async function processJob(job: JobClaimResult): Promise<void> {
 
       if (!topicReservation.reserved) {
         if (topicReservation.reason === 'budget_exhausted') {
-          const { getJobById, completeJob } = await import('@/lib/acquisition/jobService');
-          const jobData = await getJobById(job.id);
-          const hasProgress = ((jobData?.result_data as { checkpoint?: { completedTopicIds: string[] } })?.checkpoint?.completedTopicIds?.length ?? 0) > 0;
-          await completeJob(job.id, job.claim_token!, job.claim_version, hasProgress);
+          const { failJob } = await import('@/lib/acquisition/jobService');
+          await failJob(job.id, job.claim_token!, job.claim_version, 'AI budget exhausted: budget_exhausted');
         }
         return;
       }
@@ -433,7 +525,7 @@ export async function processJob(job: JobClaimResult): Promise<void> {
         'topic',
         undefined,
         undefined,
-        skeleton.title,
+        discoveryTitle,
         discoveredSources.map((s) => s.domain)
       );
 
@@ -450,25 +542,7 @@ export async function processJob(job: JobClaimResult): Promise<void> {
           ? candidate.resource_type : 'other';
         const mappedCandidate = mapToDiscoveryCandidate(candidate, []);
 
-        // Reserve AI call for acquisition (each candidate needs AI for verification)
-        const acquisitionReservationId = crypto.randomUUID();
-        const acquisitionReservation = await reserveAICall(
-          job.id, job.claim_token!, job.claim_version,
-          maxAiCalls,
-          acquisitionReservationId
-        );
-
-        if (!acquisitionReservation.reserved) {
-          if (acquisitionReservation.reason === 'budget_exhausted') {
-            const { getJobById, completeJob } = await import('@/lib/acquisition/jobService');
-            const jobData = await getJobById(job.id);
-            const hasProgress = ((jobData?.result_data as { checkpoint?: { completedTopicIds: string[] } })?.checkpoint?.completedTopicIds?.length ?? 0) > 0;
-            await completeJob(job.id, job.claim_token!, job.claim_version, hasProgress);
-          }
-          return;
-        }
-
-        // Acquire and process through pipeline
+        // Acquire and process through pipeline (deterministic - no AI call)
         const acquisitionResult = await acquireCandidate(
           { url: mappedCandidate.url, title: mappedCandidate.title, sourceDomain: mappedCandidate.sourceDomain, resourceType: mappedCandidate.resourceType, aiNote: mappedCandidate.aiNote },
           { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000 },
@@ -527,15 +601,55 @@ export async function processJob(job: JobClaimResult): Promise<void> {
         }
       }
 
-      // Advance checkpoint for this topic
-      await advanceCheckpoint(job.id, job.claim_token!, job.claim_version, nodeId, 0);
+      // Advance checkpoint for this topic.
+      // The return value MUST be checked: a false result means the claim was
+      // lost (lease expired or claim replaced). Continuing would let a stale
+      // worker keep writing under a dead claim, and would attempt to release
+      // a claim it no longer owns.
+      const checkpointOk = await advanceCheckpoint(
+        job.id, job.claim_token!, job.claim_version, nodeId, 0
+      );
+      if (!checkpointOk) {
+        console.error(
+          `[worker] advance_checkpoint returned false — ownership lost for job ${job.id}`
+        );
+        return;
+      }
     }
 
-    // Step 5: Background per-understanding batch discovery
-    await processBatchDiscovery(job, skeleton, nodeIds);
+    // Step 6: Background per-understanding batch discovery.
+    // Returns false when it yielded (quota exhausted) so we do NOT publish or
+    // complete the job — the next cron invocation resumes from the batch
+    // checkpoint.
+    const batchComplete = await processBatchDiscovery(job, discoveryTitle, nodeIds);
 
-    // Final completion
-    await completeJob(job.id, job.claim_token!, job.claim_version, true);
+    if (!batchComplete) {
+      // Yielded: claim already released inside processBatchDiscovery.
+      return;
+    }
+
+    // Final completion: only mark the job 'completed' if ALL work succeeded.
+    const completeOk = await completeJob(
+      job.id,
+      job.claim_token!,
+      job.claim_version,
+      true
+    );
+
+    if (!completeOk) {
+      // completeJob failed (claim lost or concurrent completion). The job
+      // will be recovered or retried by the cron worker. Do NOT publish.
+      console.error(
+        `[worker] completeJob returned false — job ${job.id} may have been reclaimed; leaving curriculum unpublished`
+      );
+      return;
+    }
+
+    // Job is terminally completed. Now publish the curriculum.
+    await supabase
+      .from('curricula')
+      .update({ status: 'published' })
+      .eq('id', curriculumId);
 
   } catch (error) {
     console.error('Job processing error:', error);
@@ -548,12 +662,21 @@ export async function processJob(job: JobClaimResult): Promise<void> {
 
 /**
  * Process per-understanding batch discovery (background).
+ *
+ * Bounded: processes at most MAX_TOPICS_PER_INVOCATION new topics per
+ * invocation. Progress is tracked in a SEPARATE checkpoint scope
+ * ('batchCheckpoint') so batch progress resumes independently of topic-level
+ * progress. When the quota is exhausted the claim is released (so the next
+ * cron invocation can claim the job) and `false` is returned; the caller must
+ * NOT publish or complete the job in that case.
+ *
+ * Returns true when every topic's batch discovery has completed.
  */
 async function processBatchDiscovery(
   job: JobClaimResult,
-  skeleton: Skeleton,
+  discoveryTitle: string,
   nodeIds: Array<{ nodeId: string; node: SkeletonNode }>
-): Promise<void> {
+): Promise<boolean> {
   const budgetLimits = job.budget_limits;
   const maxAiCalls = budgetLimits?.max_ai_calls ?? DEFAULT_BUDGET_LIMITS.max_ai_calls;
 
@@ -564,10 +687,47 @@ async function processBatchDiscovery(
     .eq('id', job.curriculum_id)
     .single();
 
-  const bgCurriculumTitle = curriculumRow?.title ?? skeleton.title;
+  const bgCurriculumTitle = curriculumRow?.title ?? discoveryTitle;
+
+  // Read the batch-phase checkpoint so a resumed invocation skips topics whose
+  // batch discovery already completed.
+  const batchJobData = await getJobById(job.id);
+  const rawCompletedBatchTopics =
+    (batchJobData?.result_data as { batchCheckpoint?: { completedTopicIds: unknown } })
+      ?.batchCheckpoint?.completedTopicIds;
+  const completedBatchTopics = new Set(
+    Array.isArray(rawCompletedBatchTopics)
+      ? rawCompletedBatchTopics.filter((id): id is string => typeof id === "string")
+      : []
+  );
+
+  let batchTopicsProcessed = 0;
 
   for (let i = 0; i < nodeIds.length; i++) {
     const { nodeId, node } = nodeIds[i];
+
+    // Skip topics whose batch discovery already completed (resume).
+    if (completedBatchTopics.has(nodeId)) {
+      console.log(`[worker] Skipping batch for topic ${nodeId} - already completed (batch checkpoint)`);
+      continue;
+    }
+
+    // Bounded work: release the claim and yield to the next cron invocation
+    // once this invocation's batch quota is exhausted. release_job_claim sets
+    // status='pending' without consuming a retry.
+    if (batchTopicsProcessed >= MAX_TOPICS_PER_INVOCATION) {
+      console.log(
+        `[worker] Batch quota (${MAX_TOPICS_PER_INVOCATION}) reached, releasing claim for next cron run`
+      );
+      const released = await releaseJobClaim(job.id, job.claim_token!, job.claim_version);
+      if (!released) {
+        console.log(
+          `[worker] release_job_claim returned false — ownership lost or yield refused; yielding for next cron run`
+        );
+      }
+      return false;
+    }
+    batchTopicsProcessed++;
 
     const { data: muRows } = await supabase
       .from('major_understandings')
@@ -586,13 +746,13 @@ async function processBatchDiscovery(
 
     if (!batchReservation.reserved) {
       if (batchReservation.reason === 'budget_exhausted') {
-        const { getJobById, completeJob } = await import('@/lib/acquisition/jobService');
-        const jobData = await getJobById(job.id);
-        const hasProgress = ((jobData?.result_data as { checkpoint?: { completedTopicIds: string[] } })?.checkpoint?.completedTopicIds?.length ?? 0) > 0;
-        await completeJob(job.id, job.claim_token, job.claim_version, hasProgress);
+        const { failJob } = await import('@/lib/acquisition/jobService');
+        await failJob(job.id, job.claim_token, job.claim_version, 'AI budget exhausted: budget_exhausted');
       }
-      return;
+      return false;
     }
+
+    let batchPersistedCount = 0;
 
     try {
       const batchNode: NodeWithChildren = {
@@ -646,15 +806,6 @@ async function processBatchDiscovery(
           const licenseStatus = candidate.license_status === 'cc_open' ? 'cc_open' : 'link_only';
           const resourceType = candidate.resource_type || 'other';
 
-          const acquisitionReservationId = crypto.randomUUID();
-          const acquisitionReservation = await reserveAICall(
-            job.id, job.claim_token, job.claim_version,
-            maxAiCalls,
-            acquisitionReservationId
-          );
-
-          if (!acquisitionReservation.reserved) continue;
-
           const acquisitionResult = await acquireCandidate(
             { url: discoveryCandidate.url, title: discoveryCandidate.title, sourceDomain: discoveryCandidate.sourceDomain, resourceType, aiNote: discoveryCandidate.aiNote },
             { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000 },
@@ -690,16 +841,29 @@ async function processBatchDiscovery(
               aiNote: candidate.ai_note ?? null,
             },
           });
+          batchPersistedCount++;
         }
       }
     } catch (error) {
       console.error('Batch discovery error:', error);
     }
 
-    if (i < nodeIds.length - 1) {
-      await new Promise(r => setTimeout(r, 15000));
+    // Persist batch progress for this topic. The RPC is fenced by
+    // claim_token + claim_version + status='running', so a stale worker
+    // cannot overwrite progress recorded by a newer owner.
+    const batchCheckpointOk = await advanceBatchCheckpoint(
+      job.id, job.claim_token!, job.claim_version, nodeId, batchPersistedCount
+    );
+    if (!batchCheckpointOk) {
+      console.error(
+        `[worker] advance_batch_checkpoint returned false — ownership lost for job ${job.id}`
+      );
+      return false;
     }
   }
+
+  // Every topic's batch discovery has been processed.
+  return true;
 }
 
 // Re-export functions that need to be imported dynamically

@@ -46,9 +46,26 @@ export async function GET(
     (resources ?? []).map((r) => r.major_understanding_id)
   ).size;
 
+  // Check the latest generation job for this curriculum
+  const { data: job } = await supabase
+    .from("acquisition_jobs")
+    .select("status")
+    .eq("curriculum_id", id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const jobStatus: string | null = job?.status ?? null;
+  // Generation has finished (failed or completed) but not all MUs have resources
+  const generationFinished =
+    (jobStatus === "failed" || jobStatus === "completed") &&
+    withResources < mus.length;
+
   return NextResponse.json({
     total: mus.length,
     with_resources: withResources,
     complete: withResources >= mus.length,
+    job_status: jobStatus,
+    generation_finished: generationFinished,
   });
 }

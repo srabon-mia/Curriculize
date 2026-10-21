@@ -76,9 +76,10 @@ export function CurriculumViewer({
   const [selectedNodeId, setSelectedNodeId] = useState<string>(
     nodes[0]?.id ?? ""
   );
+  const [generationFinished, setGenerationFinished] = useState(false);
 
   // Poll for background resource updates every 30 seconds
-  // Stops once all understandings have resources
+  // Stops once all understandings have resources, or generation has failed
   useEffect(() => {
     // Extract curriculum_id from the first node
     const curriculumId = nodes[0]?.curriculum_id;
@@ -93,10 +94,17 @@ export function CurriculumViewer({
         total: number;
         with_resources: number;
         complete: boolean;
+        generation_finished?: boolean;
       };
 
       if (data.complete) {
         stopped = true;
+        return;
+      }
+
+      if (data.generation_finished) {
+        stopped = true;
+        setGenerationFinished(true);
         return;
       }
 
@@ -403,10 +411,19 @@ export function CurriculumViewer({
                       })()}
 
                     {muResources.length === 0 && (
-                      <p className="text-xs text-text-tertiary mt-2.5 italic flex items-center gap-1.5">
-                        <span>⏳</span>
-                        <span>Finding verified resources…</span>
-                      </p>
+                      generationFinished ? (
+                        <p className="text-xs text-text-tertiary mt-2.5 italic flex items-center gap-1.5">
+                          <span>⚠</span>
+                          <span>
+                            No verified resources were found for this concept.
+                          </span>
+                        </p>
+                      ) : (
+                        <p className="text-xs text-text-tertiary mt-2.5 italic flex items-center gap-1.5">
+                          <span>⏳</span>
+                          <span>Finding verified resources…</span>
+                        </p>
+                      )
                     )}
                   </div>
                 );
@@ -419,9 +436,15 @@ export function CurriculumViewer({
                 (mu) => (resourcesByTarget[`mu:${mu.id}`] ?? []).length === 0
               ) && (
                 <div className="mt-8 rounded-xl border border-dashed border-border-default bg-surface-card px-6 py-10 text-center">
-                  <p className="text-sm text-text-secondary">
-                    No resources verified for this topic yet. The discovery process runs in the background.
-                  </p>
+                  {generationFinished ? (
+                    <p className="text-sm text-text-secondary">
+                      Generation failed. No verified resources were found for this topic.
+                    </p>
+                  ) : (
+                    <p className="text-sm text-text-secondary">
+                      No resources verified for this topic yet. The discovery process runs in the background.
+                    </p>
+                  )}
                 </div>
               )}
 

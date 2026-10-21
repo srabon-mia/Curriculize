@@ -79,7 +79,7 @@ describe('Phase 9: processJob maxAiCalls budget enforcement', () => {
     };
 
     expect(jobWithCustomBudget.budget_limits!.max_ai_calls).toBe(5);
-    expect(DEFAULT_BUDGET_LIMITS.max_ai_calls).toBe(12);
+    expect(DEFAULT_BUDGET_LIMITS.max_ai_calls).toBe(32);
   });
 
   test('uses DEFAULT_BUDGET_LIMITS.max_ai_calls as fallback when budget_limits is null', () => {
@@ -89,7 +89,7 @@ describe('Phase 9: processJob maxAiCalls budget enforcement', () => {
     };
 
     expect(jobWithoutBudget.budget_limits).toBeNull();
-    expect(DEFAULT_BUDGET_LIMITS.max_ai_calls).toBe(12);
+    expect(DEFAULT_BUDGET_LIMITS.max_ai_calls).toBe(32);
   });
 
   test('uses DEFAULT_BUDGET_LIMITS.max_ai_calls when budget_limits.max_ai_calls is undefined', () => {
@@ -99,7 +99,7 @@ describe('Phase 9: processJob maxAiCalls budget enforcement', () => {
     };
 
     expect(jobWithUndefinedBudget.budget_limits?.max_ai_calls).toBeUndefined();
-    expect(DEFAULT_BUDGET_LIMITS.max_ai_calls).toBe(12);
+    expect(DEFAULT_BUDGET_LIMITS.max_ai_calls).toBe(32);
   });
 });
 
@@ -121,14 +121,15 @@ describe('Phase 9: processJob budget exhaustion handling', () => {
     };
 
     expect(job.budget_limits!.max_ai_calls).toBe(3);
-    expect(DEFAULT_BUDGET_LIMITS.max_ai_calls).toBe(12);
+    expect(DEFAULT_BUDGET_LIMITS.max_ai_calls).toBe(32);
   });
 });
 
 describe('Phase 9: Budget enforcement edge cases', () => {
-  test('DEFAULT_BUDGET_LIMITS matches migration defaults', () => {
-    // Verify the TS constant matches the expected migration defaults
-    expect(DEFAULT_BUDGET_LIMITS.max_ai_calls).toBe(12);
+  test('DEFAULT_BUDGET_LIMITS matches the application default budget', () => {
+    // Verify the TS constant matches the application default budget (raised from 12
+    // to 32 so a 12-topic curriculum fits: 1 skeleton + 1 sources + 12 topic + 12 batch = 26)
+    expect(DEFAULT_BUDGET_LIMITS.max_ai_calls).toBe(32);
     expect(DEFAULT_BUDGET_LIMITS.max_total_candidates_per_job).toBe(50);
     expect(DEFAULT_BUDGET_LIMITS.max_candidates_per_understanding).toBe(5);
     expect(DEFAULT_BUDGET_LIMITS.max_fetch_attempts).toBe(3);

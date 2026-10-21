@@ -271,6 +271,45 @@ export async function advanceCheckpoint(
 }
 
 /**
+ * Advance the BATCH-phase checkpoint for a completed topic.
+ *
+ * Uses a separate scope ('batchCheckpoint') from the topic-level checkpoint
+ * so that per-understanding batch discovery progress is tracked independently.
+ * Sharing one scope would let a completed batch write mark a topic as
+ * topic-level-complete, causing a resumed worker to skip topic discovery that
+ * never actually ran.
+ */
+export async function advanceBatchCheckpoint(
+  jobId: string,
+  claimToken: string,
+  claimVersion: number,
+  completedTopicId: string,
+  resourcesFound: number
+): Promise<boolean> {
+  const { data, error } = await supabase.rpc("advance_batch_checkpoint", {
+    p_job_id: jobId,
+    p_claim_token: claimToken,
+    p_expected_claim_version: claimVersion,
+    p_completed_topic_id: completedTopicId,
+    p_resources_found: resourcesFound,
+  });
+
+  if (error) {
+    console.error("[stream] advance_batch_checkpoint RPC error:", error.message);
+    return false;
+  }
+
+  if (!data) {
+    console.error(
+      `[stream] advance_batch_checkpoint returned false — ownership lost for job ${jobId}`
+    );
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Mark the job as completed. Returns true on success.
  * MUST only be called after ALL required work (including background batch)
  * is fully persisted. A false return means the claim is no longer valid.
@@ -737,6 +776,14 @@ export async function GET(
           console.log("Source discovery failed, continuing without prioritized sources:", err);
         }
 
+        // Persist discovered sources so a resumed SSE invocation can skip the source-discovery AI call
+        try {
+          const { saveJobSources } = await import("@/lib/acquisition/jobService");
+          await saveJobSources(jobRecord!.id, jobRecord!.claim_token, jobRecord!.claim_version, discoveredSources);
+        } catch (err) {
+          console.log("Failed to persist sources:", err);
+        }
+
         // Step 4: Discover topic-level resources during generation.
         //
         // Phase 12: candidates are routed through the Learning Engine
@@ -1003,12 +1050,6 @@ export async function GET(
           return;
         }
 
-        // Publish the curriculum
-        await supabase
-          .from("curricula")
-          .update({ status: "published" })
-          .eq("id", id);
-
         // Emit topics_complete: topic-level resources done, background batch starting
         send(controller, "complete", { curriculum_id: id, phase: "topics" });
 
@@ -1039,6 +1080,8 @@ export async function GET(
               .eq("node_id", nodeId);
 
             if (!muRows || muRows.length === 0) continue;
+
+            let topicBatchPersisted = 0;
 
             try {
               const prompt = buildTopicBatchPrompt(
@@ -1173,6 +1216,7 @@ export async function GET(
                       `MU mappings persisted for "${candidate.title}"`
                   );
                 }
+                topicBatchPersisted += batchPersisted;
               }
             } catch (err) {
               console.log(`Batch discovery failed for topic "${node.title}":`, err);
@@ -1185,16 +1229,16 @@ export async function GET(
             // recover_stale_jobs will reclaim the job and a future claim_next_job
             // caller (cron worker or retried SSE) can resume from the checkpoint.
             try {
-              const checkpointOk = await advanceCheckpoint(
+              const checkpointOk = await advanceBatchCheckpoint(
                 jobRecord!.id,
                 jobRecord!.claim_token,
                 jobRecord!.claim_version,
                 nodeId,
-                muRows ? muRows.length : 0
+                topicBatchPersisted
               );
               if (!checkpointOk) {
                 console.error(
-                  `[stream] advance_checkpoint returned false — ownership lost, stopping background batch`
+                  `[stream] advance_batch_checkpoint returned false — ownership lost, stopping background batch`
                 );
                 return;
               }
@@ -1250,6 +1294,11 @@ export async function GET(
             controller.close();
             return;
           }
+          // Job is terminally completed. Now publish the curriculum.
+          await supabase
+            .from("curricula")
+            .update({ status: "published" })
+            .eq("id", id);
           // Emit background_complete: all generation done AND job finalized
           send(controller, "complete", { curriculum_id: id, phase: "background" });
         } catch (bgErr) {
