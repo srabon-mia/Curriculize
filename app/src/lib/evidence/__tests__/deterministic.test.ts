@@ -501,4 +501,160 @@ describe("extractEducationalEvidence", () => {
       expect(evidence.interpreted.explicitExercises.length).toBeGreaterThan(0);
     });
   });
+
+  describe("tutorial prose patterns (regression: Adafruit/SparkFun style)", () => {
+    test("O. extracts 'In this guide, you will learn how to' as medium-confidence learning objective", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("In this guide, you will learn how to control an LED with Arduino."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content);
+      const objectives = evidence.interpreted.explicitLearningObjectives.filter(
+        (o) => o.confidence === "medium"
+      );
+      expect(objectives.length).toBe(1);
+      expect(objectives[0].text).toContain("In this guide");
+      expect(objectives[0].pattern).toContain("guide|tutorial");
+    });
+
+    test("P. extracts 'In this tutorial, you will build' as medium-confidence learning objective", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("In this tutorial, you will build a temperature sensor circuit."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content);
+      const objectives = evidence.interpreted.explicitLearningObjectives.filter(
+        (o) => o.confidence === "medium"
+      );
+      expect(objectives.length).toBe(1);
+    });
+
+    test("Q. extracts 'This guide shows how to' as medium-confidence learning objective", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("This guide shows how to program an ESP32 for WiFi communication."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content);
+      const objectives = evidence.interpreted.explicitLearningObjectives.filter(
+        (o) => o.confidence === "medium"
+      );
+      expect(objectives.length).toBe(1);
+    });
+
+    test("R. extracts 'Let's learn how to' as medium-confidence learning objective", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("Let's learn how to wire a breadboard circuit."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content);
+      const objectives = evidence.interpreted.explicitLearningObjectives.filter(
+        (o) => o.confidence === "medium"
+      );
+      expect(objectives.length).toBe(1);
+    });
+
+    test("S. extracts 'Let's build a' as medium-confidence learning objective", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("Let's build a simple motor controller."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content);
+      const objectives = evidence.interpreted.explicitLearningObjectives.filter(
+        (o) => o.confidence === "medium"
+      );
+      expect(objectives.length).toBe(1);
+    });
+
+    test("T. generic 'Introduction to' does NOT trigger educational evidence", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("Introduction to Arduino Programming"),
+          makeTextBlock("Getting started with microcontrollers"),
+          makeTextBlock("Welcome to our product page for the Arduino Uno."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content);
+      const objectives = evidence.interpreted.explicitLearningObjectives.filter(
+        (o) => o.confidence === "medium"
+      );
+      // These are generic marketing/landing phrases, not tutorial introductions
+      expect(objectives.length).toBe(0);
+    });
+
+    test("U. 'This section teaches' still rejected (existing negative test preserved)", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("This section teaches the basics of PWM."),
+          makeTextBlock("This lesson covers analog input."),
+          makeTextBlock("This module introduces serial communication."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content);
+      const objectives = evidence.interpreted.explicitLearningObjectives;
+      const highConfidence = objectives.filter((o) => o.confidence === "high");
+      const mediumConfidence = objectives.filter((o) => o.confidence === "medium");
+      expect(highConfidence.length).toBe(0);
+      expect(mediumConfidence.length).toBe(0);
+    });
+
+    test("V. bare 'In this chapter we learn about' still rejected", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("In this chapter, we learn about digital pins."),
+          makeTextBlock("In this chapter we learn about analog sensors."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content);
+      const objectives = evidence.interpreted.explicitLearningObjectives.filter(
+        (o) => o.confidence === "medium"
+      );
+      // Missing specific activity verb (build/make/create/program/control/wire/connect)
+      expect(objectives.length).toBe(0);
+    });
+
+    test("W. tutorial pattern with specific activity verb works", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("In this guide, you will learn how to use a potentiometer."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content);
+      const objectives = evidence.interpreted.explicitLearningObjectives.filter(
+        (o) => o.confidence === "medium"
+      );
+      expect(objectives.length).toBe(1);
+      expect(objectives[0].text).toContain("potentiometer");
+    });
+
+    test("X. preserves blockIndex traceability for tutorial patterns", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("Welcome to the tutorial"),
+          makeTextBlock("In this guide, you will learn how to blink an LED."),
+          makeTextBlock("First, gather your components."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content);
+      const objectives = evidence.interpreted.explicitLearningObjectives.filter(
+        (o) => o.confidence === "medium"
+      );
+      expect(objectives.length).toBe(1);
+      expect(objectives[0].blockIndex).toBe(1); // Second block (0-indexed)
+    });
+  });
 });

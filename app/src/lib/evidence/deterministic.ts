@@ -59,6 +59,11 @@ const MEDIUM_CONFIDENCE_OBJECTIVE_PATTERNS: RegExp[] = [
   /^intended learning outcomes?:/i,
   /^goals?:/i,
   /^aims?:/i,
+  // Tutorial-specific patterns: genuine educational introductions with specific learning activities
+  // Require "guide" or "tutorial" + specific activity verb (not vague "learn about")
+  /^in this (guide|tutorial),? you will (learn|build|make|create|program|control|wire|connect) (how to )?/i,
+  /^this (guide|tutorial) (shows|teaches) (you )?how to/i,
+  /^let's (learn|build|make|create|program) (how to )?/i,
 ];
 
 /**
