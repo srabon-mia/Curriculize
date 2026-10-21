@@ -158,6 +158,11 @@ export default function GeneratePage({
     return () => es.close();
   }, [id, router]);
 
+  // Initial connection on mount
+  useEffect(() => {
+    connect();
+  }, [connect]);
+
   // Reconnect after a yielded event (when terminalState is still "none")
   useEffect(() => {
     if (terminalState !== "none") return;
