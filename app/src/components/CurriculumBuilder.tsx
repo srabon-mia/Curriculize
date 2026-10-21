@@ -19,6 +19,102 @@ function weightBarWidth(pct: string | null): number {
   return Math.min(upper, 50); // cap visual scale at 50% width-equivalent
 }
 
+/** Result of bulk discovery for a single major understanding */
+interface BulkDiscoveryResult {
+  muId: string;
+  muCode: string | null;
+  success: boolean;
+  inserted: number;
+  errorType: "network" | "http" | "json" | null;
+}
+
+/** Configuration for bulk discovery */
+interface BulkDiscoveryConfig {
+  delayMs: number;
+  curriculumId: string;
+  nodeId: string;
+  mus: MajorUnderstanding[];
+}
+
+/**
+ * Core bulk discovery logic - extracted for testability.
+ * Performs sequential discovery requests for each major understanding.
+ */
+export async function runBulkDiscovery(
+  config: BulkDiscoveryConfig,
+  fetchFn: typeof fetch
+): Promise<{
+  totalInserted: number;
+  results: BulkDiscoveryResult[];
+  summary: string;
+}> {
+  const { delayMs, curriculumId, nodeId, mus } = config;
+  let totalInserted = 0;
+  const results: BulkDiscoveryResult[] = [];
+
+  for (let i = 0; i < mus.length; i++) {
+    const mu = mus[i];
+    const muCode = mu.code ?? mu.external_key;
+
+    // Small delay between requests (skip for first request)
+    if (i > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+
+    try {
+      const res = await fetchFn("/api/discover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          curriculum_id: curriculumId,
+          node_id: nodeId,
+          granularity: "understanding",
+          major_understanding_id: mu.id,
+        }),
+      });
+
+      let data: { inserted?: number; skipped?: number; unprocessed?: number; message?: string; error?: string } | null = null;
+
+      try {
+        data = await res.json();
+      } catch {
+        // Malformed JSON response
+        results.push({ muId: mu.id, muCode, success: false, inserted: 0, errorType: "json" });
+        continue;
+      }
+
+      if (!res.ok) {
+        // HTTP error (4xx, 5xx)
+        results.push({ muId: mu.id, muCode, success: false, inserted: 0, errorType: "http" });
+        continue;
+      }
+
+      // Successful HTTP response with valid JSON
+      const inserted = data?.inserted ?? 0;
+      totalInserted += inserted;
+      results.push({ muId: mu.id, muCode, success: true, inserted, errorType: null });
+    } catch {
+      // Network error or other exception
+      results.push({ muId: mu.id, muCode, success: false, inserted: 0, errorType: "network" });
+    }
+  }
+
+  // Build honest summary
+  const successfulRequests = results.filter((r) => r.success).length;
+  const failedRequests = results.filter((r) => !r.success).length;
+  const zeroResultRequests = results.filter((r) => r.success && r.inserted === 0).length;
+
+  const parts = [
+    `${successfulRequests} successful`,
+    failedRequests > 0 ? `${failedRequests} failed` : null,
+    zeroResultRequests > 0 ? `${zeroResultRequests} with no new resources` : null,
+  ].filter(Boolean);
+
+  const summary = `Done — ${totalInserted} resources added across ${mus.length} understandings (${parts.join(", ")})`;
+
+  return { totalInserted, results, summary };
+}
+
 export function CurriculumBuilder({
   nodes: initialNodes,
   resourcesByTarget,
@@ -39,43 +135,31 @@ export function CurriculumBuilder({
   const [discovering, setDiscovering] = useState(false);
   const [discoverResult, setDiscoverResult] = useState<string | null>(null);
 
+  // Configuration for bulk discovery
+  const BULK_DELAY_MS = 3000; // 3 seconds between requests (was 60s)
+
   async function handleDiscover(granularity: "topic" | "understanding" | "bulk") {
     if (!selected || !selectedNode) return;
     setDiscovering(true);
     setDiscoverResult(null);
 
     if (granularity === "bulk") {
-      // Run each MU as a separate request from the frontend
-      // instead of one long backend loop that times out
       const mus = selectedNode.major_understandings;
-      let inserted = 0;
 
-      for (let i = 0; i < mus.length; i++) {
-        const mu = mus[i];
-        setDiscoverResult(`Searching ${i + 1} of ${mus.length}: ${mu.code ?? mu.external_key}…`);
+      // Show initial progress
+      setDiscoverResult(`Searching 1 of ${mus.length}: ${mus[0]?.code ?? mus[0]?.external_key}…`);
 
-        // Wait between calls to stay under the 30k tokens/min rate limit
-        if (i > 0) await new Promise((resolve) => setTimeout(resolve, 60000));
+      const { summary } = await runBulkDiscovery(
+        {
+          delayMs: BULK_DELAY_MS,
+          curriculumId,
+          nodeId: selectedNode.id,
+          mus,
+        },
+        fetch
+      );
 
-        try {
-          const res = await fetch("/api/discover", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              curriculum_id: curriculumId,
-              node_id: selectedNode.id,
-              granularity: "understanding",
-              major_understanding_id: mu.id,
-            }),
-          });
-          const data = await res.json();
-          if (res.ok) inserted += data.inserted ?? 0;
-        } catch {
-          // continue to next MU even if one fails
-        }
-      }
-
-      setDiscoverResult(`Done — ${inserted} resources added across ${mus.length} understandings`);
+      setDiscoverResult(summary);
       setTimeout(() => refreshResources(), 500);
       setDiscovering(false);
       return;
