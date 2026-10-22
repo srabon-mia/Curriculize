@@ -17,6 +17,7 @@ import {
   saveJobSources,
   getJobById
 } from "@/lib/acquisition/jobService";
+import { z } from "zod";
 
 export const maxDuration = 300;
 
@@ -33,6 +34,83 @@ const supabase = createServiceClient(
 // Lazy AI provider getter - avoids initialization at module load time (build time)
 function getAI(): ReturnType<typeof getAIProvider> {
   return getAIProvider();
+}
+
+/**
+ * Skeleton schema for validation - matches the Skeleton type in the stream handler.
+ */
+const SkeletonNodeSchema = z.object({
+  title: z.string().min(1),
+  order_index: z.number().int().positive(),
+  major_understandings: z.array(
+    z.object({
+      code: z.string().nullable(),
+      description: z.string().min(1),
+    })
+  ).min(1),
+});
+
+const SkeletonSchema = z.object({
+  title: z.string().min(1),
+  source_type: z.enum(["adapted", "ai_organized"]),
+  source_attribution: z.string().nullable(),
+  source_url: z.string().nullable(),
+  nodes: z.array(SkeletonNodeSchema).min(1).max(12),
+});
+
+type Skeleton = z.infer<typeof SkeletonSchema>;
+type SkeletonNode = z.infer<typeof SkeletonNodeSchema>;
+
+/**
+ * Extract a JSON object from text, handling common formatting issues:
+ * - Markdown code fences (```json ... ```)
+ * - Explanatory text around a single JSON object
+ * - Multiple JSON objects (returns first valid one matching schema)
+ */
+function extractSkeletonJson(text: string): Skeleton | null {
+  // Strategy 1: Try to find JSON in markdown code fences
+  const fenceMatch = text.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+  if (fenceMatch) {
+    try {
+      const parsed = JSON.parse(fenceMatch[1]);
+      const result = SkeletonSchema.safeParse(parsed);
+      if (result.success) return result.data;
+    } catch {
+      // Fall through to next strategy
+    }
+  }
+
+  // Strategy 2: Try greedy match for a single JSON object
+  // Match from first { to last } but validate it's a single object
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+      const result = SkeletonSchema.safeParse(parsed);
+      if (result.success) return result.data;
+    } catch {
+      // Fall through
+    }
+  }
+
+  // Strategy 3: Try to find a valid JSON object by progressively shrinking the match
+  // This handles cases where greedy match captures too much
+  let match = text.match(/\{[\s\S]*\}/);
+  while (match) {
+    try {
+      const parsed = JSON.parse(match[0]);
+      const result = SkeletonSchema.safeParse(parsed);
+      if (result.success) return result.data;
+    } catch {
+      // Shrink from the end to find a valid object
+      const str = match[0];
+      const lastBrace = str.lastIndexOf('}');
+      if (lastBrace <= 0) break;
+      match = [str.slice(0, lastBrace + 1)];
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -580,55 +658,114 @@ export async function GET(
           return;
         }
 
-        type SkeletonNode = {
-          title: string;
-          order_index: number;
-          major_understandings: Array<{
-            code: string | null;
-            description: string;
-          }>;
-        };
-
-        type Skeleton = {
-          title: string;
-          source_type: string;
-          source_attribution: string | null;
-          source_url: string | null;
-          nodes: SkeletonNode[];
-        };
-
-        let skeletonParsed: Skeleton;
+        // Parse skeleton with robust extraction and schema validation
         const skeletonParseStartTime = Date.now();
-        try {
-          const jsonMatch = (skeleton as string).match(/\{[\s\S]*\}/);
-          if (!jsonMatch) throw new Error("No JSON found");
-          skeletonParsed = JSON.parse(jsonMatch[0]) as Skeleton;
-        } catch (parseErr) {
-          const parseDurationMs = Date.now() - skeletonParseStartTime;
-          const errorCategory = parseErr instanceof SyntaxError
-            ? "JSON_SYNTAX_ERROR"
-            : parseErr instanceof Error && parseErr.message === "No JSON found"
-              ? "NO_JSON_FOUND"
-              : "PARSE_ERROR";
-          console.error(
-            `[stream] Skeleton parse failed: job_id=${jobRecord!.id}, category=${errorCategory}, response_chars=${skeleton.length}, parse_duration_ms=${parseDurationMs}, error=${parseErr instanceof Error ? parseErr.message : String(parseErr)}`
-          );
-          send(controller, "error", {
-            message: "Failed to generate curriculum structure",
-          });
-          controller.close();
+        let skeletonParsed: Skeleton | null = extractSkeletonJson(skeleton);
+        let parseDurationMs = Date.now() - skeletonParseStartTime;
 
-          // Mark the job as failed so the cron worker can retry later.
-          clearHeartbeat();
-          if (jobRecord) {
-            void failJob(
-              jobRecord.id,
-              jobRecord.claim_token,
-              jobRecord.claim_version,
-              "Failed to parse skeleton JSON"
+        // If initial parse failed, attempt one bounded corrective retry
+        if (!skeletonParsed) {
+          console.error(
+            `[stream] Skeleton parse failed: job_id=${jobRecord!.id}, category=NO_JSON_FOUND_OR_SCHEMA_MISMATCH, response_chars=${skeleton.length}, response_preview=${skeleton.slice(0, 200)}, parse_duration_ms=${parseDurationMs}`
+          );
+
+          // Check budget and ownership before retry
+          if (ownershipLost) {
+            console.log(
+              `[stream] Ownership lost before skeleton retry — aborting`
             );
+            clearHeartbeat();
+            void failJob(
+              jobRecord!.id,
+              jobRecord!.claim_token,
+              jobRecord!.claim_version,
+              "Ownership lost before skeleton retry"
+            );
+            send(controller, "error", {
+              message:
+                "Generation was interrupted — ownership of the job was lost. Please refresh to check for updates.",
+            });
+            controller.close();
+            return;
           }
-          return;
+
+          // Check AI budget for retry
+          const retryReservation = await reserveAICall(
+            jobRecord!.id,
+            jobRecord!.claim_token,
+            jobRecord!.claim_version,
+            DEFAULT_BUDGET_LIMITS.max_ai_calls,
+            crypto.randomUUID()
+          );
+          if (!retryReservation.reserved) {
+            console.error(
+              `[stream] AI budget exhausted for skeleton retry: ${retryReservation.reason}`
+            );
+            clearHeartbeat();
+            await failJob(
+              jobRecord!.id,
+              jobRecord!.claim_token,
+              jobRecord!.claim_version,
+              `AI budget exhausted: ${retryReservation.reason}`
+            );
+            send(controller, "error", {
+              message: "AI generation budget exhausted. Please try again later.",
+            });
+            controller.close();
+            return;
+          }
+
+          // Retry with explicit instruction to return valid JSON only
+          const retryPrompt = `${skeletonPrompt}\n\nIMPORTANT: Your previous response could not be parsed as valid JSON. You MUST return ONLY a valid JSON object matching the exact schema specified. No markdown, no explanation, no additional text. Start with { and end with }.`;
+          const skeletonRetry = await callAI(retryPrompt, true);
+
+          // Check ownership after retry AI call
+          if (ownershipLost) {
+            console.log(
+              `[stream] Ownership lost during skeleton retry — aborting`
+            );
+            clearHeartbeat();
+            void failJob(
+              jobRecord!.id,
+              jobRecord!.claim_token,
+              jobRecord!.claim_version,
+              "Ownership lost during skeleton retry"
+            );
+            send(controller, "error", {
+              message:
+                "Generation was interrupted — ownership of the job was lost. Please refresh to check for updates.",
+            });
+            controller.close();
+            return;
+          }
+
+          // Try parsing retry response
+          const retryParseStartTime = Date.now();
+          skeletonParsed = extractSkeletonJson(skeletonRetry);
+          const retryParseDurationMs = Date.now() - retryParseStartTime;
+          if (!skeletonParsed) {
+            console.error(
+              `[stream] Skeleton retry parse failed: job_id=${jobRecord!.id}, category=RETRY_PARSE_FAILED, response_chars=${skeletonRetry.length}, response_preview=${skeletonRetry.slice(0, 200)}, parse_duration_ms=${retryParseDurationMs}`
+            );
+            send(controller, "error", {
+              message: "Failed to generate curriculum structure",
+            });
+            controller.close();
+
+            clearHeartbeat();
+            if (jobRecord) {
+              void failJob(
+                jobRecord.id,
+                jobRecord.claim_token,
+                jobRecord.claim_version,
+                "Failed to parse skeleton JSON after retry"
+              );
+            }
+            return;
+          }
+          parseDurationMs = Date.now() - skeletonParseStartTime;
+        } else {
+          parseDurationMs = Date.now() - skeletonParseStartTime;
         }
 
         // Update curriculum with real title and attribution

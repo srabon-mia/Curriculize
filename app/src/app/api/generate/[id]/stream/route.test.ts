@@ -955,3 +955,275 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     });
   });
 });
+
+// ============================================================
+// Regression: Skeleton JSON parsing robustness
+// ============================================================
+
+describe("Skeleton JSON parsing robustness", () => {
+  // Helper to create a mock curriculum with nodes
+  function createMockCurriculumWithNodes() {
+    return {
+      id: "test-curriculum-id",
+      title: "Test Curriculum",
+      subject: "Test Subject",
+      source_type: "ai_organized",
+      status: "draft",
+      notes: JSON.stringify({
+        grade_level: "high school",
+        difficulty: "standard",
+        existing_knowledge: "",
+        learning_goal: "understand the subject",
+        time_available: "no time pressure",
+        added_context: "",
+      }),
+    };
+  }
+
+  function createMockNodes() {
+    return [
+      {
+        id: "node-1",
+        curriculum_id: "test-curriculum-id",
+        title: "Test Topic",
+        order_index: 1,
+        external_key: "topic-1",
+        exam_weight_pct: null,
+        claim_statement: null,
+        major_understandings: [
+          { id: "mu-1", node_id: "node-1", code: "1.1", description: "Concept 1", order_index: 0 },
+          { id: "mu-2", node_id: "node-1", code: "1.2", description: "Concept 2", order_index: 1 },
+        ],
+      },
+    ];
+  }
+
+  // Helper to run the stream with a custom skeleton response
+  async function runStreamWithSkeleton(skeletonResponse: string): Promise<string[]> {
+    // Mock the AI to return the given skeleton response
+    const { getAIProvider } = await import("@/lib/ai");
+    vi.mocked(getAIProvider).mockReturnValue({
+      complete: vi.fn().mockResolvedValue({ text: skeletonResponse, usage: { inputTokens: 100, outputTokens: 50 } }),
+      name: "mock",
+      capabilities: { structuredOutput: false, webSearch: false, streaming: false },
+    } as any);
+
+    // Reset captured inserts
+    capturedInserts.length = 0;
+    capturedNodeInserts.length = 0;
+    capturedMuInserts.length = 0;
+
+    // Run the stream
+    const request = createMockRequest("test-curriculum-id");
+    const response = await GET(request, { params: Promise.resolve({ id: "test-curriculum-id" }) });
+
+    const events: string[] = [];
+    const reader = response.body?.getReader();
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        events.push(new TextDecoder().decode(value));
+      }
+    }
+    return events;
+  }
+
+  it("parses valid raw JSON without markdown or surrounding text", async () => {
+    const validJson = `{"title":"Test Curriculum","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[{"title":"Test Topic","order_index":1,"major_understandings":[{"code":"1.1","description":"Concept 1"},{"code":"1.2","description":"Concept 2"}]}]}`;
+    const events = await runStreamWithSkeleton(validJson);
+
+    // Should emit skeleton event
+    const skeletonEvents = events.filter((e) => e.includes('"skeleton"'));
+    expect(skeletonEvents.length).toBe(1);
+    expect(skeletonEvents[0]).toContain("Test Curriculum");
+  });
+
+  it("parses JSON wrapped in markdown code fences", async () => {
+    const fencedJson = `\`\`\`json\n{"title":"Test Curriculum","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[{"title":"Test Topic","order_index":1,"major_understandings":[{"code":"1.1","description":"Concept 1"},{"code":"1.2","description":"Concept 2"}]}]}\n\`\`\``;
+    const events = await runStreamWithSkeleton(fencedJson);
+
+    const skeletonEvents = events.filter((e) => e.includes('"skeleton"'));
+    expect(skeletonEvents.length).toBe(1);
+    expect(skeletonEvents[0]).toContain("Test Curriculum");
+  });
+
+  it("parses JSON with explanatory text before and after", async () => {
+    const wrappedJson = `Here is the curriculum structure:\n{"title":"Test Curriculum","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[{"title":"Test Topic","order_index":1,"major_understandings":[{"code":"1.1","description":"Concept 1"}]}]}\nThat was the structure.`;
+    const events = await runStreamWithSkeleton(wrappedJson);
+
+    const skeletonEvents = events.filter((e) => e.includes('"skeleton"'));
+    expect(skeletonEvents.length).toBe(1);
+    expect(skeletonEvents[0]).toContain("Test Curriculum");
+  });
+
+  it("rejects truncated JSON with clear error category", async () => {
+    const truncatedJson = `{"title":"Test Curriculum","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[{"title":"Test Topic","order_index":1,"major_understandings":[{"code":"1.1","description":"Concept 1"}`;
+    const events = await runStreamWithSkeleton(truncatedJson);
+
+    // Should emit error event with the specific message
+    const errorEvents = events.filter((e) => e.includes('"error"'));
+    expect(errorEvents.length).toBeGreaterThan(0);
+    const errorData = JSON.parse(errorEvents[0].split("data: ")[1]);
+    expect(errorData.message).toBe("Failed to generate curriculum structure");
+  });
+
+  it("rejects completely invalid JSON", async () => {
+    const invalidJson = `This is not JSON at all`;
+    const events = await runStreamWithSkeleton(invalidJson);
+
+    const errorEvents = events.filter((e) => e.includes('"error"'));
+    expect(errorEvents.length).toBeGreaterThan(0);
+    const errorData = JSON.parse(errorEvents[0].split("data: ")[1]);
+    expect(errorData.message).toBe("Failed to generate curriculum structure");
+  });
+
+  it("handles multiple JSON objects by picking the first valid one", async () => {
+    const multipleJson = `{"title":"Invalid Curriculum","source_type":"invalid","source_attribution":null,"source_url":null,"nodes":[]} {"title":"Valid Curriculum","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[{"title":"Valid Topic","order_index":1,"major_understandings":[{"code":"1.1","description":"Valid concept"}]}]}`;
+    const events = await runStreamWithSkeleton(multipleJson);
+
+    // Should parse the first valid one that matches schema
+    const skeletonEvents = events.filter((e) => e.includes('"skeleton"'));
+    // The first object doesn't match schema, so it should pick the second valid one
+    expect(skeletonEvents.length).toBe(1);
+    expect(skeletonEvents[0]).toContain("Valid Curriculum");
+  });
+
+  it("rejects skeleton with missing required fields", async () => {
+    const invalidSchema = `{"title":"Test","nodes":[]}`; // missing source_type, source_attribution, source_url
+    const events = await runStreamWithSkeleton(invalidSchema);
+
+    const errorEvents = events.filter((e) => e.includes('"error"'));
+    expect(errorEvents.length).toBeGreaterThan(0);
+    const errorData = JSON.parse(errorEvents[0].split("data: ")[1]);
+    expect(errorData.message).toBe("Failed to generate curriculum structure");
+  });
+
+  it("rejects skeleton with invalid source_type enum", async () => {
+    const invalidSchema = `{"title":"Test","source_type":"invalid","source_attribution":null,"source_url":null,"nodes":[{"title":"Topic","order_index":1,"major_understandings":[{"code":"1.1","description":"Concept"}]}]}`;
+    const events = await runStreamWithSkeleton(invalidSchema);
+
+    const errorEvents = events.filter((e) => e.includes('"error"'));
+    expect(errorEvents.length).toBeGreaterThan(0);
+  });
+
+  it("rejects skeleton with invalid nodes array (empty)", async () => {
+    const invalidSchema = `{"title":"Test","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[]}`;
+    const events = await runStreamWithSkeleton(invalidSchema);
+
+    const errorEvents = events.filter((e) => e.includes('"error"'));
+    expect(errorEvents.length).toBeGreaterThan(0);
+  });
+
+  it("rejects skeleton with missing major_understandings in node", async () => {
+    const invalidSchema = `{"title":"Test","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[{"title":"Topic","order_index":1}]}`;
+    const events = await runStreamWithSkeleton(invalidSchema);
+
+    const errorEvents = events.filter((e) => e.includes('"error"'));
+    expect(errorEvents.length).toBeGreaterThan(0);
+  });
+});
+
+// ============================================================
+// Regression: Skeleton retry with budget/ownership checks
+// ============================================================
+
+describe("Skeleton retry with budget/ownership checks", () => {
+  it("attempts at most one corrective retry on parse failure", async () => {
+    // First response: invalid JSON
+    // Second response: valid JSON
+    let callCount = 0;
+    const { getAIProvider } = await import("@/lib/ai");
+    vi.mocked(getAIProvider).mockReturnValue({
+      complete: vi.fn().mockImplementation(async () => {
+        callCount++;
+        if (callCount === 1) {
+          return { text: "not valid json", usage: { inputTokens: 100, outputTokens: 50 } };
+        }
+        return { text: '{"title":"Retry Success","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[{"title":"Topic","order_index":1,"major_understandings":[{"code":"1.1","description":"Concept"}]}]}', usage: { inputTokens: 100, outputTokens: 50 } };
+      }),
+      name: "mock",
+      capabilities: { structuredOutput: false, webSearch: false, streaming: false },
+    } as any);
+
+    const events = await runStreamAndCapture();
+
+    const skeletonEvents = events.filter((e) => e.includes('"skeleton"'));
+    expect(skeletonEvents.length).toBe(1);
+    expect(skeletonEvents[0]).toContain("Retry Success");
+    // Should have called AI twice (initial + retry)
+    expect(callCount).toBe(2);
+  });
+
+  it("does not retry when AI budget is exhausted", async () => {
+    // First response: invalid JSON
+    const { getAIProvider } = await import("@/lib/ai");
+    vi.mocked(getAIProvider).mockReturnValue({
+      complete: vi.fn().mockResolvedValue({ text: "not valid json", usage: { inputTokens: 100, outputTokens: 50 } }),
+      name: "mock",
+      capabilities: { structuredOutput: false, webSearch: false, streaming: false },
+    } as any);
+
+    // Simulate budget exhausted on retry
+    setRpcSequence("reserve_ai_call", [
+      { data: { reserved: true, used: 1, remaining: 31 }, error: null }, // initial reservation
+      { data: { reserved: false, reason: "budget_exhausted" }, error: null }, // retry reservation fails
+    ]);
+
+    const events = await runStreamAndCapture();
+
+    const errorEvents = events.filter((e) => e.includes('"error"'));
+    expect(errorEvents.length).toBeGreaterThan(0);
+    const errorData = JSON.parse(errorEvents[0].split("data: ")[1]);
+    expect(errorData.message).toBe("AI generation budget exhausted. Please try again later.");
+  });
+
+  it("does not retry when ownership is lost before retry", async () => {
+    // First response: invalid JSON
+    const { getAIProvider } = await import("@/lib/ai");
+    vi.mocked(getAIProvider).mockReturnValue({
+      complete: vi.fn().mockResolvedValue({ text: "not valid json", usage: { inputTokens: 100, outputTokens: 50 } }),
+      name: "mock",
+      capabilities: { structuredOutput: false, webSearch: false, streaming: false },
+    } as any);
+
+    // Simulate ownership loss before retry (set renew_lease to fail)
+    setRpcResult("renew_lease", { data: false, error: null });
+
+    const events = await runStreamAndCapture();
+
+    // Should not retry - ownership lost
+    const ownershipLostEvents = events.filter((e) => e.includes("ownership"));
+    expect(ownershipLostEvents.length).toBeGreaterThan(0);
+  });
+
+  it("does not retry if retry AI call loses ownership", async () => {
+    let callCount = 0;
+    const { getAIProvider } = await import("@/lib/ai");
+    vi.mocked(getAIProvider).mockReturnValue({
+      complete: vi.fn().mockImplementation(async () => {
+        callCount++;
+        if (callCount === 1) {
+          return { text: "not valid json", usage: { inputTokens: 100, outputTokens: 50 } };
+        }
+        return { text: '{"title":"Retry Success","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[{"title":"Topic","order_index":1,"major_understandings":[{"code":"1.1","description":"Concept"}]}]}', usage: { inputTokens: 100, outputTokens: 50 } };
+      }),
+      name: "mock",
+      capabilities: { structuredOutput: false, webSearch: false, streaming: false },
+    } as any);
+
+    // Simulate ownership loss during retry
+    let renewCallCount = 0;
+    setRpcSequenced("renew_lease", [
+      { data: true, error: null }, // initial heartbeat
+      { data: false, error: null }, // ownership lost during retry
+    ]);
+
+    const events = await runStreamAndCapture();
+
+    // Should have attempted retry but ownership lost
+    expect(callCount).toBe(2);
+    const ownershipLostEvents = events.filter((e) => e.includes("ownership"));
+    expect(ownershipLostEvents.length).toBeGreaterThan(0);
+  });
+});
