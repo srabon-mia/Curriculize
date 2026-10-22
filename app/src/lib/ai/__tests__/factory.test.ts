@@ -184,4 +184,80 @@ describe("AI Provider Factory", () => {
     const provider2 = getAIProvider(); // Second call without env change
     expect(provider2).toBe(provider1); // Should return cached instance
   });
+
+  // --- Production scenario regression tests ---
+
+  test("production: AI_PROVIDER=openrouter with valid OPENROUTER_API_KEY returns OpenRouterProvider", () => {
+    // Exact production configuration
+    process.env.AI_PROVIDER = "openrouter";
+    process.env.OPENROUTER_API_KEY = "sk-or-v1-production-key";
+    process.env.ANTHROPIC_API_KEY = "sk-ant-old-key"; // Old key present but should be ignored
+
+    const provider = getAIProvider();
+    expect(provider).toBeInstanceOf(OpenRouterProvider);
+    expect(provider.name).toBe("openrouter");
+  });
+
+  test("production: AI_PROVIDER=openrouter fails clearly when OPENROUTER_API_KEY missing", () => {
+    process.env.AI_PROVIDER = "openrouter";
+    // OPENROUTER_API_KEY deliberately not set
+    process.env.ANTHROPIC_API_KEY = "sk-ant-old-key";
+
+    expect(() => getAIProvider()).toThrow("OPENROUTER_API_KEY is required but not set");
+  });
+
+  test("isExplicitInjection heuristic: explicit setAIProvider is detected correctly", () => {
+    const mockProvider = new MockProvider();
+    setAIProvider(mockProvider);
+
+    // Should return injected provider without checking env vars
+    const provider = getAIProvider();
+    expect(provider).toBe(mockProvider);
+  });
+
+  test("isExplicitInjection heuristic: env-resolved provider is NOT treated as explicit injection", () => {
+    // First, create a provider via env resolution
+    process.env.AI_PROVIDER = "openrouter";
+    process.env.OPENROUTER_API_KEY = "key1";
+    const provider1 = getAIProvider();
+    expect(provider1.name).toBe("openrouter");
+
+    // Change env to anthropic
+    process.env.AI_PROVIDER = "anthropic";
+    process.env.ANTHROPIC_API_KEY = "key2";
+
+    // Should NOT return the cached openrouter provider (not explicit injection)
+    // Should re-resolve and create new anthropic provider
+    const provider2 = getAIProvider();
+    expect(provider2.name).toBe("anthropic");
+    expect(provider2).not.toBe(provider1);
+  });
+
+  test("isExplicitInjection heuristic: cachedConfig with full fields is not explicit injection", () => {
+    // Verify that a provider created via env resolution has full cachedConfig
+    process.env.AI_PROVIDER = "openrouter";
+    process.env.OPENROUTER_API_KEY = "key1";
+    getAIProvider();
+
+    // The cachedConfig should have all fields (provider, apiKey, defaultModel, defaultMaxTokens, debug)
+    // We can't directly access it, but we can verify the behavior:
+    // Changing env should create a new provider, not return cached
+    process.env.AI_PROVIDER = "anthropic";
+    process.env.ANTHROPIC_API_KEY = "key2";
+
+    const provider = getAIProvider();
+    expect(provider.name).toBe("anthropic");
+  });
+
+  test("factory never instantiates AnthropicProvider when AI_PROVIDER=openrouter", () => {
+    // This test verifies that even if ANTHROPIC_API_KEY is present,
+    // it is completely ignored when AI_PROVIDER=openrouter
+    process.env.AI_PROVIDER = "openrouter";
+    process.env.OPENROUTER_API_KEY = "sk-or-v1-test";
+    process.env.ANTHROPIC_API_KEY = "sk-ant-any-value";
+
+    const provider = getAIProvider();
+    expect(provider).toBeInstanceOf(OpenRouterProvider);
+    expect(provider.name).toBe("openrouter");
+  });
 });

@@ -264,5 +264,5 @@ export const DEFAULT_BUDGET_LIMITS: JobBudgetLimits = {
   max_retries: 3,
 };
 
-export const LEASE_DURATION_MINUTES = 5;
+export const LEASE_DURATION_MINUTES = 15;
 export const LEASE_RENEWAL_INTERVAL_MS = 60_000; // 60 seconds

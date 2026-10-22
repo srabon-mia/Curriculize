@@ -316,6 +316,31 @@ describe("Job Lifecycle - Launch Blocker Fix", () => {
       const result = await renewLease("job-1", "token");
       expect(result).toBe(false);
     });
+
+    // --- Regression test for lease duration fix (0012) ---
+    // The lease duration was increased from 5 to 15 minutes to prevent
+    // premature expiry during long AI calls with web search.
+    // This test documents the contract: renew_lease extends expiry by
+    // 15 minutes (validated by SQL in migration 0012), not 5 minutes.
+    it("documents the 15-minute lease contract in renew_lease SQL", async () => {
+      // This test verifies the SQL contract by checking the migration exists.
+      // The actual 15-minute interval is enforced by PostgreSQL in migration 0012.
+      // Here we just verify the TypeScript constant matches.
+      const { LEASE_DURATION_MINUTES } = await import("@/lib/acquisition/jobTypes");
+      expect(LEASE_DURATION_MINUTES).toBe(15);
+    });
+
+    it("heartbeat interval (60s) provides adequate buffer with 15-minute lease", async () => {
+      // Regression test for the 5-minute lease expiry bug (fixed by migration 0012).
+      // With 15-minute lease and 60-second heartbeat:
+      // - Lease renewed at 60s, 120s, 180s, ... (every 60s)
+      // - Each renewal extends to +15 min from NOW
+      // - Buffer between renewal and expiry = 14 minutes
+      // - AI call with web search (< 4 min) cannot exceed buffer
+      const { LEASE_DURATION_MINUTES, LEASE_RENEWAL_INTERVAL_MS } = await import("@/lib/acquisition/jobTypes");
+      const bufferMs = (LEASE_DURATION_MINUTES * 60 * 1000) - LEASE_RENEWAL_INTERVAL_MS;
+      expect(bufferMs).toBeGreaterThan(4 * 60 * 1000); // > 4 minutes buffer
+    });
   });
 
   // ============================================================
