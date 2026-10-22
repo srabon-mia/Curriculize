@@ -137,9 +137,9 @@ export interface AIProvider {
  * Configuration for provider factory.
  */
 export interface AIProviderConfig {
-  /** Provider name: "anthropic" | "mock" */
-  provider: "anthropic" | "mock";
-  /** Anthropic API key (required for anthropic provider) */
+  /** Provider name: "anthropic" | "mock" | "openrouter" */
+  provider: "anthropic" | "mock" | "openrouter";
+  /** API key (required for anthropic and openrouter providers) */
   apiKey?: string;
   /** Default model name */
   defaultModel?: string;

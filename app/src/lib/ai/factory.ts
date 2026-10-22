@@ -6,6 +6,7 @@
 import { AIProvider, AIProviderConfig } from "./types";
 import { AnthropicProvider } from "./anthropic";
 import { MockProvider } from "./mock";
+import { OpenRouterProvider } from "./openrouter";
 
 let cachedProvider: AIProvider | null = null;
 let cachedConfig: AIProviderConfig | null = null;
@@ -23,8 +24,9 @@ export function getAIProvider(config?: Partial<AIProviderConfig>): AIProvider {
   }
 
   const resolvedConfig: AIProviderConfig = {
-    provider: config?.provider ?? (process.env.AI_PROVIDER as "anthropic" | "mock") ?? "anthropic",
-    apiKey: config?.apiKey ?? process.env.ANTHROPIC_API_KEY,
+    provider: config?.provider ?? (process.env.AI_PROVIDER as "anthropic" | "mock" | "openrouter") ?? "anthropic",
+    apiKey: config?.apiKey ??
+      (process.env.AI_PROVIDER === "openrouter" ? process.env.OPENROUTER_API_KEY : process.env.ANTHROPIC_API_KEY),
     defaultModel: config?.defaultModel ?? process.env.AI_DEFAULT_MODEL,
     defaultMaxTokens: config?.defaultMaxTokens ? parseInt(process.env.AI_DEFAULT_MAX_TOKENS ?? "", 10) : undefined,
     debug: config?.debug ?? process.env.AI_DEBUG === "true",
@@ -52,6 +54,17 @@ export function createProvider(config: AIProviderConfig): AIProvider {
         throw new Error("ANTHROPIC_API_KEY is required for anthropic provider");
       }
       return new AnthropicProvider({
+        apiKey: config.apiKey,
+        defaultModel: config.defaultModel,
+        defaultMaxTokens: config.defaultMaxTokens,
+        debug: config.debug,
+      });
+
+    case "openrouter":
+      if (!config.apiKey) {
+        throw new Error("OPENROUTER_API_KEY is required for openrouter provider");
+      }
+      return new OpenRouterProvider({
         apiKey: config.apiKey,
         defaultModel: config.defaultModel,
         defaultMaxTokens: config.defaultMaxTokens,

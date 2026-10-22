@@ -18,6 +18,7 @@ export type { AIError, AIProvider } from "./types";
 
 // Implementations
 export { AnthropicProvider } from "./anthropic";
+export { OpenRouterProvider } from "./openrouter";
 export { MockProvider, createMockProvider, type MockCallRecord, type MockResponse } from "./mock";
 
 // Factory
