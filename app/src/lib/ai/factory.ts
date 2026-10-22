@@ -23,14 +23,23 @@ export function getAIProvider(config?: Partial<AIProviderConfig>): AIProvider {
     return cachedProvider;
   }
 
+  const resolvedProvider = config?.provider ?? (process.env.AI_PROVIDER as "anthropic" | "mock" | "openrouter") ?? "anthropic";
   const resolvedConfig: AIProviderConfig = {
-    provider: config?.provider ?? (process.env.AI_PROVIDER as "anthropic" | "mock" | "openrouter") ?? "anthropic",
+    provider: resolvedProvider,
     apiKey: config?.apiKey ??
-      (process.env.AI_PROVIDER === "openrouter" ? process.env.OPENROUTER_API_KEY : process.env.ANTHROPIC_API_KEY),
+      (resolvedProvider === "openrouter" ? process.env.OPENROUTER_API_KEY : process.env.ANTHROPIC_API_KEY),
     defaultModel: config?.defaultModel ?? process.env.AI_DEFAULT_MODEL,
     defaultMaxTokens: config?.defaultMaxTokens ? parseInt(process.env.AI_DEFAULT_MAX_TOKENS ?? "", 10) : undefined,
     debug: config?.debug ?? process.env.AI_DEBUG === "true",
   };
+
+  // Fail fast if required API key is missing for the selected provider
+  if (resolvedProvider === "anthropic" && !resolvedConfig.apiKey) {
+    throw new Error("ANTHROPIC_API_KEY is required but not set. Set AI_PROVIDER=openrouter to use OpenRouter instead.");
+  }
+  if (resolvedProvider === "openrouter" && !resolvedConfig.apiKey) {
+    throw new Error("OPENROUTER_API_KEY is required but not set. Set AI_PROVIDER=openrouter and provide OPENROUTER_API_KEY.");
+  }
 
   // Return cached provider if config matches
   if (cachedProvider && configsEqual(cachedConfig, resolvedConfig)) {
