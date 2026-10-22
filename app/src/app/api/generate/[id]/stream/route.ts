@@ -41,10 +41,16 @@ function getAI(): ReturnType<typeof getAIProvider> {
  * Returns raw text response; callers handle JSON extraction.
  */
 async function callAI(prompt: string, useSearch = true): Promise<string> {
-  const textResult = await getAI().complete(prompt, {
+  const startTime = Date.now();
+  const provider = getAI();
+  const textResult = await provider.complete(prompt, {
     useSearch,
     maxTokens: 4000,
   });
+  const durationMs = Date.now() - startTime;
+  console.log(
+    `[stream] AI call completed: provider=${provider.name}, duration_ms=${durationMs}, response_chars=${textResult.text.length}`
+  );
   return textResult.text;
 }
 
@@ -238,11 +244,15 @@ export async function renewLease(jobId: string, claimToken: string): Promise<boo
   });
 
   if (error) {
-    console.error("[stream] renew_lease RPC error:", error.message);
+    console.error(`[stream] renew_lease RPC error: job_id=${jobId}, error=${error.message}`);
     return false;
   }
 
-  return data === true;
+  const renewed = data === true;
+  if (!renewed) {
+    console.error(`[stream] Lease renewal failed: job_id=${jobId}, reason=not_found_or_expired`);
+  }
+  return renewed;
 }
 
 /**
@@ -470,10 +480,12 @@ export async function GET(
           void renewLease(jobRecord!.id, jobRecord!.claim_token).then((ok) => {
             if (!ok) {
               console.error(
-                `[stream] Lease renewal failed — job ${jobRecord!.id} may have been reclaimed`
+                `[stream] Lease renewal failed: job_id=${jobRecord!.id}, reason=not_found_or_expired`
               );
               ownershipLost = true;
               clearHeartbeat();
+            } else {
+              console.debug(`[stream] Lease renewed: job_id=${jobRecord!.id}`);
             }
           });
         }, 60_000); // Every 60 seconds
@@ -586,11 +598,21 @@ export async function GET(
         };
 
         let skeletonParsed: Skeleton;
+        const skeletonParseStartTime = Date.now();
         try {
           const jsonMatch = (skeleton as string).match(/\{[\s\S]*\}/);
           if (!jsonMatch) throw new Error("No JSON found");
           skeletonParsed = JSON.parse(jsonMatch[0]) as Skeleton;
-        } catch {
+        } catch (parseErr) {
+          const parseDurationMs = Date.now() - skeletonParseStartTime;
+          const errorCategory = parseErr instanceof SyntaxError
+            ? "JSON_SYNTAX_ERROR"
+            : parseErr instanceof Error && parseErr.message === "No JSON found"
+              ? "NO_JSON_FOUND"
+              : "PARSE_ERROR";
+          console.error(
+            `[stream] Skeleton parse failed: job_id=${jobRecord!.id}, category=${errorCategory}, response_chars=${skeleton.length}, parse_duration_ms=${parseDurationMs}, error=${parseErr instanceof Error ? parseErr.message : String(parseErr)}`
+          );
           send(controller, "error", {
             message: "Failed to generate curriculum structure",
           });

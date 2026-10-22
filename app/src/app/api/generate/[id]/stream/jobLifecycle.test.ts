@@ -341,6 +341,47 @@ describe("Job Lifecycle - Launch Blocker Fix", () => {
       const bufferMs = (LEASE_DURATION_MINUTES * 60 * 1000) - LEASE_RENEWAL_INTERVAL_MS;
       expect(bufferMs).toBeGreaterThan(4 * 60 * 1000); // > 4 minutes buffer
     });
+
+    // --- Diagnostic logging regression tests ---
+
+    it("renewLease logs structured error on RPC error", async () => {
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      setRpcResult("renew_lease", {
+        data: null,
+        error: { message: "connection refused" },
+      });
+
+      await renewLease("job-1", "token");
+
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        "[stream] renew_lease RPC error: job_id=job-1, error=connection refused"
+      );
+      consoleErrorSpy.mockRestore();
+    });
+
+    it("renewLease logs structured error on lease not found/expired", async () => {
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      setRpcResult("renew_lease", { data: false, error: null });
+
+      await renewLease("job-1", "stale-token");
+
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        "[stream] Lease renewal failed: job_id=job-1, reason=not_found_or_expired"
+      );
+      consoleErrorSpy.mockRestore();
+    });
+
+    it("renewLease does not log error on success", async () => {
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const consoleDebugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+      setRpcResult("renew_lease", { data: true, error: null });
+
+      await renewLease("job-1", "valid-token");
+
+      expect(consoleErrorSpy).not.toHaveBeenCalled();
+      consoleErrorSpy.mockRestore();
+      consoleDebugSpy.mockRestore();
+    });
   });
 
   // ============================================================
