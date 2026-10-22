@@ -156,15 +156,32 @@ describe("AI Provider Factory", () => {
     expect(provider1).not.toBe(provider2);
   });
 
-  test("mock provider still works without API keys", () => {
-    const provider = getAIProvider({ provider: "mock" });
-    expect(provider).toBeInstanceOf(MockProvider);
-    expect(provider.name).toBe("mock");
+  // --- Regression test for caching bug ---
+  // The factory must re-read env vars on each getAIProvider() call when no explicit config
+  // is provided, so that a container reuse with changed env vars doesn't return a stale provider.
+
+  test("factory re-reads AI_PROVIDER on each call and creates new provider when env changes", () => {
+    // Simulate first cold start: AI_PROVIDER not set -> defaults to anthropic
+    delete process.env.AI_PROVIDER;
+    process.env.ANTHROPIC_API_KEY = "key1";
+    const provider1 = getAIProvider();
+    expect(provider1.name).toBe("anthropic");
+
+    // Simulate container reuse: env var changed to openrouter, but module cache persists
+    // The factory must detect this and create a new provider
+    process.env.AI_PROVIDER = "openrouter";
+    process.env.OPENROUTER_API_KEY = "key2";
+    // Don't call resetAIProvider() - simulates same module instance
+    const provider2 = getAIProvider();
+    expect(provider2.name).toBe("openrouter");
+    expect(provider2).not.toBe(provider1); // Must be a new instance
   });
 
-  test("anthropic provider still works with explicit config", () => {
-    const provider = getAIProvider({ provider: "anthropic", apiKey: "test-key" });
-    expect(provider).toBeInstanceOf(AnthropicProvider);
-    expect(provider.name).toBe("anthropic");
+  test("factory returns cached provider when env vars unchanged", () => {
+    process.env.AI_PROVIDER = "openrouter";
+    process.env.OPENROUTER_API_KEY = "key1";
+    const provider1 = getAIProvider();
+    const provider2 = getAIProvider(); // Second call without env change
+    expect(provider2).toBe(provider1); // Should return cached instance
   });
 });

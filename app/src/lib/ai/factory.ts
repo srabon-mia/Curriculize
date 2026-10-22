@@ -18,11 +18,17 @@ let cachedConfig: AIProviderConfig | null = null;
  * returns that explicitly set provider.
  */
 export function getAIProvider(config?: Partial<AIProviderConfig>): AIProvider {
-  // If explicitly set via setAIProvider() and no config override requested, return it
-  if (config === undefined && cachedProvider && cachedConfig) {
-    return cachedProvider;
+  // If explicitly set via setAIProvider() and no config override requested, return it.
+  // setAIProvider sets cachedConfig with ONLY the provider field (minimal config),
+  // while env resolution creates a full config. Detect explicit injection by checking
+  // if cachedConfig has only the provider field.
+  const isExplicitInjection = cachedProvider !== null && cachedConfig !== null &&
+    Object.keys(cachedConfig).length === 1 && "provider" in cachedConfig;
+  if (config === undefined && isExplicitInjection) {
+    return cachedProvider!;
   }
 
+  // Resolve config from environment (reads current env vars to detect changes)
   const resolvedProvider = config?.provider ?? (process.env.AI_PROVIDER as "anthropic" | "mock" | "openrouter") ?? "anthropic";
   const resolvedConfig: AIProviderConfig = {
     provider: resolvedProvider,
@@ -41,7 +47,7 @@ export function getAIProvider(config?: Partial<AIProviderConfig>): AIProvider {
     throw new Error("OPENROUTER_API_KEY is required but not set. Set AI_PROVIDER=openrouter and provide OPENROUTER_API_KEY.");
   }
 
-  // Return cached provider if config matches
+  // Return cached provider if config matches (handles env var changes)
   if (cachedProvider && configsEqual(cachedConfig, resolvedConfig)) {
     return cachedProvider;
   }
