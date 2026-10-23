@@ -261,18 +261,17 @@ describe("Job Service Layer - RPC Contract Verification", () => {
         error: null,
       });
 
-      const mockInput = {
+      const mockInput: Parameters<typeof persistWithFence>[2] = {
         acquiredPage: {
           finalUrl: "https://example.com",
           canonicalUrl: { url: "https://example.com" },
           contentHash: "abc123",
           statusCode: 200,
           acquiredAt: new Date().toISOString(),
-          contentType: "text/html",
         },
         structuredContent: {
           metadata: {
-            title: "Test Resource",
+            title: "Café and Unicode 😀",
             description: "Test Description",
             author: "Test Author",
             datePublished: "2023-01-01",
@@ -299,18 +298,80 @@ describe("Job Service Layer - RPC Contract Verification", () => {
         callerMetadata: {
           resourceType: "video",
           licenseStatus: "cc_open",
-          aiNote: "Test note",
+          aiNote: "literal \\u0000 remains text",
         },
       };
+      Object.assign(mockInput.acquiredPage, { body: "unused page body with a NUL: \u0000", contentType: "text/html" });
+      Object.assign(mockInput.structuredContent, { blocks: [{ text: "unused extracted text with a NUL: \u0000" }] });
 
       const result = await persistWithFence("test-job", "test-token", mockInput);
 
       expect(mockSupabase.rpc).toHaveBeenCalledWith("persist_with_fence", {
         p_job_id: "test-job",
         p_claim_token: "test-token",
-        p_input: mockInput,
+        p_input: {
+          acquiredPage: {
+            finalUrl: "https://example.com",
+            canonicalUrl: { url: "https://example.com" },
+            contentHash: "abc123",
+            statusCode: 200,
+            acquiredAt: mockInput.acquiredPage.acquiredAt,
+          },
+          structuredContent: { metadata: mockInput.structuredContent.metadata },
+          educationalEvidence: mockInput.educationalEvidence,
+          verificationResult: mockInput.verificationResult,
+          target: mockInput.target,
+          acquisitionJobId: mockInput.acquisitionJobId,
+          callerMetadata: mockInput.callerMetadata,
+        },
       });
+      const rpcInput = (mockSupabase.rpc as ReturnType<typeof vi.fn>).mock.calls[0][1].p_input;
+      expect(rpcInput.acquiredPage).not.toHaveProperty("body");
+      expect(rpcInput.structuredContent).not.toHaveProperty("blocks");
+      expect(rpcInput.structuredContent.metadata.title).toBe("Café and Unicode 😀");
+      expect(rpcInput.callerMetadata.aiNote).toBe("literal \\u0000 remains text");
       expect(result.resource_id).toBe("test-resource");
+    });
+
+    it("reports only field paths and counts for unsupported Unicode in a jsonb error", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        data: null,
+        error: { message: "unsupported Unicode escape sequence" },
+      });
+      const input: Parameters<typeof persistWithFence>[2] = {
+        acquiredPage: {
+          finalUrl: "https://example.com",
+          canonicalUrl: { url: "https://example.com" },
+          contentHash: "abc123",
+          statusCode: 200,
+          acquiredAt: new Date().toISOString(),
+        },
+        structuredContent: { metadata: { title: "Valid café 😀" } },
+        educationalEvidence: { interpreted: { example: "bad\u0000value", literal: "\\u0000" } },
+        verificationResult: {
+          status: "verified" as const,
+          deterministicChecks: { cleanedContentNonEmpty: true },
+          advisorySignals: { titlePresent: true, educationalEvidencePresent: true, wordCount: 1, headingCount: 0, paragraphCount: 1 },
+          verifiedAt: new Date().toISOString(),
+        },
+        target: { nodeId: "test-node-id" },
+        acquisitionJobId: "test-job-id",
+        callerMetadata: { aiNote: "valid backslash \\u0041 text" },
+      };
+
+      try {
+        const result = await persistWithFence("test-job", "test-token", input);
+        expect(result.error).toBe("unsupported Unicode escape sequence");
+        expect(consoleError).toHaveBeenCalledWith("[persistence] JSONB Unicode input diagnostic:", {
+          job_id: "test-job",
+          fields: [{ path: "p_input.educationalEvidence.interpreted.example", nul_count: 1, unpaired_surrogate_count: 0 }],
+        });
+        expect(consoleError.mock.calls.flat().join(" ")).not.toContain("bad");
+        expect(consoleError.mock.calls.flat().join(" ")).not.toContain("Valid café");
+      } finally {
+        consoleError.mockRestore();
+      }
     });
 
     it("returns error when ownership is lost", async () => {

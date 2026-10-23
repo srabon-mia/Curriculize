@@ -37,6 +37,24 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
 const MAX_TOPICS_PER_INVOCATION = 2;
 
+class ResourcePersistenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ResourcePersistenceError';
+  }
+}
+
+/** Fail the job instead of checkpointing a topic whose resource write failed. */
+export function requireSuccessfulPersistence(
+  result: { error?: string },
+  jobId: string,
+  topicId: string
+): void {
+  if (!result.error) return;
+  console.error('Persistence error:', { job_id: jobId, topic_id: topicId, error: result.error });
+  throw new ResourcePersistenceError(result.error);
+}
+
 function getAdminClient() {
   return createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 }
@@ -596,9 +614,7 @@ export async function processJob(job: JobClaimResult): Promise<void> {
           },
         });
 
-        if (persistResult.error) {
-          console.error('Persistence error:', persistResult.error);
-        }
+        requireSuccessfulPersistence(persistResult, job.id, nodeId);
       }
 
       // Advance checkpoint for this topic.
@@ -828,7 +844,7 @@ async function processBatchDiscovery(
             educationalEvidence,
           });
 
-          await persistWithFence(job.id, job.claim_token, {
+          const persistResult = await persistWithFence(job.id, job.claim_token, {
             acquiredPage,
             structuredContent,
             educationalEvidence,
@@ -841,11 +857,13 @@ async function processBatchDiscovery(
               aiNote: candidate.ai_note ?? null,
             },
           });
+          requireSuccessfulPersistence(persistResult, job.id, nodeId);
           batchPersistedCount++;
         }
       }
     } catch (error) {
       console.error('Batch discovery error:', error);
+      if (error instanceof ResourcePersistenceError) throw error;
     }
 
     // Persist batch progress for this topic. The RPC is fenced by

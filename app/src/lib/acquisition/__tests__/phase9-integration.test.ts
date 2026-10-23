@@ -43,7 +43,7 @@ vi.mock('@/lib/acquisition/engine', async () => ({
   acquireCandidate: async () => ({ success: false }),
 }));
 
-import { processJob } from '@/lib/acquisition/worker';
+import { processJob, requireSuccessfulPersistence } from '@/lib/acquisition/worker';
 import type { JobBudgetLimits, JobClaimResult } from '@/lib/acquisition/jobTypes';
 import { DEFAULT_BUDGET_LIMITS } from '@/lib/acquisition/jobTypes';
 
@@ -70,6 +70,30 @@ const defaultJobClaimResult: JobClaimResult = {
   budget_version: 0,
   last_reservation_id: null,
 };
+
+describe('Worker resource persistence failures', () => {
+  test('fails before topic checkpointing when persistence returns an error', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => requireSuccessfulPersistence(
+        { error: 'unsupported Unicode escape sequence' },
+        'job-1',
+        'topic-1'
+      )).toThrow('unsupported Unicode escape sequence');
+      expect(consoleError).toHaveBeenCalledWith('Persistence error:', {
+        job_id: 'job-1',
+        topic_id: 'topic-1',
+        error: 'unsupported Unicode escape sequence',
+      });
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  test('continues when persistence succeeds', () => {
+    expect(() => requireSuccessfulPersistence({}, 'job-1', 'topic-1')).not.toThrow();
+  });
+});
 
 describe('Phase 9: processJob maxAiCalls budget enforcement', () => {
   test('reads max_ai_calls from job budget_limits', () => {

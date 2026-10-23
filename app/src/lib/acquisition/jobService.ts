@@ -167,27 +167,106 @@ export async function persistWithFence(
   input: PersistWithFenceRequest['input']
 ): Promise<PersistWithFenceResponse> {
   const supabase = getServiceClient();
+  // Send only fields consumed by persist_with_fence. Runtime AcquisitionPage
+  // and StructuredContent objects also carry raw page bodies and extracted
+  // blocks/links; those are not needed by this RPC and may contain characters
+  // PostgreSQL cannot represent in jsonb (for example U+0000).
+  const rpcInput = {
+    acquiredPage: {
+      finalUrl: input.acquiredPage.finalUrl,
+      canonicalUrl: { url: input.acquiredPage.canonicalUrl.url },
+      contentHash: input.acquiredPage.contentHash,
+      statusCode: input.acquiredPage.statusCode,
+      acquiredAt: input.acquiredPage.acquiredAt,
+    },
+    structuredContent: {
+      metadata: {
+        title: input.structuredContent.metadata.title ?? null,
+        description: input.structuredContent.metadata.description ?? null,
+        author: input.structuredContent.metadata.author ?? null,
+        datePublished: input.structuredContent.metadata.datePublished ?? null,
+        language: input.structuredContent.metadata.language ?? null,
+      },
+    },
+    educationalEvidence: { interpreted: input.educationalEvidence.interpreted },
+    verificationResult: {
+      status: input.verificationResult.status,
+      deterministicChecks: {
+        cleanedContentNonEmpty: input.verificationResult.deterministicChecks.cleanedContentNonEmpty,
+      },
+      advisorySignals: {
+        titlePresent: input.verificationResult.advisorySignals.titlePresent,
+        educationalEvidencePresent: input.verificationResult.advisorySignals.educationalEvidencePresent,
+        wordCount: input.verificationResult.advisorySignals.wordCount,
+        headingCount: input.verificationResult.advisorySignals.headingCount,
+        paragraphCount: input.verificationResult.advisorySignals.paragraphCount,
+      },
+      verifiedAt: input.verificationResult.verifiedAt,
+    },
+    target: { ...input.target },
+    acquisitionJobId: input.acquisitionJobId ?? null,
+    callerMetadata: {
+      resourceType: input.callerMetadata?.resourceType ?? null,
+      licenseStatus: input.callerMetadata?.licenseStatus ?? null,
+      aiNote: input.callerMetadata?.aiNote ?? null,
+    },
+  };
 
   const { data, error } = await supabase.rpc('persist_with_fence', {
     p_job_id: jobId,
     p_claim_token: claimToken,
-    p_input: {
-      acquiredPage: input.acquiredPage,
-      structuredContent: input.structuredContent,
-      educationalEvidence: input.educationalEvidence,
-      verificationResult: input.verificationResult,
-      target: input.target,
-      acquisitionJobId: input.acquisitionJobId,
-      callerMetadata: input.callerMetadata,
-    },
+    p_input: rpcInput,
   });
 
   if (error) {
     console.error('Persist with fence error:', error);
+    if (/unicode|escape sequence/i.test(error.message)) {
+      const fields = findUnsupportedJsonbUnicode(rpcInput);
+      console.error('[persistence] JSONB Unicode input diagnostic:', {
+        job_id: jobId,
+        fields,
+      });
+    }
     return { resource_id: '', vr_id: '', mapping_id: null, is_exact_retry: false, error: error.message };
   }
 
   return data as PersistWithFenceResponse;
+}
+
+/** Report only paths and code-point counts; never include persisted text values. */
+function findUnsupportedJsonbUnicode(value: unknown, path = 'p_input'): Array<{
+  path: string;
+  nul_count: number;
+  unpaired_surrogate_count: number;
+}> {
+  const fields: Array<{ path: string; nul_count: number; unpaired_surrogate_count: number }> = [];
+  const visit = (current: unknown, currentPath: string): void => {
+    if (typeof current === 'string') {
+      let nulCount = 0;
+      let unpairedSurrogateCount = 0;
+      for (let index = 0; index < current.length; index++) {
+        const code = current.charCodeAt(index);
+        if (code === 0) {
+          nulCount++;
+        } else if (code >= 0xd800 && code <= 0xdbff) {
+          const next = current.charCodeAt(index + 1);
+          if (next >= 0xdc00 && next <= 0xdfff) index++;
+          else unpairedSurrogateCount++;
+        } else if (code >= 0xdc00 && code <= 0xdfff) {
+          unpairedSurrogateCount++;
+        }
+      }
+      if (nulCount > 0 || unpairedSurrogateCount > 0) {
+        fields.push({ path: currentPath, nul_count: nulCount, unpaired_surrogate_count: unpairedSurrogateCount });
+      }
+    } else if (Array.isArray(current)) {
+      current.forEach((item, index) => visit(item, `${currentPath}[${index}]`));
+    } else if (current && typeof current === 'object') {
+      Object.entries(current).forEach(([key, child]) => visit(child, `${currentPath}.${key}`));
+    }
+  };
+  visit(value, path);
+  return fields;
 }
 
 /**
