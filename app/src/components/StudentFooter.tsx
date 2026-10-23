@@ -16,7 +16,7 @@ export function StudentFooter() {
                 C
               </span>
               <span className="font-display font-semibold text-base sm:text-lg tracking-tight text-white">
-                Curriculum Generator
+                Curriculize
               </span>
             </Link>
             <p className="text-sm leading-relaxed text-white/75 max-w-xs">
@@ -74,7 +74,7 @@ export function StudentFooter() {
         {/* Bottom copyright row */}
         <div className="mt-12 pt-8 border-t border-white/15 flex flex-col sm:flex-row items-center justify-between gap-3">
           <p className="text-xs text-white/60">
-            © {new Date().getFullYear()} Curriculum Generator. All rights reserved.
+            © {new Date().getFullYear()} Curriculize. All rights reserved.
           </p>
           <p className="text-xs text-white/60">
             Free to use · No subscriptions or paid tiers

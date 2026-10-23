@@ -18,7 +18,7 @@ export function StudentHeader() {
             C
           </span>
           <span className="hidden font-display font-semibold text-base tracking-tight text-brand-navy sm:inline sm:text-lg">
-            Curriculum Generator
+            Curriculize
           </span>
         </Link>
 

@@ -16,9 +16,22 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "Curriculum Generator — Human-Curated Study Guides",
+  title: "Curriculize — Human-Curated Study Guides",
   description:
-    "Generate structured, topic-by-topic study guides compiled from verified, human-curated educational web resources, or browse published curricula.",
+    "Discover structured learning roadmaps built around authoritative, human-written curricula and resources. Generate topic-by-topic study guides or browse published curricula.",
+  openGraph: {
+    title: "Curriculize — Human-Curated Study Guides",
+    description:
+      "Discover structured learning roadmaps built around authoritative, human-written curricula and resources.",
+    siteName: "Curriculize",
+    type: "website",
+  },
+  twitter: {
+    card: "summary",
+    title: "Curriculize — Human-Curated Study Guides",
+    description:
+      "Discover structured learning roadmaps built around authoritative, human-written curricula and resources.",
+  },
 };
 
 export default function RootLayout({

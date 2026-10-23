@@ -4,7 +4,7 @@ import { StudentHeader } from "../../components/StudentHeader";
 import { StudentFooter } from "../../components/StudentFooter";
 
 export const metadata: Metadata = {
-  title: "About | Curriculum Generator",
+  title: "About | Curriculize",
   description:
     "A free platform for building structured learning paths around the topics you want to explore.",
 };
@@ -28,7 +28,7 @@ export default function AboutPage() {
               <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-brand-fresh" />
               A little about us
             </span>
-            <h1 className="mt-4 font-display text-4xl font-bold tracking-tight text-brand-navy sm:text-5xl">About <span className="text-brand-forest">Curriculum Generator</span></h1>
+            <h1 className="mt-4 font-display text-4xl font-bold tracking-tight text-brand-navy sm:text-5xl">About <span className="text-brand-forest">Curriculize</span></h1>
             <p className="mx-auto mt-4 max-w-2xl text-base leading-relaxed text-text-secondary sm:text-lg">A free place to make one for the subject you want to explore or skill you want to develop.</p>
             <div className="mt-6 flex flex-wrap justify-center gap-2">
               <span className="rounded-full border border-border-default bg-surface-card/80 px-3 py-1.5 text-xs font-medium text-text-secondary">Free to use</span>
@@ -41,7 +41,7 @@ export default function AboutPage() {
           <div className="mx-auto grid max-w-5xl items-center gap-6 md:grid-cols-12 md:gap-8">
             <div className="md:col-span-5">
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-brand-forest">The idea</p>
-              <h2 className="mt-2 font-display text-2xl font-bold tracking-tight text-brand-navy sm:text-3xl">What is Curriculum Generator?</h2>
+              <h2 className="mt-2 font-display text-2xl font-bold tracking-tight text-brand-navy sm:text-3xl">What is Curriculize?</h2>
               <p className="mt-4 text-sm leading-relaxed text-text-secondary sm:text-base">Learning on your own often means searching for good material, deciding what to study first, and organizing it all yourself. This site helps bring a topic, a sequence of ideas, and related educational resources into one place, so you don't have to jump around from website to website with no proper order.</p>
             </div>
             <div className="md:col-span-7">
