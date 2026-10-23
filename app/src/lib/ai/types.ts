@@ -69,6 +69,18 @@ export interface AIStructuredOptions<T> extends AICompleteOptions {
 }
 
 /**
+ * Search citation from web search tool.
+ */
+export interface AISearchCitation {
+  /** URL of the cited source */
+  url: string;
+  /** Title of the cited source */
+  title?: string;
+  /** Snippet or excerpt from the source */
+  snippet?: string;
+}
+
+/**
  * Raw completion result.
  */
 export interface AICompleteResult {
@@ -81,6 +93,10 @@ export interface AICompleteResult {
   };
   /** Raw provider response for debugging */
   raw?: unknown;
+  /** Search citations if web search was used */
+  searchCitations?: AISearchCitation[];
+  /** Whether the web search tool completed successfully (only set when useSearch=true) */
+  searchCompleted?: boolean;
 }
 
 /**
@@ -137,9 +153,9 @@ export interface AIProvider {
  * Configuration for provider factory.
  */
 export interface AIProviderConfig {
-  /** Provider name: "anthropic" | "mock" | "openrouter" */
-  provider: "anthropic" | "mock" | "openrouter";
-  /** API key (required for anthropic and openrouter providers) */
+  /** Provider name: "anthropic" | "mock" | "openrouter" | "azure" */
+  provider: "anthropic" | "mock" | "openrouter" | "azure";
+  /** API key (required for anthropic, openrouter, and azure providers) */
   apiKey?: string;
   /** Default model name */
   defaultModel?: string;

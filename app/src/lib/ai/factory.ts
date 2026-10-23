@@ -7,6 +7,7 @@ import { AIProvider, AIProviderConfig } from "./types";
 import { AnthropicProvider } from "./anthropic";
 import { MockProvider } from "./mock";
 import { OpenRouterProvider } from "./openrouter";
+import { AzureProvider } from "./azure";
 
 let cachedProvider: AIProvider | null = null;
 let cachedConfig: AIProviderConfig | null = null;
@@ -29,11 +30,21 @@ export function getAIProvider(config?: Partial<AIProviderConfig>): AIProvider {
   }
 
   // Resolve config from environment (reads current env vars to detect changes)
-  const resolvedProvider = config?.provider ?? (process.env.AI_PROVIDER as "anthropic" | "mock" | "openrouter") ?? "anthropic";
+  const resolvedProvider = config?.provider ?? (process.env.AI_PROVIDER as "anthropic" | "mock" | "openrouter" | "azure") ?? "anthropic";
+  let resolvedApiKey: string | undefined;
+  if (config?.apiKey) {
+    resolvedApiKey = config.apiKey;
+  } else if (resolvedProvider === "openrouter") {
+    resolvedApiKey = process.env.OPENROUTER_API_KEY;
+  } else if (resolvedProvider === "azure") {
+    resolvedApiKey = process.env.AZURE_OPENAI_API_KEY;
+  } else {
+    resolvedApiKey = process.env.ANTHROPIC_API_KEY;
+  }
+
   const resolvedConfig: AIProviderConfig = {
     provider: resolvedProvider,
-    apiKey: config?.apiKey ??
-      (resolvedProvider === "openrouter" ? process.env.OPENROUTER_API_KEY : process.env.ANTHROPIC_API_KEY),
+    apiKey: resolvedApiKey,
     defaultModel: config?.defaultModel ?? process.env.AI_DEFAULT_MODEL,
     defaultMaxTokens: config?.defaultMaxTokens ? parseInt(process.env.AI_DEFAULT_MAX_TOKENS ?? "", 10) : undefined,
     debug: config?.debug ?? process.env.AI_DEBUG === "true",
@@ -41,10 +52,13 @@ export function getAIProvider(config?: Partial<AIProviderConfig>): AIProvider {
 
   // Fail fast if required API key is missing for the selected provider
   if (resolvedProvider === "anthropic" && !resolvedConfig.apiKey) {
-    throw new Error("ANTHROPIC_API_KEY is required but not set. Set AI_PROVIDER=openrouter to use OpenRouter instead.");
+    throw new Error("ANTHROPIC_API_KEY is required but not set. Set AI_PROVIDER=openrouter or AI_PROVIDER=azure to use another provider.");
   }
   if (resolvedProvider === "openrouter" && !resolvedConfig.apiKey) {
     throw new Error("OPENROUTER_API_KEY is required but not set. Set AI_PROVIDER=openrouter and provide OPENROUTER_API_KEY.");
+  }
+  if (resolvedProvider === "azure" && !resolvedConfig.apiKey) {
+    throw new Error("AZURE_OPENAI_API_KEY is required but not set. Set AI_PROVIDER=azure and provide AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, and AZURE_OPENAI_DEPLOYMENT.");
   }
 
   // Return cached provider if config matches (handles env var changes)
@@ -84,6 +98,34 @@ export function createProvider(config: AIProviderConfig): AIProvider {
         defaultModel: config.defaultModel,
         defaultMaxTokens: config.defaultMaxTokens,
         debug: config.debug,
+      });
+
+    case "azure":
+      if (!config.apiKey) {
+        throw new Error("AZURE_OPENAI_API_KEY is required for azure provider");
+      }
+      // Azure-specific config from environment (not in AIProviderConfig to keep it generic)
+      const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
+      const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
+      const apiVersion = process.env.AZURE_OPENAI_API_VERSION;
+      const useV1Endpoint = process.env.AZURE_OPENAI_USE_V1_ENDPOINT === "true";
+
+      if (!endpoint) {
+        throw new Error("AZURE_OPENAI_ENDPOINT is required for azure provider (e.g., https://my-resource.openai.azure.com)");
+      }
+      if (!deployment) {
+        throw new Error("AZURE_OPENAI_DEPLOYMENT is required for azure provider (deployment name, e.g., gpt-4.1-mini)");
+      }
+
+      return new AzureProvider({
+        apiKey: config.apiKey,
+        endpoint,
+        deployment,
+        apiVersion,
+        defaultModel: config.defaultModel,
+        defaultMaxTokens: config.defaultMaxTokens,
+        debug: config.debug,
+        useV1Endpoint,
       });
 
     case "mock":

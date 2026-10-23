@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use, useRef, useCallback } from "react";
+import { use, useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 
@@ -11,6 +11,8 @@ type Status = {
   total?: number;
   phase?: string;
   topicsCompleted?: number;
+  job_id?: string;
+  is_reconnect?: boolean;
 };
 
 type CompleteEvent = {
@@ -45,12 +47,17 @@ export default function GeneratePage({
   const [skeletonTitle, setSkeletonTitle] = useState<string | null>(null);
   const [terminalState, setTerminalState] = useState<"none" | "complete" | "failed">("none");
   const terminalStateRef = useRef(terminalState);
-  terminalStateRef.current = terminalState;
   const esRef = useRef<EventSource | null>(null);
   const yieldedHandledRef = useRef(false);
+  const connectRef = useRef<() => void>(() => {});
+
+  // Keep terminalStateRef in sync with terminalState
+  useEffect(() => {
+    terminalStateRef.current = terminalState;
+  }, [terminalState]);
 
   // Single connection manager - handles all lifecycle
-  const connect = useCallback(() => {
+  const connectImpl = useCallback(() => {
     // Don't reconnect if we've reached a terminal state
     if (terminalStateRef.current !== "none") return;
 
@@ -73,6 +80,20 @@ export default function GeneratePage({
       if (data.step === "already_claimed") {
         es.close();
         router.push(`/curriculum/${id}`);
+      }
+
+      // Handle reconnect/resume events - don't redirect, just update UI
+      if (data.step === "reconnect" || data.step === "resume" || data.step === "waiting") {
+        // These are informational - we stay on the page and wait for owner to complete
+        if (data.step === "waiting") {
+          setLog((prev) => [
+            ...prev.slice(0, -1),
+            {
+              message: "Another generation is in progress. Waiting for it to complete…",
+              done: false,
+            },
+          ]);
+        }
       }
     });
 
@@ -150,6 +171,14 @@ export default function GeneratePage({
 
       // If connection closed and we didn't handle yielded/complete
       if (es.readyState === EventSource.CLOSED && terminalStateRef.current === "none" && !yieldedHandledRef.current) {
+        // Check if we were in a waiting/reconnect state - if so, reconnect automatically
+        const currentStatus = status;
+        if (currentStatus.step === "waiting" || currentStatus.step === "reconnect" || currentStatus.step === "resume") {
+          console.info('[GeneratePage] Reconnecting after observer mode close');
+          setTimeout(() => connectRef.current?.(), 2000); // Reconnect after short delay
+          return;
+        }
+
         // This is an unexpected disconnect (network failure, server crash, etc.)
         setError("Connection lost. Retrying…");
         setTerminalState("failed");
@@ -157,7 +186,16 @@ export default function GeneratePage({
     });
 
     return () => es.close();
-  }, [id, router]);
+  }, [id, router, status]);
+
+  // Store the connect function in a ref for access from event handlers
+  useEffect(() => {
+    connectRef.current = connectImpl;
+  }, [connectImpl]);
+
+  const connect = useCallback(() => {
+    connectImpl();
+  }, [connectImpl]);
 
   // Initial connection on mount
   useEffect(() => {

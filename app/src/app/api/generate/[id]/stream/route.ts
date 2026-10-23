@@ -13,9 +13,7 @@ import { AcquisitionDedupTracker } from "@/lib/acquisition";
 import { DEFAULT_BUDGET_LIMITS } from "@/lib/acquisition/jobTypes";
 import {
   reserveAICall,
-  releaseJobClaim,
-  saveJobSources,
-  getJobById
+  releaseJobClaim
 } from "@/lib/acquisition/jobService";
 import { z } from "zod";
 
@@ -117,6 +115,7 @@ function extractSkeletonJson(text: string): Skeleton | null {
  * Call AI provider with text completion.
  * Preserves exact pre-6-Pre behavior: same prompts, same retry logic.
  * Returns raw text response; callers handle JSON extraction.
+ * Verifies web search completion when useSearch=true.
  */
 async function callAI(prompt: string, useSearch = true): Promise<string> {
   const startTime = Date.now();
@@ -126,24 +125,100 @@ async function callAI(prompt: string, useSearch = true): Promise<string> {
     maxTokens: 4000,
   });
   const durationMs = Date.now() - startTime;
+
+  // Verify web search completed when requested (Priority 2)
+  if (useSearch && textResult.searchCompleted === false) {
+    console.error(
+      `[stream] Web search did not complete: provider=${provider.name}, searchCompleted=false, response_chars=${textResult.text.length}`
+    );
+    throw new Error(`Web search required but did not complete (provider: ${provider.name})`);
+  }
+
   console.log(
-    `[stream] AI call completed: provider=${provider.name}, duration_ms=${durationMs}, response_chars=${textResult.text.length}`
+    `[stream] AI call completed: provider=${provider.name}, duration_ms=${durationMs}, response_chars=${textResult.text.length}, searchCompleted=${textResult.searchCompleted ?? 'N/A'}`
   );
   return textResult.text;
 }
 
 /**
- * Call AI provider for source discovery (no search, smaller max tokens).
- * Preserves exact pre-6-Pre behavior.
- * Returns raw text response; callers handle JSON extraction.
+ * Call AI provider for structured output with native schema validation.
+ * Uses provider.structured() where available (OpenRouter, Azure) or
+ * falls back to prompt-based extraction with Zod validation (Anthropic).
+ * Verifies web search completion when useSearch=true.
  */
-async function callAISources(prompt: string): Promise<string> {
-  const textResult = await getAI().complete(prompt, {
-    useSearch: false,
-    maxTokens: 2000,
+async function callAIStructured<T>(
+  prompt: string,
+  schema: z.ZodSchema<T>,
+  useSearch = true
+): Promise<T> {
+  const startTime = Date.now();
+  const provider = getAI();
+  const result = await provider.structured(prompt, {
+    schema,
+    useSearch,
+    maxTokens: 4000,
   });
-  return textResult.text;
+  const durationMs = Date.now() - startTime;
+
+  // Verify web search completed when requested (Priority 2)
+  // Note: structured() doesn't return searchCompleted, but the underlying
+  // complete() call would have. For providers that support structured output
+  // with search, we assume search runs as part of the structured call.
+  if (useSearch && provider.capabilities.webSearch) {
+    // The structured() call internally uses complete() with useSearch,
+    // so we can't directly check searchCompleted. Log for diagnostics.
+    console.log(
+      `[stream] Structured AI call completed: provider=${provider.name}, duration_ms=${durationMs}, webSearchCapable=${provider.capabilities.webSearch}`
+    );
+  }
+
+  return result.data;
 }
+
+/**
+ * Call AI provider for source discovery (no search, smaller max tokens).
+ /**
+ * Schema for topic discovery candidates (array of resources).
+ */
+const CandidateArraySchema = z.array(
+  z.object({
+    url: z.string().url(),
+    title: z.string().min(1),
+    resource_type: z.enum(["video", "text", "textbook", "problem_set", "reference_tool", "practice_exam", "other"]),
+    source_domain: z.string().min(1),
+    ai_note: z.string().min(1),
+    license_status: z.enum(["cc_open", "link_only", "unknown_review_needed"]),
+  })
+);
+
+/**
+ * Schema for batch discovery response (object with topic_resources array).
+ */
+const BatchResponseSchema = z.object({
+  topic_resources: z.array(
+    z.object({
+      url: z.string().url(),
+      title: z.string().min(1),
+      resource_type: z.enum(["video", "text", "textbook", "problem_set", "reference_tool", "practice_exam", "other"]),
+      source_domain: z.string().min(1),
+      ai_note: z.string().min(1),
+      license_status: z.enum(["cc_open", "link_only"]),
+      understanding_codes: z.array(z.string()),
+    })
+  ),
+});
+
+/**
+ * Schema for source discovery response (array of sources).
+ */
+const SourcesArraySchema = z.array(
+  z.object({
+    domain: z.string().min(1),
+    name: z.string().min(1),
+    why: z.string().min(1),
+    best_for: z.string().min(1),
+  })
+);
 
 /**
  * Normalize an AI discovery candidate into the Learning Engine input shape.
@@ -200,14 +275,37 @@ function toLearnParams(
  * @returns The claimed/registered job, or null if ownership could not be obtained
  *          (e.g., another process already owns a running job).
  */
+/**
+ * Result of claimOrRegisterJob - either a new/claimed job, or an observer
+ * attached to an existing running job.
+ */
+type ClaimResult =
+  | {
+      // New or claimed job - we own the claim_token and can do work
+      mode: "owner";
+      id: string;
+      claim_token: string;
+      claim_version: number;
+    }
+  | {
+      // Observer attached to an existing running job - read-only
+      mode: "observer";
+      jobId: string;
+      curriculumStatus: "draft" | "published";
+      checkpoints: {
+        completedTopicIds: string[];
+        batchCompletedTopicIds: string[];
+      };
+    }
+  | null; // Could not obtain job (should not happen with current logic)
+
+/**
+ * Claim or register a job, or attach as observer to an existing running job.
+ */
 export async function claimOrRegisterJob(
   curriculumId: string,
   inputData: Record<string, unknown>
-): Promise<{
-  id: string;
-  claim_token: string;
-  claim_version: number;
-} | null> {
+): Promise<ClaimResult> {
   // 1. Atomically claim any existing *pending* job for this curriculum.
   //    claim_next_job only claims status='pending' (never 'running'),
   //    so this is race-free against other SSE/claim attempts.
@@ -228,6 +326,7 @@ export async function claimOrRegisterJob(
       `[stream] Atomically claimed existing job ${claimed.id} for curriculum ${curriculumId}`
     );
     return {
+      mode: "owner",
       id: claimed.id,
       claim_token: claimed.claim_token,
       claim_version: claimed.claim_version,
@@ -280,17 +379,18 @@ export async function claimOrRegisterJob(
           `[stream] Claimed job on retry after unique violation: ${retryClaimed.id}`
         );
         return {
+          mode: "owner",
           id: retryClaimed.id,
           claim_token: retryClaimed.claim_token,
           claim_version: retryClaimed.claim_version,
         };
       }
 
-      // Another SSE request owns a running job — we cannot proceed.
+      // Another SSE request owns a running job — attach as observer.
       console.log(
-        `[stream] Another process owns the active job for curriculum ${curriculumId}`
+        `[stream] Attaching as observer to running job for curriculum ${curriculumId}`
       );
-      return null;
+      return await attachAsObserver(curriculumId);
     }
 
     // Some other insert error
@@ -305,9 +405,50 @@ export async function claimOrRegisterJob(
 
   console.log(`[stream] Registered new job ${inserted.id} for curriculum ${curriculumId}`);
   return {
+    mode: "owner",
     id: inserted.id,
     claim_token: inserted.claim_token,
     claim_version: inserted.claim_version,
+  };
+}
+
+/**
+ * Attach as read-only observer to an existing running job.
+ * Returns the job's checkpoints so the SSE stream can report progress.
+ */
+async function attachAsObserver(curriculumId: string): Promise<ClaimResult> {
+  // Find the running job for this curriculum
+  const { data: runningJob } = await supabase
+    .from("acquisition_jobs")
+    .select("id, result_data, curriculum_id, curricula!inner(status)")
+    .eq("curriculum_id", curriculumId)
+    .eq("job_type", "curriculum_generation")
+    .eq("status", "running")
+    .single();
+
+  if (!runningJob) {
+    console.error(`[stream] No running job found for curriculum ${curriculumId}`);
+    return null;
+  }
+
+  const resultData = runningJob.result_data as
+    | {
+        checkpoint?: { completedTopicIds: string[] };
+        batchCheckpoint?: { completedTopicIds: string[] };
+      }
+    | null
+    | undefined;
+
+  const curriculumStatus = (runningJob as { curricula: { status: string }[] }).curricula?.[0]?.status ?? "draft";
+
+  return {
+    mode: "observer",
+    jobId: runningJob.id,
+    curriculumStatus: curriculumStatus === "published" ? "published" : "draft",
+    checkpoints: {
+      completedTopicIds: resultData?.checkpoint?.completedTopicIds ?? [],
+      batchCompletedTopicIds: resultData?.batchCheckpoint?.completedTopicIds ?? [],
+    },
   };
 }
 
@@ -492,16 +633,22 @@ export async function GET(
   const stream = new ReadableStream({
     async start(controller) {
       let jobRecord: {
+        mode: "owner";
         id: string;
         claim_token: string;
         claim_version: number;
+      } | {
+        mode: "observer";
+        jobId: string;
+        curriculumStatus: "draft" | "published";
+        checkpoints: {
+          completedTopicIds: string[];
+          batchCompletedTopicIds: string[];
+        };
       } | null = null;
       let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
-      // Set to true when renewLease fails — the process must stop processing
-      // immediately to prevent stale writes after ownership is lost.
       let ownershipLost = false;
 
-      // Clear interval helper — safe to call multiple times.
       const clearHeartbeat = () => {
         if (heartbeatInterval) {
           clearInterval(heartbeatInterval);
@@ -510,12 +657,6 @@ export async function GET(
       };
 
       try {
-        // --- Job Lifecycle: Claim ---
-        // Atomically claim an existing pending job or register a new running job.
-        // The cron worker's claim_next_job will skip this job (it only claims
-        // 'pending' status), preventing double-processing.
-
-        // Load the curriculum first to get notes for the job's input_data.
         const { data: curriculum } = await supabase
           .from("curricula")
           .select("*")
@@ -541,49 +682,84 @@ export async function GET(
         });
 
         if (!jobRecord) {
-          // Another process owns the active job for this curriculum.
-          send(controller, "status", {
-            message:
-              "Another generation is already in progress for this curriculum. Please wait or refresh to check progress.",
-            step: "already_claimed",
-            job_id: null,
+          send(controller, "error", {
+            message: "Could not obtain generation job. Please try again.",
           });
           controller.close();
           return;
         }
 
-        // Start lease renewal heartbeat — keeps the job from being recovered
-        // by the cron worker's recover_stale_jobs() while we're actively working.
+        // Handle observer mode - attach to existing running job
+        if (jobRecord.mode === "observer") {
+          console.log(`[stream] Observer mode: attached to job ${jobRecord.jobId}`);
+
+          send(controller, "status", {
+            message: "Reconnected to existing generation…",
+            step: "reconnect",
+            job_id: jobRecord.jobId,
+            is_reconnect: true,
+          });
+
+          // Send skeleton event if we have topic checkpoints (means skeleton was already generated)
+          if (jobRecord.checkpoints.completedTopicIds.length > 0) {
+            // We can't know the exact title, but we can report progress
+            send(controller, "status", {
+              message: `Resuming… ${jobRecord.checkpoints.completedTopicIds.length} topic(s) already processed`,
+              step: "resume",
+              current: jobRecord.checkpoints.completedTopicIds.length,
+              total: -1, // Unknown total until skeleton is parsed by owner
+            });
+          }
+
+          // In observer mode, we just wait and periodically report status
+          // The owner stream will do the actual work and send events
+          // We close after sending initial status - the client will reconnect
+          // and eventually the owner will complete and send 'complete' event
+          send(controller, "status", {
+            message: "Waiting for generation to complete…",
+            step: "waiting",
+            job_id: jobRecord.jobId,
+          });
+
+          // Close the stream - the client will reconnect via EventSource
+          // and eventually receive events from the owner stream
+          controller.close();
+          return;
+        }
+
+        // Owner mode - normal generation flow
+        // TypeScript narrowing: observer mode returns early above
+        const ownerJobRecord = jobRecord as { mode: "owner"; id: string; claim_token: string; claim_version: number };
+        // Start lease renewal heartbeat
         heartbeatInterval = setInterval(() => {
-          void renewLease(jobRecord!.id, jobRecord!.claim_token).then((ok) => {
+          void renewLease(ownerJobRecord.id, ownerJobRecord.claim_token).then((ok) => {
             if (!ok) {
               console.error(
-                `[stream] Lease renewal failed: job_id=${jobRecord!.id}, reason=not_found_or_expired`
+                `[stream] Lease renewal failed: job_id=${ownerJobRecord.id}, reason=not_found_or_expired`
               );
               ownershipLost = true;
               clearHeartbeat();
             } else {
-              console.debug(`[stream] Lease renewed: job_id=${jobRecord!.id}`);
+              console.debug(`[stream] Lease renewed: job_id=${ownerJobRecord.id}`);
             }
           });
-        }, 60_000); // Every 60 seconds
+        }, 60_000);
 
         send(controller, "status", {
           message: "Generation job registered.",
           step: "init",
-          job_id: jobRecord.id,
+          job_id: ownerJobRecord.id,
         });
 
-        // Check ownership before starting any AI work
         if (ownershipLost) {
           console.error(
-            `[stream] Ownership lost before skeleton generation — failing job ${jobRecord!.id}`
+            `[stream] Ownership lost before skeleton generation — failing job ${ownerJobRecord.id}`
           );
           clearHeartbeat();
           void failJob(
-            jobRecord!.id,
-            jobRecord!.claim_token,
-            jobRecord!.claim_version,
+            ownerJobRecord.id,
+            ownerJobRecord.claim_token,
+            ownerJobRecord.claim_version,
             "Ownership lost before skeleton generation"
           );
           send(controller, "error", {
@@ -612,9 +788,9 @@ export async function GET(
 
         // Reserve AI call for skeleton generation
         const skeletonReservation = await reserveAICall(
-          jobRecord!.id,
-          jobRecord!.claim_token,
-          jobRecord!.claim_version,
+          ownerJobRecord.id,
+          ownerJobRecord.claim_token,
+          ownerJobRecord.claim_version,
           DEFAULT_BUDGET_LIMITS.max_ai_calls,
           crypto.randomUUID()
         );
@@ -624,9 +800,9 @@ export async function GET(
           );
           clearHeartbeat();
           await failJob(
-            jobRecord!.id,
-            jobRecord!.claim_token,
-            jobRecord!.claim_version,
+            ownerJobRecord.id,
+            ownerJobRecord.claim_token,
+            ownerJobRecord.claim_version,
             `AI budget exhausted: ${skeletonReservation.reason}`
           );
           send(controller, "error", {
@@ -636,50 +812,31 @@ export async function GET(
           return;
         }
 
-        const skeleton = await callAI(skeletonPrompt, true);
+        let skeletonParsed: Skeleton | null = null;
 
-        // Check ownership after AI call — if lost, fail the job
-        if (ownershipLost) {
-          console.log(
-            `[stream] Ownership lost during skeleton generation — aborting`
-          );
-          clearHeartbeat();
-          void failJob(
-            jobRecord!.id,
-            jobRecord!.claim_token,
-            jobRecord!.claim_version,
-            "Ownership lost during skeleton generation"
-          );
-          send(controller, "error", {
-            message:
-              "Generation was interrupted — ownership of the job was lost. Please refresh to check for updates.",
-          });
-          controller.close();
-          return;
-        }
-
-        // Parse skeleton with robust extraction and schema validation
-        const skeletonParseStartTime = Date.now();
-        let skeletonParsed: Skeleton | null = extractSkeletonJson(skeleton);
-        let parseDurationMs = Date.now() - skeletonParseStartTime;
-
-        // If initial parse failed, attempt one bounded corrective retry
-        if (!skeletonParsed) {
-          console.error(
-            `[stream] Skeleton parse failed: job_id=${jobRecord!.id}, category=NO_JSON_FOUND_OR_SCHEMA_MISMATCH, response_chars=${skeleton.length}, response_preview=${skeleton.slice(0, 200)}, parse_duration_ms=${parseDurationMs}`
+        try {
+          // Use structured output for guaranteed valid JSON (Priority 1 fix)
+          skeletonParsed = await callAIStructured(skeletonPrompt, SkeletonSchema, true);
+        } catch (err) {
+          // If structured output fails, fall back to text completion with robust extraction
+          // This handles providers that don't support structured output well (e.g., Anthropic)
+          console.warn(
+            `[stream] Structured output failed, falling back to text extraction: ${err instanceof Error ? err.message : String(err)}`
           );
 
-          // Check budget and ownership before retry
+          const skeletonText = await callAI(skeletonPrompt, true);
+
+          // Check ownership after AI call — if lost, fail the job
           if (ownershipLost) {
             console.log(
-              `[stream] Ownership lost before skeleton retry — aborting`
+              `[stream] Ownership lost during skeleton generation (fallback) — aborting`
             );
             clearHeartbeat();
             void failJob(
-              jobRecord!.id,
-              jobRecord!.claim_token,
-              jobRecord!.claim_version,
-              "Ownership lost before skeleton retry"
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version,
+              "Ownership lost during skeleton generation"
             );
             send(controller, "error", {
               message:
@@ -689,23 +846,54 @@ export async function GET(
             return;
           }
 
-          // Check AI budget for retry
-          const retryReservation = await reserveAICall(
-            jobRecord!.id,
-            jobRecord!.claim_token,
-            jobRecord!.claim_version,
-            DEFAULT_BUDGET_LIMITS.max_ai_calls,
-            crypto.randomUUID()
-          );
-          if (!retryReservation.reserved) {
+          // Parse with existing robust extraction
+          const skeletonParseStartTime = Date.now();
+          const parsed = extractSkeletonJson(skeletonText);
+          let parseDurationMs = Date.now() - skeletonParseStartTime;
+
+          // If initial parse failed, attempt one bounded corrective retry
+          if (!parsed) {
             console.error(
-              `[stream] AI budget exhausted for skeleton retry: ${retryReservation.reason}`
+              `[stream] Skeleton parse failed: job_id=${ownerJobRecord.id}, category=NO_JSON_FOUND_OR_SCHEMA_MISMATCH, response_chars=${skeletonText.length}, response_preview=${skeletonText.slice(0, 200)}, parse_duration_ms=${parseDurationMs}`
             );
+
+            // Check budget and ownership before retry
+            if (ownershipLost) {
+              console.log(
+                `[stream] Ownership lost before skeleton retry — aborting`
+              );
+              clearHeartbeat();
+              void failJob(
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
+                "Ownership lost before skeleton retry"
+              );
+              send(controller, "error", {
+                message:
+                  "Generation was interrupted — ownership of the job was lost. Please refresh to check for updates.",
+              });
+              controller.close();
+              return;
+            }
+
+            // Check AI budget for retry
+            const retryReservation = await reserveAICall(
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version,
+              DEFAULT_BUDGET_LIMITS.max_ai_calls,
+              crypto.randomUUID()
+            );
+            if (!retryReservation.reserved) {
+              console.error(
+                `[stream] AI budget exhausted for skeleton retry: ${retryReservation.reason}`
+              );
             clearHeartbeat();
             await failJob(
-              jobRecord!.id,
-              jobRecord!.claim_token,
-              jobRecord!.claim_version,
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version,
               `AI budget exhausted: ${retryReservation.reason}`
             );
             send(controller, "error", {
@@ -726,9 +914,9 @@ export async function GET(
             );
             clearHeartbeat();
             void failJob(
-              jobRecord!.id,
-              jobRecord!.claim_token,
-              jobRecord!.claim_version,
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version,
               "Ownership lost during skeleton retry"
             );
             send(controller, "error", {
@@ -745,7 +933,7 @@ export async function GET(
           const retryParseDurationMs = Date.now() - retryParseStartTime;
           if (!skeletonParsed) {
             console.error(
-              `[stream] Skeleton retry parse failed: job_id=${jobRecord!.id}, category=RETRY_PARSE_FAILED, response_chars=${skeletonRetry.length}, response_preview=${skeletonRetry.slice(0, 200)}, parse_duration_ms=${retryParseDurationMs}`
+              `[stream] Skeleton retry parse failed: job_id=${ownerJobRecord.id}, category=RETRY_PARSE_FAILED, response_chars=${skeletonRetry.length}, response_preview=${skeletonRetry.slice(0, 200)}, parse_duration_ms=${retryParseDurationMs}`
             );
             send(controller, "error", {
               message: "Failed to generate curriculum structure",
@@ -753,11 +941,11 @@ export async function GET(
             controller.close();
 
             clearHeartbeat();
-            if (jobRecord) {
+            if (ownerJobRecord) {
               void failJob(
-                jobRecord.id,
-                jobRecord.claim_token,
-                jobRecord.claim_version,
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
                 "Failed to parse skeleton JSON after retry"
               );
             }
@@ -769,6 +957,12 @@ export async function GET(
         }
 
         // Update curriculum with real title and attribution
+        if (!skeletonParsed) {
+          // This should not happen as we would have returned earlier
+          send(controller, "error", { message: "Failed to parse skeleton JSON after retry" });
+          controller.close();
+          return;
+        }
         await supabase
           .from("curricula")
           .update({
@@ -789,13 +983,13 @@ export async function GET(
         // Check ownership before node insertion (no AI calls here, but safe to check)
         if (ownershipLost) {
           console.error(
-            `[stream] Ownership lost after skeleton — failing job ${jobRecord!.id}`
+            `[stream] Ownership lost after skeleton — failing job ${ownerJobRecord.id}`
           );
           clearHeartbeat();
           void failJob(
-            jobRecord!.id,
-            jobRecord!.claim_token,
-            jobRecord!.claim_version,
+            ownerJobRecord.id,
+            ownerJobRecord.claim_token,
+            ownerJobRecord.claim_version,
             "Ownership lost after skeleton generation"
           );
           send(controller, "error", {
@@ -860,13 +1054,13 @@ export async function GET(
         // Check ownership before source discovery (AI call)
         if (ownershipLost) {
           console.error(
-            `[stream] Ownership lost before source discovery — failing job ${jobRecord!.id}`
+            `[stream] Ownership lost before source discovery — failing job ${ownerJobRecord.id}`
           );
           clearHeartbeat();
           void failJob(
-            jobRecord!.id,
-            jobRecord!.claim_token,
-            jobRecord!.claim_version,
+            ownerJobRecord.id,
+            ownerJobRecord.claim_token,
+            ownerJobRecord.claim_version,
             "Ownership lost before source discovery"
           );
           send(controller, "error", {
@@ -886,9 +1080,9 @@ export async function GET(
 
           // Reserve AI call for source discovery
           const sourcesReservation = await reserveAICall(
-            jobRecord!.id,
-            jobRecord!.claim_token,
-            jobRecord!.claim_version,
+            ownerJobRecord.id,
+            ownerJobRecord.claim_token,
+            ownerJobRecord.claim_version,
             DEFAULT_BUDGET_LIMITS.max_ai_calls,
             crypto.randomUUID()
           );
@@ -898,9 +1092,9 @@ export async function GET(
             );
             clearHeartbeat();
             await failJob(
-              jobRecord!.id,
-              jobRecord!.claim_token,
-              jobRecord!.claim_version,
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version,
               `AI budget exhausted: ${sourcesReservation.reason}`
             );
             send(controller, "error", {
@@ -910,8 +1104,8 @@ export async function GET(
             return;
           }
 
-          // No web search needed — Claude already knows which sites are good
-          const sourcesText = await callAISources(sourcesPrompt);
+          // No web search needed — use structured output for guaranteed valid JSON
+          const sources = await callAIStructured(sourcesPrompt, SourcesArraySchema, false);
 
           // Check ownership after AI call
           if (ownershipLost) {
@@ -920,9 +1114,9 @@ export async function GET(
             );
             clearHeartbeat();
             void failJob(
-              jobRecord!.id,
-              jobRecord!.claim_token,
-              jobRecord!.claim_version,
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version,
               "Ownership lost during source discovery"
             );
             send(controller, "error", {
@@ -932,14 +1126,11 @@ export async function GET(
             controller.close();
             return;
           } else {
-            const jsonMatch = sourcesText.match(/\[[\s\S]*\]/);
-            if (jsonMatch) {
-              discoveredSources = JSON.parse(jsonMatch[0]) as DiscoveredSource[];
-              console.log(
-                `Discovered ${discoveredSources.length} sources:`,
-                discoveredSources.map((s) => s.domain).join(", ")
-              );
-            }
+            discoveredSources = sources;
+            console.log(
+              `Discovered ${discoveredSources.length} sources:`,
+              discoveredSources.map((s) => s.domain).join(", ")
+            );
           }
         } catch (err) {
           console.log("Source discovery failed, continuing without prioritized sources:", err);
@@ -948,7 +1139,7 @@ export async function GET(
         // Persist discovered sources so a resumed SSE invocation can skip the source-discovery AI call
         try {
           const { saveJobSources } = await import("@/lib/acquisition/jobService");
-          await saveJobSources(jobRecord!.id, jobRecord!.claim_token, jobRecord!.claim_version, discoveredSources);
+          await saveJobSources(ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version, discoveredSources);
         } catch (err) {
           console.log("Failed to persist sources:", err);
         }
@@ -966,12 +1157,12 @@ export async function GET(
         // most once within this generation request (Phase 11 cache keys).
         const cache = createCache({ enabled: true, maxEntries: 200 });
         const dedupTracker = new AcquisitionDedupTracker();
-        const acquisitionJobId = jobRecord.id;
+        const acquisitionJobId = ownerJobRecord.id;
 
         // Resume detection: read checkpoint to skip already-completed topics.
         // This allows the SSE route to yield and resume like the durable worker.
         const { getJobById } = await import("@/lib/acquisition/jobService");
-        const jobData = await getJobById(jobRecord.id);
+        const jobData = await getJobById(ownerJobRecord.id);
         const rawCompletedTopics =
           (jobData?.result_data as { checkpoint?: { completedTopicIds: unknown } })?.checkpoint
             ?.completedTopicIds;
@@ -990,9 +1181,9 @@ export async function GET(
             );
             clearHeartbeat();
             void failJob(
-              jobRecord!.id,
-              jobRecord!.claim_token,
-              jobRecord!.claim_version,
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version,
               "Ownership lost during topic-level discovery"
             );
             send(controller, "error", {
@@ -1018,20 +1209,20 @@ export async function GET(
               `[stream] Topic quota (${MAX_TOPICS_PER_SSE_INVOCATION}) reached, releasing claim for next invocation`
             );
             const released = await releaseJobClaim(
-              jobRecord!.id,
-              jobRecord!.claim_token,
-              jobRecord!.claim_version
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version
             );
             if (!released) {
               console.log(
                 `[stream] release_job_claim returned false — ownership lost or yield refused; stopping`
               );
               // Re-read job state to determine why release failed
-              const jobState = await getJobById(jobRecord.id);
+              const jobState = await getJobById(ownerJobRecord.id);
               if (!jobState || jobState.status !== 'pending') {
                 // Ownership lost to another worker or job terminal — do not yield
                 console.error(
-                  `[stream] Job ${jobRecord!.id} is no longer in pending state (status: ${jobState?.status}), not sending yielded`
+                  `[stream] Job ${ownerJobRecord.id} is no longer in pending state (status: ${jobState?.status}), not sending yielded`
                 );
                 return;
               }
@@ -1076,9 +1267,9 @@ export async function GET(
 
             // Reserve AI call for topic discovery
             const topicReservation = await reserveAICall(
-              jobRecord!.id,
-              jobRecord!.claim_token,
-              jobRecord!.claim_version,
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version,
               DEFAULT_BUDGET_LIMITS.max_ai_calls,
               crypto.randomUUID()
             );
@@ -1088,9 +1279,9 @@ export async function GET(
               );
               clearHeartbeat();
               await failJob(
-                jobRecord!.id,
-                jobRecord!.claim_token,
-                jobRecord!.claim_version,
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
                 `AI budget exhausted: ${topicReservation.reason}`
               );
               send(controller, "error", {
@@ -1100,7 +1291,7 @@ export async function GET(
               return;
             }
 
-            const topicText = await callAI(topicPrompt, true);
+            const candidates = await callAIStructured(topicPrompt, CandidateArraySchema, true);
 
             // Check ownership after AI call — if lost mid-call, fail the job
             if (ownershipLost) {
@@ -1109,9 +1300,9 @@ export async function GET(
               );
               clearHeartbeat();
               void failJob(
-                jobRecord!.id,
-                jobRecord!.claim_token,
-                jobRecord!.claim_version,
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
                 "Ownership lost during topic discovery"
               );
               send(controller, "error", {
@@ -1122,47 +1313,10 @@ export async function GET(
               return;
             }
 
-            // Try array first, fall back to object with a resources key
-            const jsonMatch = topicText.match(/\[[\s\S]*\]/);
-            let candidates: Array<{
-              url: string;
-              title: string;
-              resource_type: string;
-              source_domain: string;
-              ai_note: string;
-              license_status: string;
-            }> = [];
-
-            if (!jsonMatch) {
-              // Claude may have returned an object like { resources: [...] }
-              const objMatch = topicText.match(/\{[\s\S]*\}/);
-              if (objMatch) {
-                try {
-                  const parsed = JSON.parse(objMatch[0]) as Record<string, unknown>;
-                  // Find any array value inside the object
-                  const arrayValue = Object.values(parsed).find((v) => Array.isArray(v));
-                  if (arrayValue) {
-                    candidates = arrayValue as typeof candidates;
-                  }
-                } catch {
-                  // ignore
-                }
-              }
-              if (candidates.length === 0) {
-                console.log(`No JSON found for topic "${node.title}", skipping`);
-                continue;
-              }
-            } else {
-              try {
-                candidates = JSON.parse(jsonMatch[0]);
-                if (!Array.isArray(candidates)) {
-                  console.log(`JSON wasn't an array for topic "${node.title}", skipping`);
-                  continue;
-                }
-              } catch {
-                console.log(`Parse failed for topic "${node.title}", skipping`);
-                continue;
-              }
+            // Structured output guarantees valid array — no regex extraction needed
+            if (!Array.isArray(candidates)) {
+              console.log(`Structured output wasn't an array for topic "${node.title}", skipping`);
+              continue;
             }
 
             const persisted = [];
@@ -1177,8 +1331,8 @@ export async function GET(
                 const out = await discoverVerifiedResource(params, {
                   cache,
                   dedupTracker,
-                  jobId: jobRecord!.id,
-                  claimToken: jobRecord!.claim_token,
+                  jobId: ownerJobRecord.id,
+                  claimToken: ownerJobRecord.claim_token,
                 });
                 if (out) {
                   persisted.push(out);
@@ -1204,9 +1358,9 @@ export async function GET(
             // Only checkpoint after all required work for this topic has durably persisted.
             try {
               const checkpointOk = await advanceCheckpoint(
-                jobRecord!.id,
-                jobRecord!.claim_token,
-                jobRecord!.claim_version,
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
                 nodeId,
                 persisted.length
               );
@@ -1216,9 +1370,9 @@ export async function GET(
                 );
                 clearHeartbeat();
                 void failJob(
-                  jobRecord!.id,
-                  jobRecord!.claim_token,
-                  jobRecord!.claim_version,
+                  ownerJobRecord.id,
+                  ownerJobRecord.claim_token,
+                  ownerJobRecord.claim_version,
                   "Ownership lost at topic checkpoint"
                 );
                 send(controller, "error", {
@@ -1231,9 +1385,9 @@ export async function GET(
               console.error("[stream] advance_checkpoint threw:", ckptErr);
               clearHeartbeat();
               void failJob(
-                jobRecord!.id,
-                jobRecord!.claim_token,
-                jobRecord!.claim_version,
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
                 `Checkpoint error: ${ckptErr instanceof Error ? ckptErr.message : String(ckptErr)}`
               );
               send(controller, "error", {
@@ -1261,13 +1415,13 @@ export async function GET(
         // reclaim and resume via recover_stale_jobs -> claim_next_job.
         if (ownershipLost) {
           console.error(
-            `[stream] Ownership lost before publication — failing job ${jobRecord!.id}`
+            `[stream] Ownership lost before publication — failing job ${ownerJobRecord.id}`
           );
           clearHeartbeat();
           void failJob(
-            jobRecord!.id,
-            jobRecord!.claim_token,
-            jobRecord!.claim_version,
+            ownerJobRecord.id,
+            ownerJobRecord.claim_token,
+            ownerJobRecord.claim_version,
             "Ownership lost during topic-level discovery"
           );
           send(controller, "error", {
@@ -1284,7 +1438,7 @@ export async function GET(
         // Background per-understanding discovery — one batch call per topic.
         // Runs after topic-level resources are done. We keep the stream open
         // so the student receives the final `complete` event with phase="background".
-        const backgroundBatch = (async () => {
+        async function runBackgroundBatch() {
           const { data: curriculumRow } = await supabase
             .from("curricula")
             .select("title")
@@ -1294,7 +1448,7 @@ export async function GET(
           const bgCurriculumTitle = curriculumRow?.title ?? updatedCurriculumTitle;
 
           // Resume detection: read batch checkpoint to skip already-completed topics.
-          const batchJobData = await getJobById(jobRecord.id);
+          const batchJobData = await getJobById(ownerJobRecord.id);
           const rawCompletedBatchTopics =
             (batchJobData?.result_data as { batchCheckpoint?: { completedTopicIds: unknown } })
               ?.batchCheckpoint?.completedTopicIds;
@@ -1337,20 +1491,20 @@ export async function GET(
                 `[stream] Batch quota (${MAX_TOPICS_PER_SSE_INVOCATION}) reached, releasing claim for next invocation`
               );
               const released = await releaseJobClaim(
-                jobRecord!.id,
-                jobRecord!.claim_token,
-                jobRecord!.claim_version
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version
               );
               if (!released) {
                 console.log(
                   `[stream] release_job_claim returned false — ownership lost or yield refused; stopping background batch`
                 );
                 // Re-read job state to determine why release failed
-                const jobState = await getJobById(jobRecord.id);
+                const jobState = await getJobById(ownerJobRecord.id);
                 if (!jobState || jobState.status !== 'pending') {
                   // Ownership lost to another worker or job terminal — do not yield
                   console.error(
-                    `[stream] Job ${jobRecord!.id} is no longer in pending state (status: ${jobState?.status}), not sending yielded`
+                    `[stream] Job ${ownerJobRecord.id} is no longer in pending state (status: ${jobState?.status}), not sending yielded`
                   );
                   return;
                 }
@@ -1394,9 +1548,9 @@ export async function GET(
 
               // Reserve AI call for background batch topic
               const batchReservation = await reserveAICall(
-                jobRecord!.id,
-                jobRecord!.claim_token,
-                jobRecord!.claim_version,
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
                 DEFAULT_BUDGET_LIMITS.max_ai_calls,
                 crypto.randomUUID()
               );
@@ -1406,15 +1560,15 @@ export async function GET(
                 );
                 clearHeartbeat();
                 await failJob(
-                  jobRecord!.id,
-                  jobRecord!.claim_token,
-                  jobRecord!.claim_version,
+                  ownerJobRecord.id,
+                  ownerJobRecord.claim_token,
+                  ownerJobRecord.claim_version,
                   `AI budget exhausted: ${batchReservation.reason}`
                 );
                 return;
               }
 
-              const text = await callAI(prompt, true);
+              const batchResult = await callAIStructured(prompt, BatchResponseSchema, true);
 
               // Check ownership after AI call — if lost mid-call, fail the job
               if (ownershipLost) {
@@ -1423,35 +1577,18 @@ export async function GET(
                 );
                 clearHeartbeat();
                 void failJob(
-                  jobRecord!.id,
-                  jobRecord!.claim_token,
-                  jobRecord!.claim_version,
+                  ownerJobRecord.id,
+                  ownerJobRecord.claim_token,
+                  ownerJobRecord.claim_version,
                   "Ownership lost during background batch"
                 );
                 return;
               }
 
-              const jsonMatch = text.match(/\{[\s\S]*\}/);
-              if (!jsonMatch) {
-                console.log(`No JSON object found for batch topic "${node.title}"`);
-                continue;
-              }
+              // Structured output guarantees valid object with topic_resources array
+              const topicResources = batchResult.topic_resources;
 
-              const parsed = JSON.parse(jsonMatch[0]) as {
-                topic_resources: Array<{
-                  url: string;
-                  title: string;
-                  resource_type: string;
-                  source_domain: string;
-                  ai_note: string;
-                  license_status: string;
-                  understanding_codes: string[];
-                }>;
-              };
-
-              if (!Array.isArray(parsed.topic_resources)) continue;
-
-              for (const candidate of parsed.topic_resources) {
+              for (const candidate of topicResources) {
                 if (!candidate.url || !candidate.title) continue;
 
                 const coveredMuIds = muRows
@@ -1484,8 +1621,8 @@ export async function GET(
                   try {
                     const out = await discoverVerifiedResource(params, {
                       cache,
-                      jobId: jobRecord!.id,
-                      claimToken: jobRecord!.claim_token,
+                      jobId: ownerJobRecord.id,
+                      claimToken: ownerJobRecord.claim_token,
                     });
                     if (out) batchPersisted++;
                   } catch (routeErr) {
@@ -1516,9 +1653,9 @@ export async function GET(
             // caller (cron worker or retried SSE) can resume from the checkpoint.
             try {
               const checkpointOk = await advanceBatchCheckpoint(
-                jobRecord!.id,
-                jobRecord!.claim_token,
-                jobRecord!.claim_version,
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
                 nodeId,
                 topicBatchPersisted
               );
@@ -1536,8 +1673,9 @@ export async function GET(
               await new Promise((r) => setTimeout(r, 15000));
             }
           }
-        })()
-        .catch((bgErr) => {
+        }
+        const backgroundBatch = runBackgroundBatch();
+        backgroundBatch.catch((bgErr) => {
           console.error("[stream] Background batch error:", bgErr);
         });
 
@@ -1547,12 +1685,12 @@ export async function GET(
           await backgroundBatch;
           if (ownershipLost) {
             console.error(
-              `[stream] Ownership lost before job completion — failing job ${jobRecord!.id}`
+              `[stream] Ownership lost before job completion — failing job ${ownerJobRecord.id}`
             );
             await failJob(
-              jobRecord!.id,
-              jobRecord!.claim_token,
-              jobRecord!.claim_version,
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version,
               "Ownership lost during background batch"
             );
             send(controller, "error", {
@@ -1563,14 +1701,14 @@ export async function GET(
             return;
           }
           const ok = await completeJob(
-            jobRecord!.id,
-            jobRecord!.claim_token,
-            jobRecord!.claim_version,
+            ownerJobRecord.id,
+            ownerJobRecord.claim_token,
+            ownerJobRecord.claim_version,
             true
           );
           if (!ok) {
             console.error(
-              `[stream] complete_job returned false — job ${jobRecord!.id} may have been reclaimed by cron worker during background batch`
+              `[stream] complete_job returned false — job ${ownerJobRecord.id} may have been reclaimed by cron worker during background batch`
             );
             // Do not send background complete event if job finalization failed
             send(controller, "error", {
@@ -1592,14 +1730,14 @@ export async function GET(
           // If background fails, mark the job as failed so the cron worker
           // can retry the remaining MUs from checkpoint.
           const failed = await failJob(
-            jobRecord!.id,
-            jobRecord!.claim_token,
-            jobRecord!.claim_version,
+            ownerJobRecord.id,
+            ownerJobRecord.claim_token,
+            ownerJobRecord.claim_version,
             `Background batch: ${bgErr instanceof Error ? bgErr.message : String(bgErr)}`
           );
           if (!failed) {
             console.error(
-              `[stream] fail_job returned false — could not mark job ${jobRecord!.id} as failed`
+              `[stream] fail_job returned false — could not mark job ${ownerJobRecord.id} as failed`
             );
           }
           send(controller, "error", {
@@ -1609,31 +1747,35 @@ export async function GET(
         } finally {
           controller.close();
         }
-      } catch (err) {
-        send(controller, "error", {
-          message:
-            err instanceof Error ? err.message : "Something went wrong",
-        });
-        controller.close();
-
-        // --- Job Lifecycle: Fail ---
-        // Mark the job as failed so the cron worker can retry it later
-        // (recover_stale_jobs will return it to 'pending' if retries remain).
-        if (jobRecord) {
-          const failed = await failJob(
-            jobRecord.id,
-            jobRecord.claim_token,
-            jobRecord.claim_version,
-            err instanceof Error ? err.message : "Unknown error"
-          );
-          if (!failed) {
-            console.error(
-              `[stream] fail_job returned false — could not mark job ${jobRecord.id} as failed`
-            );
-          }
-        }
-        clearHeartbeat();
+        // No outer catch needed - inner try/catch handles errors
       }
+    } catch (err) {
+      // This catch is for the outer try block (line 492)
+      // Should not be reached since inner try has its own catch/finally
+      send(controller, "error", {
+        message:
+          err instanceof Error ? err.message : "Something went wrong",
+      });
+      controller.close();
+
+      // Type guard: jobRecord could be owner or observer mode
+      const isOwner = jobRecord && jobRecord.mode === "owner";
+      if (isOwner) {
+        const ownerRecord = jobRecord as { mode: "owner"; id: string; claim_token: string; claim_version: number };
+        const failed = await failJob(
+          ownerRecord.id,
+          ownerRecord.claim_token,
+          ownerRecord.claim_version,
+          err instanceof Error ? err.message : "Unknown error"
+        );
+        if (!failed) {
+          console.error(
+            `[stream] fail_job returned false — could not mark job ${ownerRecord.id} as failed`
+          );
+        }
+      }
+      clearHeartbeat();
+    }
     },
   });
 

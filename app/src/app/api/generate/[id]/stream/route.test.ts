@@ -1213,7 +1213,7 @@ describe("Skeleton retry with budget/ownership checks", () => {
     } as any);
 
     // Simulate ownership loss during retry
-    let renewCallCount = 0;
+    const renewCallCount = 0;
     setRpcSequenced("renew_lease", [
       { data: true, error: null }, // initial heartbeat
       { data: false, error: null }, // ownership lost during retry
