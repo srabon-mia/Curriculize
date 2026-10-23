@@ -424,6 +424,100 @@ function createMockRequest(id: string): Request {
   });
 }
 
+async function consumeSseEvents(
+  response: Response,
+  deadlineMs = 10_000,
+  scheduleTimeout: typeof setTimeout = setTimeout
+): Promise<string[]> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("SSE response did not include a readable body");
+
+  const events: string[] = [];
+  let streamDone = false;
+  let readPending = false;
+  let activeRead: Promise<ReadableStreamReadResult<Uint8Array>> | null = null;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    deadlineTimer = scheduleTimeout(
+      () => reject(new Error(`SSE stream did not close within ${deadlineMs}ms`)),
+      deadlineMs
+    );
+  });
+
+  try {
+    while (true) {
+      readPending = true;
+      activeRead = reader.read().then(
+        (result) => {
+          readPending = false;
+          return result;
+        },
+        (error) => {
+          readPending = false;
+          throw error;
+        }
+      );
+      const { done, value } = await Promise.race([activeRead, deadline]);
+      activeRead = null;
+      if (done) {
+        streamDone = true;
+        break;
+      }
+      events.push(new TextDecoder().decode(value));
+    }
+    return events;
+  } finally {
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+
+    if (!streamDone) {
+      const cancelPromise = Promise.resolve()
+        .then(() => reader.cancel())
+        .catch(() => undefined);
+      let cancelTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        cancelPromise,
+        new Promise<void>((resolve) => {
+          cancelTimer = scheduleTimeout(resolve, 250);
+        }),
+      ]);
+      if (cancelTimer !== undefined) clearTimeout(cancelTimer);
+
+      if (readPending && activeRead) {
+        let settleTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          activeRead.then(() => undefined, () => undefined),
+          new Promise<void>((resolve) => {
+            settleTimer = scheduleTimeout(resolve, 250);
+          }),
+        ]);
+        if (settleTimer !== undefined) clearTimeout(settleTimer);
+      }
+    }
+
+    if (!readPending) {
+      try { reader.releaseLock(); } catch { /* reader still owns a pending read */ }
+    }
+  }
+}
+
+async function runStreamAndCaptureEvents(
+  curriculumId = "test-curriculum-id"
+): Promise<string[]> {
+  const response = await GET(createMockRequest(curriculumId), {
+    params: Promise.resolve({ id: curriculumId }),
+  });
+  return consumeSseEvents(response);
+}
+
+function parseSseEvent(chunk: string): { event: string | undefined; data: any } {
+  const event = chunk.match(/^event: ([^\r\n]+)/m)?.[1];
+  const dataLine = chunk.split(/\r?\n/).find((line) => line.startsWith("data: "));
+  return {
+    event,
+    data: dataLine ? JSON.parse(dataLine.slice("data: ".length)) : undefined,
+  };
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -474,21 +568,28 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     mockAIInstance = undefined as any;
   });
 
-  async function runStreamAndCapture(curriculumId: string = "test-curriculum-id") {
+  async function runStreamAndCapture(
+    curriculumId: string = "test-curriculum-id",
+    assertSkeletonEvent = false
+  ): Promise<any[]> {
     mockAIInstance.setDefaultResponse({
       completeText: createMockSkeletonResponse(),
+      structuredData: JSON.parse(createMockSkeletonResponse()),
       usage: { inputTokens: 100, outputTokens: 50 },
     });
     mockAIInstance.setResponse("sources prompt", {
       completeText: createMockSourcesResponse(),
+      structuredData: JSON.parse(createMockSourcesResponse()),
       usage: { inputTokens: 50, outputTokens: 25 },
     });
     mockAIInstance.setResponse("discover prompt", {
       completeText: createMockDiscoverResponse(),
+      structuredData: JSON.parse(createMockDiscoverResponse()),
       usage: { inputTokens: 100, outputTokens: 50 },
     });
     mockAIInstance.setResponse("batch prompt", {
       completeText: createMockBatchResponse(),
+      structuredData: JSON.parse(createMockBatchResponse()),
       usage: { inputTokens: 100, outputTokens: 50 },
     });
 
@@ -497,12 +598,9 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       params: Promise.resolve({ id: curriculumId }),
     });
 
-    const reader = response.body?.getReader();
-    if (reader) {
-      while (true) {
-        const { done } = await reader.read();
-        if (done) break;
-      }
+    const events = await consumeSseEvents(response, 10_000, originalSetTimeout);
+    if (assertSkeletonEvent) {
+      expect(events.map(parseSseEvent).some((event) => event.event === "skeleton")).toBe(true);
     }
 
     // Drain background batch microtasks — background batch runs after
@@ -526,7 +624,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
   // ============================================================
 
   it("emits the unchanged SSE contract (status/skeleton/complete) while routing through the Learning Engine", async () => {
-    const resources = await runStreamAndCapture();
+    const resources = await runStreamAndCapture("test-curriculum-id", true);
 
     const topicLevel = resources.filter((r) => r.node_id && r.major_understanding_id === null);
     const batchLevel = resources.filter((r) => r.major_understanding_id && r.node_id === null);
@@ -1129,6 +1227,47 @@ describe("Skeleton JSON parsing robustness", () => {
 // ============================================================
 
 describe("Skeleton retry with budget/ownership checks", () => {
+  let originalSetInterval: typeof global.setInterval;
+  let heartbeatCallback: (() => void) | undefined;
+  let heartbeatTimer: ReturnType<typeof global.setInterval> | undefined;
+
+  beforeEach(() => {
+    originalSetInterval = global.setInterval;
+    heartbeatCallback = undefined;
+    heartbeatTimer = undefined;
+    vi.clearAllMocks();
+    resetRpcOverrides();
+    resetRpcSequences();
+    capturedInserts.length = 0;
+    capturedNodeInserts.length = 0;
+    capturedMuInserts.length = 0;
+    // Capture the route's normal 60-second heartbeat and let each test invoke
+    // it at a deterministic point in the mocked AI call.
+    vi.spyOn(global, "setInterval").mockImplementation((callback) => {
+      heartbeatCallback = callback;
+      heartbeatTimer = originalSetInterval(() => {}, 60_000);
+      return heartbeatTimer;
+    });
+  });
+
+  afterEach(() => {
+    if (heartbeatTimer !== undefined) global.clearInterval(heartbeatTimer);
+    vi.restoreAllMocks();
+    heartbeatCallback = undefined;
+    heartbeatTimer = undefined;
+    resetRpcOverrides();
+    resetRpcSequences();
+  });
+
+  async function runHeartbeatNow(): Promise<void> {
+    if (!heartbeatCallback) throw new Error("Route heartbeat was not registered");
+    heartbeatCallback();
+    // renewLease awaits the already-resolved RPC mock; flush its continuation
+    // and the route's .then callback before the mocked AI response resolves.
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
   it("attempts at most one corrective retry on parse failure", async () => {
     // First response: invalid JSON
     // Second response: valid JSON
@@ -1146,11 +1285,11 @@ describe("Skeleton retry with budget/ownership checks", () => {
       capabilities: { structuredOutput: false, webSearch: false, streaming: false },
     } as any);
 
-    const events = await runStreamAndCapture();
+    const events = await runStreamAndCaptureEvents();
 
-    const skeletonEvents = events.filter((e) => e.includes('"skeleton"'));
+    const skeletonEvents = events.map(parseSseEvent).filter((e) => e.event === "skeleton");
     expect(skeletonEvents.length).toBe(1);
-    expect(skeletonEvents[0]).toContain("Retry Success");
+    expect(skeletonEvents[0].data.title).toBe("Retry Success");
     // Should have called AI twice (initial + retry)
     expect(callCount).toBe(2);
   });
@@ -1170,19 +1309,21 @@ describe("Skeleton retry with budget/ownership checks", () => {
       { data: { reserved: false, reason: "budget_exhausted" }, error: null }, // retry reservation fails
     ]);
 
-    const events = await runStreamAndCapture();
+    const events = await runStreamAndCaptureEvents();
 
-    const errorEvents = events.filter((e) => e.includes('"error"'));
+    const errorEvents = events.map(parseSseEvent).filter((e) => e.event === "error");
     expect(errorEvents.length).toBeGreaterThan(0);
-    const errorData = JSON.parse(errorEvents[0].split("data: ")[1]);
-    expect(errorData.message).toBe("AI generation budget exhausted. Please try again later.");
+    expect(errorEvents[0].data.message).toBe("AI generation budget exhausted. Please try again later.");
   });
 
   it("does not retry when ownership is lost before retry", async () => {
     // First response: invalid JSON
     const { getAIProvider } = await import("@/lib/ai");
     vi.mocked(getAIProvider).mockReturnValue({
-      complete: vi.fn().mockResolvedValue({ text: "not valid json", usage: { inputTokens: 100, outputTokens: 50 } }),
+      complete: vi.fn().mockImplementation(async () => {
+        await runHeartbeatNow();
+        return { text: "not valid json", usage: { inputTokens: 100, outputTokens: 50 } };
+      }),
       name: "mock",
       capabilities: { structuredOutput: false, webSearch: false, streaming: false },
     } as any);
@@ -1190,10 +1331,12 @@ describe("Skeleton retry with budget/ownership checks", () => {
     // Simulate ownership loss before retry (set renew_lease to fail)
     setRpcResult("renew_lease", { data: false, error: null });
 
-    const events = await runStreamAndCapture();
+    const events = await runStreamAndCaptureEvents();
 
     // Should not retry - ownership lost
-    const ownershipLostEvents = events.filter((e) => e.includes("ownership"));
+    const ownershipLostEvents = events.map(parseSseEvent).filter(
+      (e) => e.event === "error" && e.data.message.includes("ownership")
+    );
     expect(ownershipLostEvents.length).toBeGreaterThan(0);
   });
 
@@ -1203,6 +1346,7 @@ describe("Skeleton retry with budget/ownership checks", () => {
     vi.mocked(getAIProvider).mockReturnValue({
       complete: vi.fn().mockImplementation(async () => {
         callCount++;
+        await runHeartbeatNow();
         if (callCount === 1) {
           return { text: "not valid json", usage: { inputTokens: 100, outputTokens: 50 } };
         }
@@ -1213,17 +1357,18 @@ describe("Skeleton retry with budget/ownership checks", () => {
     } as any);
 
     // Simulate ownership loss during retry
-    const renewCallCount = 0;
-    setRpcSequenced("renew_lease", [
+    setRpcSequence("renew_lease", [
       { data: true, error: null }, // initial heartbeat
       { data: false, error: null }, // ownership lost during retry
     ]);
 
-    const events = await runStreamAndCapture();
+    const events = await runStreamAndCaptureEvents();
 
     // Should have attempted retry but ownership lost
     expect(callCount).toBe(2);
-    const ownershipLostEvents = events.filter((e) => e.includes("ownership"));
+    const ownershipLostEvents = events.map(parseSseEvent).filter(
+      (e) => e.event === "error" && e.data.message.includes("ownership")
+    );
     expect(ownershipLostEvents.length).toBeGreaterThan(0);
   });
 });

@@ -16,6 +16,7 @@ const eventSourceInstances: Array<{
   addEventListener: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
   readyState: number;
+  listeners: Map<string, (event: Event) => void>;
 }> = [];
 
 class MockEventSourceClass {
@@ -23,17 +24,21 @@ class MockEventSourceClass {
   addEventListener: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
   readyState: number;
+  listeners: Map<string, (event: Event) => void>;
 
   constructor(url: string) {
+    const listeners = new Map<string, (event: Event) => void>();
     const instance = {
-      addEventListener: vi.fn(),
+      addEventListener: vi.fn((type: string, listener: (event: Event) => void) => listeners.set(type, listener)),
       close: vi.fn(),
       readyState: 1, // EventSource.OPEN = 1
+      listeners,
     };
     this.url = url;
     this.addEventListener = instance.addEventListener;
     this.close = instance.close;
     this.readyState = instance.readyState;
+    this.listeners = listeners;
     eventSourceInstances.push(this);
   }
 }
@@ -51,7 +56,7 @@ vi.mock("react", async () => {
   const actualReact = await vi.importActual("react");
   return {
     ...actualReact,
-    use: vi.fn((promise: Promise<{ id: string }>) => {
+    use: vi.fn(() => {
       // Return the resolved value for testing
       return { id: "test-curriculum-id" };
     }),
@@ -59,7 +64,7 @@ vi.mock("react", async () => {
 });
 
 describe("GeneratePage - EventSource connection", () => {
-  let mockRouter: ReturnType<typeof vi.fn>;
+  let mockRouter: { push: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -105,5 +110,58 @@ describe("GeneratePage - EventSource connection", () => {
 
     // Verify close was called on unmount
     expect(instance.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps one connection when status events update the page", async () => {
+    const { unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+    await waitFor(() => expect(eventSourceInstances.length).toBe(1));
+
+    act(() => {
+      eventSourceInstances[0].listeners.get("status")?.({
+        data: JSON.stringify({ message: "Finding structure…", step: "skeleton" }),
+      } as MessageEvent);
+    });
+    await act(async () => Promise.resolve());
+
+    expect(eventSourceInstances).toHaveLength(1);
+    unmount();
+  });
+
+  it("stops after the finite transport retry limit", async () => {
+    vi.useFakeTimers();
+    const { getByText, unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const current = eventSourceInstances[eventSourceInstances.length - 1];
+      act(() => current.listeners.get("error")?.({ data: undefined } as MessageEvent));
+      if (attempt < 4) {
+        await act(async () => vi.advanceTimersByTimeAsync(2000));
+      }
+    }
+
+    expect(eventSourceInstances).toHaveLength(5);
+    expect(getByText(/could not make progress after several attempts/i)).toBeTruthy();
+    unmount();
+    vi.useRealTimers();
+  });
+
+  it("reconnects once after the server yields a durable continuation", async () => {
+    vi.useFakeTimers();
+    const { unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+    const first = eventSourceInstances[0];
+    act(() => first.listeners.get("yielded")?.({
+      data: JSON.stringify({ message: "Resuming…", topicsCompleted: 2, totalTopics: 4 }),
+    } as MessageEvent));
+
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(eventSourceInstances).toHaveLength(2);
+    unmount();
+    vi.useRealTimers();
   });
 });

@@ -111,19 +111,45 @@ function extractSkeletonJson(text: string): Skeleton | null {
   return null;
 }
 
+// Leave time inside this route's 300s execution limit for cleanup and checkpointing.
+const AI_CALL_TIMEOUT_MS = 4 * 60 * 1000;
+const STALL_TIMEOUT_MS = 4 * 60 * 1000;
+
+class AITimeoutError extends Error {
+  constructor(operation: string) {
+    super(`${operation} timed out after ${AI_CALL_TIMEOUT_MS / 1000}s`);
+    this.name = "AITimeoutError";
+  }
+}
+
 /**
  * Call AI provider with text completion.
  * Preserves exact pre-6-Pre behavior: same prompts, same retry logic.
  * Returns raw text response; callers handle JSON extraction.
  * Verifies web search completion when useSearch=true.
+ * Includes a timeout to prevent indefinite hangs.
  */
 async function callAI(prompt: string, useSearch = true): Promise<string> {
   const startTime = Date.now();
   const provider = getAI();
-  const textResult = await provider.complete(prompt, {
-    useSearch,
-    maxTokens: 4000,
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AI_CALL_TIMEOUT_MS);
+  let textResult;
+  try {
+    textResult = await provider.complete(prompt, {
+      useSearch,
+      maxTokens: 4000,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new AITimeoutError("AI call");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+
   const durationMs = Date.now() - startTime;
 
   // Verify web search completed when requested (Priority 2)
@@ -145,6 +171,7 @@ async function callAI(prompt: string, useSearch = true): Promise<string> {
  * Uses provider.structured() where available (OpenRouter, Azure) or
  * falls back to prompt-based extraction with Zod validation (Anthropic).
  * Verifies web search completion when useSearch=true.
+ * Includes a timeout to prevent indefinite hangs.
  */
 async function callAIStructured<T>(
   prompt: string,
@@ -153,11 +180,25 @@ async function callAIStructured<T>(
 ): Promise<T> {
   const startTime = Date.now();
   const provider = getAI();
-  const result = await provider.structured(prompt, {
-    schema,
-    useSearch,
-    maxTokens: 4000,
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AI_CALL_TIMEOUT_MS);
+  let result;
+  try {
+    result = await provider.structured(prompt, {
+      schema,
+      useSearch,
+      maxTokens: 4000,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new AITimeoutError("Structured AI call");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+
   const durationMs = Date.now() - startTime;
 
   // Verify web search completed when requested (Priority 2)
@@ -617,6 +658,8 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  const streamId = crypto.randomUUID();
+  console.info(`[stream] Request opened: stream_id=${streamId}, curriculum_id=${id}`);
 
   const encoder = new TextEncoder();
 
@@ -688,6 +731,7 @@ export async function GET(
           controller.close();
           return;
         }
+        console.info(`[stream] Job attached: stream_id=${streamId}, mode=${jobRecord.mode}, job_id=${jobRecord.mode === "owner" ? jobRecord.id : jobRecord.jobId}`);
 
         // Handle observer mode - attach to existing running job
         if (jobRecord.mode === "observer") {
@@ -730,6 +774,7 @@ export async function GET(
         // Owner mode - normal generation flow
         // TypeScript narrowing: observer mode returns early above
         const ownerJobRecord = jobRecord as { mode: "owner"; id: string; claim_token: string; claim_version: number };
+        let lastProgressTime = Date.now();
         // Start lease renewal heartbeat
         heartbeatInterval = setInterval(() => {
           void renewLease(ownerJobRecord.id, ownerJobRecord.claim_token).then((ok) => {
@@ -816,8 +861,11 @@ export async function GET(
 
         try {
           // Use structured output for guaranteed valid JSON (Priority 1 fix)
+          console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=skeleton_ai`);
           skeletonParsed = await callAIStructured(skeletonPrompt, SkeletonSchema, true);
+          console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=skeleton_ai, topic_count=${skeletonParsed.nodes.length}`);
         } catch (err) {
+          if (err instanceof AITimeoutError) throw err;
           // If structured output fails, fall back to text completion with robust extraction
           // This handles providers that don't support structured output well (e.g., Anthropic)
           console.warn(
@@ -955,6 +1003,7 @@ export async function GET(
         } else {
           parseDurationMs = Date.now() - skeletonParseStartTime;
         }
+        }
 
         // Update curriculum with real title and attribution
         if (!skeletonParsed) {
@@ -963,6 +1012,7 @@ export async function GET(
           controller.close();
           return;
         }
+        console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=curriculum_skeleton_update`);
         await supabase
           .from("curricula")
           .update({
@@ -972,6 +1022,7 @@ export async function GET(
             source_url: skeletonParsed.source_url,
           })
           .eq("id", id);
+        console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=curriculum_skeleton_update`);
 
         const updatedCurriculumTitle = skeletonParsed.title;
 
@@ -1009,6 +1060,7 @@ export async function GET(
 
         for (const node of skeletonParsed.nodes) {
           const topicExternalKey = `topic-${node.order_index}`;
+          console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=node_upsert, external_key=${topicExternalKey}`);
           const { data: nodeRow } = await supabase
             .from("nodes")
             .upsert({
@@ -1020,6 +1072,7 @@ export async function GET(
             .select("id")
             .single();
 
+          console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=node_upsert, persisted=${Boolean(nodeRow)}`);
           if (!nodeRow) continue;
 
           const mus = node.major_understandings.map((mu, i) => ({
@@ -1030,11 +1083,14 @@ export async function GET(
             order_index: i,
           }));
 
+          console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=understanding_upsert, topic_id=${nodeRow.id}`);
           await supabase
             .from("major_understandings")
             .upsert(mus, { onConflict: "node_id,external_key" });
+          console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=understanding_upsert, topic_id=${nodeRow.id}, count=${mus.length}`);
           nodeIds.push({ nodeId: nodeRow.id, node });
         }
+        console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=skeleton_persist, topic_count=${nodeIds.length}`);
 
         // Step 3: Discover best sources for this subject/difficulty
         send(controller, "status", {
@@ -1105,7 +1161,9 @@ export async function GET(
           }
 
           // No web search needed — use structured output for guaranteed valid JSON
+          console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=source_discovery_ai`);
           const sources = await callAIStructured(sourcesPrompt, SourcesArraySchema, false);
+          console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=source_discovery_ai, source_count=${sources.length}`);
 
           // Check ownership after AI call
           if (ownershipLost) {
@@ -1133,6 +1191,7 @@ export async function GET(
             );
           }
         } catch (err) {
+          if (err instanceof AITimeoutError) throw err;
           console.log("Source discovery failed, continuing without prioritized sources:", err);
         }
 
@@ -1194,6 +1253,7 @@ export async function GET(
             return;
           }
           const { nodeId, node } = nodeIds[i];
+          console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=topic_discovery, topic_id=${nodeId}`);
 
           // Skip already-completed topics (resume from checkpoint)
           if (completedTopics.has(nodeId)) {
@@ -1292,6 +1352,7 @@ export async function GET(
             }
 
             const candidates = await callAIStructured(topicPrompt, CandidateArraySchema, true);
+            console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=topic_discovery_ai, topic_id=${nodeId}, candidate_count=${candidates.length}`);
 
             // Check ownership after AI call — if lost mid-call, fail the job
             if (ownershipLost) {
@@ -1381,6 +1442,7 @@ export async function GET(
                 controller.close();
                 return;
               }
+              console.info(`[stream] Checkpoint persisted: stream_id=${streamId}, job_id=${ownerJobRecord.id}, phase=topics, topic_id=${nodeId}`);
             } catch (ckptErr) {
               console.error("[stream] advance_checkpoint threw:", ckptErr);
               clearHeartbeat();
@@ -1396,12 +1458,34 @@ export async function GET(
               controller.close();
               return;
             }
+            // Update progress time on successful checkpoint
+            lastProgressTime = Date.now();
           } catch (err) {
+            if (err instanceof AITimeoutError) throw err;
             console.log(
               `Resource discovery failed for topic "${node.title}":`,
               err instanceof Error ? err.message : err
             );
             // If rate limited, wait and the next topic will still run
+          }
+
+          // Stall detection: check if we've made no progress for too long
+          if (Date.now() - lastProgressTime > STALL_TIMEOUT_MS) {
+            console.error(
+              `[stream] STALL DETECTED: job=${ownerJobRecord.id}, no progress for ${STALL_TIMEOUT_MS / 1000}s, failing job`
+            );
+            clearHeartbeat();
+            await failJob(
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version,
+              `Stalled: no progress for ${STALL_TIMEOUT_MS / 1000}s`
+            );
+            send(controller, "error", {
+              message: "Generation stalled — no progress for an extended period. Please refresh to retry.",
+            });
+            controller.close();
+            return;
           }
 
           if (i < nodeIds.length - 1) {
@@ -1432,7 +1516,7 @@ export async function GET(
           return;
         }
 
-        // Emit topics_complete: topic-level resources done, background batch starting
+        // Topic-level work is complete; the per-understanding batch continues below.
         send(controller, "complete", { curriculum_id: id, phase: "topics" });
 
         // Background per-understanding discovery — one batch call per topic.
@@ -1468,6 +1552,7 @@ export async function GET(
               return;
             }
             const { nodeId, node } = nodeIds[i];
+            console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=batch_discovery, topic_id=${nodeId}`);
 
             // Skip topics whose batch discovery already completed (resume).
             if (completedBatchTopics.has(nodeId)) {
@@ -1569,6 +1654,7 @@ export async function GET(
               }
 
               const batchResult = await callAIStructured(prompt, BatchResponseSchema, true);
+              console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=batch_discovery_ai, topic_id=${nodeId}, resource_count=${batchResult.topic_resources.length}`);
 
               // Check ownership after AI call — if lost mid-call, fail the job
               if (ownershipLost) {
@@ -1642,6 +1728,7 @@ export async function GET(
                 topicBatchPersisted += batchPersisted;
               }
             } catch (err) {
+              if (err instanceof AITimeoutError) throw err;
               console.log(`Batch discovery failed for topic "${node.title}":`, err);
             }
 
@@ -1665,6 +1752,7 @@ export async function GET(
                 );
                 return;
               }
+              console.info(`[stream] Checkpoint persisted: stream_id=${streamId}, job_id=${ownerJobRecord.id}, phase=batch, topic_id=${nodeId}`);
             } catch (ckptErr) {
               console.error("[stream] advance_checkpoint threw:", ckptErr);
             }
@@ -1748,7 +1836,6 @@ export async function GET(
           controller.close();
         }
         // No outer catch needed - inner try/catch handles errors
-      }
     } catch (err) {
       // This catch is for the outer try block (line 492)
       // Should not be reached since inner try has its own catch/finally

@@ -50,6 +50,9 @@ export default function GeneratePage({
   const esRef = useRef<EventSource | null>(null);
   const yieldedHandledRef = useRef(false);
   const connectRef = useRef<() => void>(() => {});
+  const reconnectAttemptsRef = useRef(0);
+  const MAX_RECONNECT_ATTEMPTS = 5;
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Keep terminalStateRef in sync with terminalState
   useEffect(() => {
@@ -61,39 +64,41 @@ export default function GeneratePage({
     // Don't reconnect if we've reached a terminal state
     if (terminalStateRef.current !== "none") return;
 
-    // Close any existing connection
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
+    // A reconnect can be requested by multiple events; keep one connection.
+    if (esRef.current && esRef.current.readyState !== EventSource.CLOSED) return;
+    esRef.current?.close();
 
     console.info('[GeneratePage] EventSource constructing for', id);
     const es = new EventSource(`/api/generate/${id}/stream`);
     esRef.current = es;
     yieldedHandledRef.current = false;
 
+    es.addEventListener("open", () => {
+      console.info('[GeneratePage] EventSource connected');
+    });
+
     es.addEventListener("status", (e) => {
       const data = JSON.parse(e.data) as Status;
       setStatus(data);
       setLog((prev) => [...prev, { message: data.message, done: false }]);
+
+      if (data.step === "discovery" && data.current !== undefined) {
+        reconnectAttemptsRef.current = 0;
+      }
 
       if (data.step === "already_claimed") {
         es.close();
         router.push(`/curriculum/${id}`);
       }
 
-      // Handle reconnect/resume events - don't redirect, just update UI
-      if (data.step === "reconnect" || data.step === "resume" || data.step === "waiting") {
-        // These are informational - we stay on the page and wait for owner to complete
-        if (data.step === "waiting") {
-          setLog((prev) => [
-            ...prev.slice(0, -1),
-            {
-              message: "Another generation is in progress. Waiting for it to complete…",
-              done: false,
-            },
-          ]);
-        }
+      if (data.step === "waiting") {
+        setLog((prev) => [
+          ...prev.slice(0, -1),
+          {
+            message: "Another generation is in progress. Waiting for it to complete…",
+            done: false,
+          },
+        ]);
       }
     });
 
@@ -143,6 +148,16 @@ export default function GeneratePage({
       // Close current connection; reconnect will be triggered by the effect
       es.close();
       esRef.current = null;
+      reconnectAttemptsRef.current += 1;
+      if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+        setError("Generation needs another continuation, but the retry limit was reached. Please return to the curriculum and try again.");
+        setTerminalState("failed");
+      } else if (reconnectTimerRef.current === null) {
+        reconnectTimerRef.current = setTimeout(() => {
+          reconnectTimerRef.current = null;
+          connectRef.current?.();
+        }, 2000);
+      }
     });
 
     // Handle explicit "error" events from server (event type = "error", has data)
@@ -161,32 +176,32 @@ export default function GeneratePage({
         es.close();
         esRef.current = null;
       }
-      // Connection closures (readyState = CLOSED) without data are handled by close event
+      // Transport errors without data are handled by the bounded reconnect listener.
     });
 
-    // Handle unexpected connection close (network failure, server crash, etc.)
-    es.addEventListener("close", () => {
-      // If we already handled an error event with data, don't double-handle
-      if (terminalStateRef.current === "failed") return;
-
-      // If connection closed and we didn't handle yielded/complete
-      if (es.readyState === EventSource.CLOSED && terminalStateRef.current === "none" && !yieldedHandledRef.current) {
-        // Check if we were in a waiting/reconnect state - if so, reconnect automatically
-        const currentStatus = status;
-        if (currentStatus.step === "waiting" || currentStatus.step === "reconnect" || currentStatus.step === "resume") {
-          console.info('[GeneratePage] Reconnecting after observer mode close');
-          setTimeout(() => connectRef.current?.(), 2000); // Reconnect after short delay
-          return;
-        }
-
-        // This is an unexpected disconnect (network failure, server crash, etc.)
-        setError("Connection lost. Retrying…");
+    // Close native EventSource retries and manage one finite retry path ourselves.
+    es.addEventListener("error", (e) => {
+      const event = e as MessageEvent;
+      if (event.data) return; // Explicit server error is handled below.
+      if (terminalStateRef.current !== "none" || yieldedHandledRef.current) return;
+      es.close();
+      if (esRef.current === es) esRef.current = null;
+      reconnectAttemptsRef.current += 1;
+      if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+        setError("The generation connection could not make progress after several attempts. Please return to the curriculum and try again.");
         setTerminalState("failed");
+        return;
+      }
+      if (reconnectTimerRef.current === null) {
+        reconnectTimerRef.current = setTimeout(() => {
+          reconnectTimerRef.current = null;
+          connectRef.current?.();
+        }, 2000);
       }
     });
 
     return () => es.close();
-  }, [id, router, status]);
+  }, [id, router]);
 
   // Store the connect function in a ref for access from event handlers
   useEffect(() => {
@@ -203,20 +218,13 @@ export default function GeneratePage({
     connect();
   }, [connect]);
 
-  // Reconnect after a yielded event (when terminalState is still "none")
-  useEffect(() => {
-    if (terminalState !== "none") return;
-
-    // If we just handled a yielded event, reconnect
-    if (yieldedHandledRef.current) {
-      yieldedHandledRef.current = false;
-      connect();
-    }
-  }, [terminalState, connect]);
-
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+      if (reconnectTimerRef.current !== null) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       if (esRef.current) {
         esRef.current.close();
         esRef.current = null;
