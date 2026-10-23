@@ -107,6 +107,7 @@ describe("AzureProvider", () => {
         id?: string;
         status?: "completed" | "in_progress" | "failed";
         query?: string;
+        action?: { type: "search"; query: string };
       }>;
       usage?: { input_tokens: number; output_tokens: number; total_tokens: number };
     };
@@ -801,6 +802,7 @@ describe("AzureProvider", () => {
   });
 
   test("structured() with useSearch=true searches first, then returns schema-valid data with citations", async () => {
+    const consoleInfo = vi.spyOn(console, "info").mockImplementation(() => {});
     const controller = new AbortController();
     const schema = z.object({
       resources: z.array(z.object({
@@ -817,9 +819,15 @@ describe("AzureProvider", () => {
           created_at: Date.now(),
           model: "gpt-4.1-mini",
           output: [
-            { type: "web_search_call", status: "completed", id: "search_1" },
+            {
+              type: "web_search_call",
+              status: "completed",
+              id: "search_1",
+              action: { type: "search", query: "fraction arithmetic learning resources" },
+            },
             {
               type: "message",
+              status: "completed",
               role: "assistant",
               content: [{
                 type: "output_text",
@@ -885,6 +893,48 @@ describe("AzureProvider", () => {
     expect(structuredBody.response_format.type).toBe("json_schema");
     expect(structuredBody.messages[0].content).toContain("completed web research");
     expect(structuredBody.messages[0].content).toContain("https://www.khanacademy.org/math/arithmetic/fraction-arithmetic");
+    expect(consoleInfo).toHaveBeenCalledWith("[Azure] Responses API web search summary", {
+      response_item_types: ["web_search_call", "message"],
+      search_call_statuses: ["completed"],
+      annotation_count: 1,
+      annotation_locations: ["response[1].content[0].annotations=1"],
+      extracted_url_count: 1,
+    });
+    consoleInfo.mockRestore();
+  });
+
+  test("structured() rejects a completed Responses API search with no usable citations", async () => {
+    const schema = z.object({ result: z.string() });
+    mockFetch.mockResolvedValueOnce(createMockResponsesResponse({
+      json: {
+        id: "resp_search_without_citations",
+        object: "response",
+        created_at: Date.now(),
+        model: "gpt-4.1-mini",
+        output: [
+          {
+            type: "web_search_call",
+            status: "completed",
+            id: "search_without_citations",
+            action: { type: "search", query: "educational topic" },
+          },
+          {
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [{ type: "output_text", text: "A result without citation annotations." }],
+          },
+        ],
+      },
+    }));
+
+    await expect(provider.structured("Test prompt", { schema, useSearch: true })).rejects.toMatchObject({
+      code: "MODEL_ERROR",
+      provider: "azure",
+      message: "Azure web search completed without source citations; structured discovery was not generated.",
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch.mock.calls[0][0]).toContain("/responses?");
   });
 
   test("structured() with useSearch=true fails clearly and skips structured generation when web search fails", async () => {

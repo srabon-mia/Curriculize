@@ -98,6 +98,22 @@ interface AzureResponsesResponse {
   };
 }
 
+/** Summarize annotation placement without exposing response text or citation URLs. */
+function summarizeAnnotationLocations(value: unknown, path = "response", locations: string[] = []): string[] {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => summarizeAnnotationLocations(item, `${path}[${index}]`, locations));
+  } else if (value && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "annotations" && Array.isArray(child)) {
+        locations.push(`${path}.annotations=${child.length}`);
+      } else if (typeof child === "object" && child !== null) {
+        summarizeAnnotationLocations(child, `${path}.${key}`, locations);
+      }
+    }
+  }
+  return locations;
+}
+
 /**
  * Azure AI Foundry provider implementation.
  * Uses chat completions for non-search calls and Responses API for web search.
@@ -541,6 +557,7 @@ export class AzureProvider implements AIProvider {
     const citations: AISearchCitation[] = [];
     let sawSearchCall = false;
     let allSearchCallsCompleted = true;
+    const searchCallStatuses: string[] = [];
 
     for (const output of response.output) {
       if (output.type === "message" && output.content) {
@@ -565,6 +582,7 @@ export class AzureProvider implements AIProvider {
         // Require every returned search call to finish; an in-progress or failed
         // call must not be reported as successful just because another completed.
         sawSearchCall = true;
+        searchCallStatuses.push(output.status ?? "missing");
         if (output.status !== "completed") {
           allSearchCallsCompleted = false;
         }
@@ -573,6 +591,20 @@ export class AzureProvider implements AIProvider {
         }
       }
     }
+
+    // Keep diagnostics structural only: never log user prompts or model output.
+    const annotationLocations = summarizeAnnotationLocations(response.output);
+    const annotationCount = annotationLocations.reduce((total, location) => {
+      const count = Number(location.slice(location.lastIndexOf("=") + 1));
+      return total + (Number.isFinite(count) ? count : 0);
+    }, 0);
+    console.info("[Azure] Responses API web search summary", {
+      response_item_types: response.output.map((item) => item.type),
+      search_call_statuses: searchCallStatuses,
+      annotation_count: annotationCount,
+      annotation_locations: annotationLocations,
+      extracted_url_count: citations.length,
+    });
 
     if (text === "" && this.debug) {
       console.warn("[Azure] Empty response content received", { output: response.output });
