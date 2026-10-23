@@ -30,8 +30,8 @@ const supabase = createServiceClient(
 );
 
 // Lazy AI provider getter - avoids initialization at module load time (build time)
-function getAI(): ReturnType<typeof getAIProvider> {
-  return getAIProvider();
+function getAI(operation: string): ReturnType<typeof getAIProvider> {
+  return getAIProvider(undefined, { operation });
 }
 
 /**
@@ -129,9 +129,9 @@ class AITimeoutError extends Error {
  * Verifies web search completion when useSearch=true.
  * Includes a timeout to prevent indefinite hangs.
  */
-async function callAI(prompt: string, useSearch = true): Promise<string> {
+async function callAI(prompt: string, useSearch = true, operation = "text_completion"): Promise<string> {
   const startTime = Date.now();
-  const provider = getAI();
+  const provider = getAI(operation);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AI_CALL_TIMEOUT_MS);
   let textResult;
@@ -176,10 +176,11 @@ async function callAI(prompt: string, useSearch = true): Promise<string> {
 async function callAIStructured<T>(
   prompt: string,
   schema: z.ZodSchema<T>,
-  useSearch = true
+  useSearch = true,
+  operation = "structured_completion"
 ): Promise<T> {
   const startTime = Date.now();
-  const provider = getAI();
+  const provider = getAI(operation);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AI_CALL_TIMEOUT_MS);
   let result;
@@ -862,7 +863,7 @@ export async function GET(
         try {
           // Use structured output for guaranteed valid JSON (Priority 1 fix)
           console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=skeleton_ai`);
-          skeletonParsed = await callAIStructured(skeletonPrompt, SkeletonSchema, true);
+          skeletonParsed = await callAIStructured(skeletonPrompt, SkeletonSchema, true, "skeleton_ai");
           console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=skeleton_ai, topic_count=${skeletonParsed.nodes.length}`);
         } catch (err) {
           if (err instanceof AITimeoutError) throw err;
@@ -872,7 +873,7 @@ export async function GET(
             `[stream] Structured output failed, falling back to text extraction: ${err instanceof Error ? err.message : String(err)}`
           );
 
-          const skeletonText = await callAI(skeletonPrompt, true);
+          const skeletonText = await callAI(skeletonPrompt, true, "skeleton_fallback");
 
           // Check ownership after AI call — if lost, fail the job
           if (ownershipLost) {
@@ -953,7 +954,7 @@ export async function GET(
 
           // Retry with explicit instruction to return valid JSON only
           const retryPrompt = `${skeletonPrompt}\n\nIMPORTANT: Your previous response could not be parsed as valid JSON. You MUST return ONLY a valid JSON object matching the exact schema specified. No markdown, no explanation, no additional text. Start with { and end with }.`;
-          const skeletonRetry = await callAI(retryPrompt, true);
+          const skeletonRetry = await callAI(retryPrompt, true, "skeleton_retry");
 
           // Check ownership after retry AI call
           if (ownershipLost) {
@@ -1162,7 +1163,7 @@ export async function GET(
 
           // No web search needed — use structured output for guaranteed valid JSON
           console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=source_discovery_ai`);
-          const sources = await callAIStructured(sourcesPrompt, SourcesArraySchema, false);
+          const sources = await callAIStructured(sourcesPrompt, SourcesArraySchema, false, "source_discovery_ai");
           console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=source_discovery_ai, source_count=${sources.length}`);
 
           // Check ownership after AI call
@@ -1351,7 +1352,7 @@ export async function GET(
               return;
             }
 
-            const candidates = await callAIStructured(topicPrompt, CandidateArraySchema, true);
+            const candidates = await callAIStructured(topicPrompt, CandidateArraySchema, true, "topic_discovery_ai");
             console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=topic_discovery_ai, topic_id=${nodeId}, candidate_count=${candidates.length}`);
 
             // Check ownership after AI call — if lost mid-call, fail the job
@@ -1653,7 +1654,7 @@ export async function GET(
                 return;
               }
 
-              const batchResult = await callAIStructured(prompt, BatchResponseSchema, true);
+              const batchResult = await callAIStructured(prompt, BatchResponseSchema, true, "topic_batch_ai");
               console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=batch_discovery_ai, topic_id=${nodeId}, resource_count=${batchResult.topic_resources.length}`);
 
               // Check ownership after AI call — if lost mid-call, fail the job

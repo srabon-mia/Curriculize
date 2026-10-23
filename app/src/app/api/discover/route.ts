@@ -31,8 +31,8 @@ const VALID_TYPES = [
 ];
 
 // Lazy AI provider getter - avoids initialization at module load time (build time)
-function getAI(): ReturnType<typeof getAIProvider> {
-  return getAIProvider();
+function getAI(operation: string): ReturnType<typeof getAIProvider> {
+  return getAIProvider(undefined, { operation });
 }
 
 /**
@@ -40,7 +40,7 @@ function getAI(): ReturnType<typeof getAIProvider> {
  * Preserves exact pre-6-Pre behavior: same prompts, same JSON extraction, same retry logic.
  */
 async function callAIDiscover(prompt: string, signal?: AbortSignal): Promise<ResourceCandidate[]> {
-  const textResult = await getAI().complete(prompt, {
+  const textResult = await getAI("api_resource_discovery").complete(prompt, {
     useSearch: true,
     maxTokens: 2000,
     signal,
