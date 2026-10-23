@@ -3,7 +3,7 @@
  */
 
 import { getAIProvider, createProvider, resetAIProvider, setAIProvider } from "../factory";
-import { MockProvider, AnthropicProvider, OpenRouterProvider } from "../index";
+import { MockProvider, AnthropicProvider, OpenRouterProvider, AzureProvider } from "../index";
 
 describe("AI Provider Factory", () => {
   beforeEach(() => {
@@ -12,6 +12,9 @@ describe("AI Provider Factory", () => {
     delete process.env.AI_PROVIDER;
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.OPENROUTER_API_KEY;
+    delete process.env.AZURE_OPENAI_API_KEY;
+    delete process.env.AZURE_OPENAI_ENDPOINT;
+    delete process.env.AZURE_OPENAI_DEPLOYMENT;
     delete process.env.AI_DEFAULT_MODEL;
     delete process.env.AI_DEBUG;
   });
@@ -87,6 +90,27 @@ describe("AI Provider Factory", () => {
     process.env.AI_PROVIDER = "mock";
     const provider = getAIProvider();
     expect(provider.name).toBe("mock");
+  });
+
+  test("source discovery selects Azure under Azure configuration and logs safe selection context", () => {
+    process.env.AI_PROVIDER = "azure";
+    process.env.AZURE_OPENAI_API_KEY = "test-azure-key";
+    process.env.AZURE_OPENAI_ENDPOINT = "https://test.openai.azure.com";
+    process.env.AZURE_OPENAI_DEPLOYMENT = "gpt-4.1-mini";
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    try {
+      const provider = getAIProvider(undefined, { operation: "source_discovery_ai" });
+
+      expect(provider).toBeInstanceOf(AzureProvider);
+      expect(provider.name).toBe("azure");
+      expect(info).toHaveBeenCalledWith(
+        "[ai] Provider selected: provider=azure, reason=AI_PROVIDER environment, operation=source_discovery_ai"
+      );
+      expect(info.mock.calls.flat().join(" ")).not.toContain("test-azure-key");
+    } finally {
+      info.mockRestore();
+    }
   });
 
   test("anthropic provider uses ANTHROPIC_API_KEY from env", () => {

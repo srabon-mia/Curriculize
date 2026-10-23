@@ -91,7 +91,7 @@ describe("OpenRouterProvider", () => {
     expect(call[1].headers["Authorization"]).toBe("Bearer test-openrouter-key");
     expect(call[1].headers["Content-Type"]).toBe("application/json");
     expect(call[1].headers["HTTP-Referer"]).toBe("https://curriculum-generator-alpha.vercel.app");
-    expect(call[1].headers["X-Title"]).toBe("Curriculum Generator");
+    expect(call[1].headers["X-Title"]).toBe("Curriculize");
 
     const body = JSON.parse(call[1].body as string);
     expect(body.model).toBe("openrouter/free");

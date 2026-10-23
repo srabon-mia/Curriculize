@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Curriculum Generator** — an AI-powered tool that builds study guides by compiling human-curated resources from the web (not AI-generated content). The system:
+**Curriculize** — an AI-powered tool that builds study guides by compiling human-curated resources from the web (not AI-generated content). The system:
 1. Takes a user's subject/topic request
 2. Uses Claude with web search to find or adapt an existing curriculum structure (official syllabi, university courses)
 3. Searches for high-quality free resources per topic/concept

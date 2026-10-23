@@ -18,7 +18,10 @@ let cachedConfig: AIProviderConfig | null = null;
  * If config is not explicitly provided and a provider was set via setAIProvider(),
  * returns that explicitly set provider.
  */
-export function getAIProvider(config?: Partial<AIProviderConfig>): AIProvider {
+export function getAIProvider(
+  config?: Partial<AIProviderConfig>,
+  context: { operation?: string } = {}
+): AIProvider {
   // If explicitly set via setAIProvider() and no config override requested, return it.
   // setAIProvider sets cachedConfig with ONLY the provider field (minimal config),
   // while env resolution creates a full config. Detect explicit injection by checking
@@ -26,6 +29,9 @@ export function getAIProvider(config?: Partial<AIProviderConfig>): AIProvider {
   const isExplicitInjection = cachedProvider !== null && cachedConfig !== null &&
     Object.keys(cachedConfig).length === 1 && "provider" in cachedConfig;
   if (config === undefined && isExplicitInjection) {
+    console.info(
+      `[ai] Provider selected: provider=${cachedProvider!.name}, reason=setAIProvider injection, operation=${context.operation ?? "unspecified"}`
+    );
     return cachedProvider!;
   }
 
@@ -63,12 +69,28 @@ export function getAIProvider(config?: Partial<AIProviderConfig>): AIProvider {
 
   // Return cached provider if config matches (handles env var changes)
   if (cachedProvider && configsEqual(cachedConfig, resolvedConfig)) {
+    const selectionReason = config?.provider
+      ? "explicit config"
+      : process.env.AI_PROVIDER
+        ? "AI_PROVIDER environment"
+        : "default provider";
+    console.info(
+      `[ai] Provider selected: provider=${cachedProvider.name}, reason=${selectionReason}, operation=${context.operation ?? "unspecified"}`
+    );
     return cachedProvider;
   }
 
   // Create new provider
   cachedProvider = createProvider(resolvedConfig);
   cachedConfig = resolvedConfig;
+  const selectionReason = config?.provider
+    ? "explicit config"
+    : process.env.AI_PROVIDER
+      ? "AI_PROVIDER environment"
+      : "default provider";
+  console.info(
+    `[ai] Provider selected: provider=${cachedProvider.name}, reason=${selectionReason}, operation=${context.operation ?? "unspecified"}`
+  );
   return cachedProvider;
 }
 

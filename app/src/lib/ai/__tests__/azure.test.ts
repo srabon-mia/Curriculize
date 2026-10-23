@@ -108,7 +108,7 @@ describe("AzureProvider", () => {
         status?: "completed" | "in_progress" | "failed";
         query?: string;
       }>;
-      usage?: { prompt_tokens: number; output_tokens: number; total_tokens: number };
+      usage?: { input_tokens: number; output_tokens: number; total_tokens: number };
     };
   }> = {}) => {
     const response = {
@@ -123,7 +123,7 @@ describe("AzureProvider", () => {
         output: [
           { type: "message", role: "assistant", content: [{ type: "output_text", text: '{"result": "success"}' }] }
         ],
-        usage: { prompt_tokens: 100, output_tokens: 50, total_tokens: 150 },
+        usage: { input_tokens: 100, output_tokens: 50, total_tokens: 150 },
       }),
     };
     return response;
@@ -209,7 +209,7 @@ describe("AzureProvider", () => {
             query: "test query"
           }
         ],
-        usage: { prompt_tokens: 100, output_tokens: 50, total_tokens: 150 },
+        usage: { input_tokens: 100, output_tokens: 50, total_tokens: 150 },
       },
     })));
 
@@ -307,7 +307,7 @@ describe("AzureProvider", () => {
             query: "test query"
           }
         ],
-        usage: { prompt_tokens: 100, output_tokens: 50, total_tokens: 150 },
+        usage: { input_tokens: 100, output_tokens: 50, total_tokens: 150 },
       },
     })));
 
@@ -370,7 +370,7 @@ describe("AzureProvider", () => {
             query: "educational resources"
           }
         ],
-        usage: { prompt_tokens: 100, output_tokens: 50, total_tokens: 150 },
+        usage: { input_tokens: 100, output_tokens: 50, total_tokens: 150 },
       },
     })));
 
@@ -412,7 +412,7 @@ describe("AzureProvider", () => {
             query: "test query"
           }
         ],
-        usage: { prompt_tokens: 100, output_tokens: 50, total_tokens: 150 },
+        usage: { input_tokens: 100, output_tokens: 50, total_tokens: 150 },
       },
     })));
 
@@ -452,7 +452,7 @@ describe("AzureProvider", () => {
             query: "test query"
           }
         ],
-        usage: { prompt_tokens: 100, output_tokens: 50, total_tokens: 150 },
+        usage: { input_tokens: 100, output_tokens: 50, total_tokens: 150 },
       },
     })));
 
@@ -665,6 +665,7 @@ describe("AzureProvider", () => {
   });
 
   test("structured() uses native JSON Schema response_format", async () => {
+    const controller = new AbortController();
     const schema = z.object({
       name: z.string(),
       value: z.number(),
@@ -689,7 +690,7 @@ describe("AzureProvider", () => {
       },
     }));
 
-    const result = await provider.structured("Test prompt", { schema });
+    const result = await provider.structured("Test prompt", { schema, signal: controller.signal });
     expect(result.data).toEqual({ name: "test", value: 42 });
     expect(result.rawText).toBe('{"name": "test", "value": 42}');
 
@@ -700,6 +701,7 @@ describe("AzureProvider", () => {
     expect(body.response_format.json_schema.name).toBe("structured_response");
     expect(body.response_format.json_schema.strict).toBe(true);
     expect(body.temperature).toBe(0); // Should default to 0 for structured output
+    expect(mockFetch.mock.calls[0][1].signal).toBe(controller.signal);
   });
 
   test("structured() validates against Zod schema", async () => {
@@ -798,13 +800,44 @@ describe("AzureProvider", () => {
     }
   });
 
-  test("structured() with useSearch=true uses chat completions with response_format", async () => {
+  test("structured() with useSearch=true searches first, then returns schema-valid data with citations", async () => {
+    const controller = new AbortController();
     const schema = z.object({
-      name: z.string(),
-      value: z.number(),
+      resources: z.array(z.object({
+        url: z.string().url(),
+        title: z.string().min(1),
+      })),
     });
 
-    mockFetch.mockResolvedValue(createMockResponse({
+    mockFetch
+      .mockResolvedValueOnce(createMockResponsesResponse({
+        json: {
+          id: "resp_search_test",
+          object: "response",
+          created_at: Date.now(),
+          model: "gpt-4.1-mini",
+          output: [
+            { type: "web_search_call", status: "completed", id: "search_1" },
+            {
+              type: "message",
+              role: "assistant",
+              content: [{
+                type: "output_text",
+                text: "A useful lesson on fractions is available from Khan Academy.",
+                annotations: [{
+                  type: "url_citation",
+                  url: "https://www.khanacademy.org/math/arithmetic/fraction-arithmetic",
+                  title: "Fraction arithmetic",
+                  start_index: 0,
+                  end_index: 60,
+                }],
+              }],
+            },
+          ],
+          usage: { input_tokens: 40, output_tokens: 25, total_tokens: 65 },
+        },
+      }))
+      .mockResolvedValueOnce(createMockResponse({
       json: {
         id: "chatcmpl_test",
         object: "chat.completion",
@@ -814,7 +847,7 @@ describe("AzureProvider", () => {
           index: 0,
           message: {
             role: "assistant",
-            content: '{"name": "test", "value": 42}',
+            content: '{"resources":[{"url":"https://www.khanacademy.org/math/arithmetic/fraction-arithmetic","title":"Fraction arithmetic"}]}',
             tool_calls: undefined,
           },
           finish_reason: "stop",
@@ -823,14 +856,59 @@ describe("AzureProvider", () => {
       },
     }));
 
-    const result = await provider.structured("Test prompt", { schema, useSearch: true });
+    const result = await provider.structured("Test prompt", { schema, useSearch: true, signal: controller.signal });
 
-    expect(result.data).toEqual({ name: "test", value: 42 });
-    // Verify it called the chat completions endpoint with response_format
-    expect(mockFetch.mock.calls[0][0]).toContain("/chat/completions");
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string);
-    expect(body.response_format).toBeDefined();
-    expect(body.response_format.type).toBe("json_schema");
+    expect(result.data).toEqual({
+      resources: [{
+        url: "https://www.khanacademy.org/math/arithmetic/fraction-arithmetic",
+        title: "Fraction arithmetic",
+      }],
+    });
+    expect(result.searchCompleted).toBe(true);
+    expect(result.searchCitations).toEqual([{
+      url: "https://www.khanacademy.org/math/arithmetic/fraction-arithmetic",
+      title: "Fraction arithmetic",
+    }]);
+    expect(result.usage).toEqual({ inputTokens: 140, outputTokens: 75 });
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch.mock.calls[0][1].signal).toBe(controller.signal);
+    expect(mockFetch.mock.calls[1][1].signal).toBe(controller.signal);
+    expect(mockFetch.mock.calls[0][0]).toContain("/responses?");
+    const searchBody = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    expect(searchBody.model).toBe("gpt-4.1-mini");
+    expect(searchBody.tools).toEqual([{ type: "web_search" }]);
+    expect(searchBody.tool_choice).toBe("required");
+
+    expect(mockFetch.mock.calls[1][0]).toContain("/chat/completions");
+    const structuredBody = JSON.parse(mockFetch.mock.calls[1][1].body as string);
+    expect(structuredBody.response_format.type).toBe("json_schema");
+    expect(structuredBody.messages[0].content).toContain("completed web research");
+    expect(structuredBody.messages[0].content).toContain("https://www.khanacademy.org/math/arithmetic/fraction-arithmetic");
+  });
+
+  test("structured() with useSearch=true fails clearly and skips structured generation when web search fails", async () => {
+    const schema = z.object({ result: z.string() });
+    mockFetch.mockResolvedValueOnce(createMockResponsesResponse({
+      json: {
+        id: "resp_search_failed",
+        object: "response",
+        created_at: Date.now(),
+        model: "gpt-4.1-mini",
+        output: [
+          { type: "web_search_call", status: "failed", id: "search_1" },
+          { type: "message", role: "assistant", content: [{ type: "output_text", text: "No verified research." }] },
+        ],
+      },
+    }));
+
+    await expect(provider.structured("Test prompt", { schema, useSearch: true })).rejects.toMatchObject({
+      code: "MODEL_ERROR",
+      provider: "azure",
+      message: "Azure web search did not complete; structured discovery was not generated.",
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch.mock.calls[0][0]).toContain("/responses?");
   });
 
   test("structured() throws on malformed JSON from provider", async () => {

@@ -306,10 +306,9 @@ export class AzureProvider implements AIProvider {
         const shapeDef = def.shape?.() ?? {};
         for (const [key, value] of Object.entries(shapeDef)) {
           shape[key] = this.zodToJsonSchema(value);
-          const valueDef = (value as ZodSchemaInternal)._def;
-          if (valueDef.typeName !== "ZodOptional" && valueDef.typeName !== "ZodNullable") {
-            required.push(key);
-          }
+          // In strict mode (which we always use), ALL properties must be in required array.
+          // Nullable/optional fields are indicated by nullable: true in the property schema.
+          required.push(key);
         }
         return {
           type: "object",
@@ -408,6 +407,10 @@ export class AzureProvider implements AIProvider {
         }
         try {
           await new Promise<void>((resolve, reject) => {
+            if (signal?.aborted) {
+              reject(new DOMException("Aborted", "AbortError"));
+              return;
+            }
             const timeout = setTimeout(resolve, waitMs);
             if (signal) {
               signal.addEventListener("abort", () => {
@@ -456,6 +459,10 @@ export class AzureProvider implements AIProvider {
               console.log(`[Azure] Server sent Retry-After: ${retryAfter}ms`);
             }
             await new Promise<void>((resolve, reject) => {
+              if (signal?.aborted) {
+                reject(new DOMException("Aborted", "AbortError"));
+                return;
+              }
               const timeout = setTimeout(resolve, retryAfter);
               if (signal) {
                 signal.addEventListener("abort", () => {
@@ -532,7 +539,8 @@ export class AzureProvider implements AIProvider {
   private extractResponsesResult(response: AzureResponsesResponse): { text: string; citations: AISearchCitation[]; searchCompleted: boolean } {
     let text = "";
     const citations: AISearchCitation[] = [];
-    let searchCompleted = false;
+    let sawSearchCall = false;
+    let allSearchCallsCompleted = true;
 
     for (const output of response.output) {
       if (output.type === "message" && output.content) {
@@ -554,10 +562,13 @@ export class AzureProvider implements AIProvider {
           }
         }
       } else if (output.type === "web_search_call") {
-        // Track search completion status
-        if (output.status === "completed") {
-          searchCompleted = true;
-        } else if (output.status === "failed" && this.debug) {
+        // Require every returned search call to finish; an in-progress or failed
+        // call must not be reported as successful just because another completed.
+        sawSearchCall = true;
+        if (output.status !== "completed") {
+          allSearchCallsCompleted = false;
+        }
+        if (output.status === "failed" && this.debug) {
           console.warn("[Azure] Web search call failed", { query: output.query, id: output.id });
         }
       }
@@ -567,7 +578,7 @@ export class AzureProvider implements AIProvider {
       console.warn("[Azure] Empty response content received", { output: response.output });
     }
 
-    return { text, citations, searchCompleted };
+    return { text, citations, searchCompleted: sawSearchCall && allSearchCallsCompleted };
   }
 
   /**
@@ -654,14 +665,45 @@ export class AzureProvider implements AIProvider {
 
   /**
    * Generate structured output with native JSON Schema validation.
-   * Uses chat completions (Responses API structured output + web search not confirmed compatible).
+   * Search requests use a required Responses API web search first, then a
+   * schema-constrained chat completion grounded in those results. This keeps
+   * the required search behavior explicit and preserves the response citations.
    */
   async structured<T>(prompt: string, options: AIStructuredOptions<T>): Promise<AIStructuredResult<T>> {
-    const { schema, ...completeOptions } = options;
+    const { schema, useSearch = false, ...completeOptions } = options;
+    const searchResult = useSearch
+      ? await this.complete(prompt, { ...completeOptions, useSearch: true })
+      : undefined;
 
-    const request = this.buildStructuredChatRequest(prompt, schema, completeOptions);
+    if (searchResult && searchResult.searchCompleted !== true) {
+      throw new AIError("MODEL_ERROR", "Azure web search did not complete; structured discovery was not generated.", {
+        retryable: false,
+        provider: "azure",
+      });
+    }
+
+    const searchCitations = searchResult?.searchCitations ?? [];
+    if (searchResult && searchCitations.length === 0) {
+      throw new AIError("MODEL_ERROR", "Azure web search completed without source citations; structured discovery was not generated.", {
+        retryable: false,
+        provider: "azure",
+      });
+    }
+
+    const groundedPrompt = searchResult
+      ? [
+          prompt,
+          "\nUse the following completed web research to answer the request. Base factual claims and URLs only on these results; do not invent sources.",
+          "\nWeb research results:",
+          searchResult.text,
+          "\nSource references:",
+          ...searchCitations.map((citation, index) => `${index + 1}. ${citation.title ? `${citation.title} — ` : ""}${citation.url}`),
+        ].join("\n")
+      : prompt;
+
+    const request = this.buildStructuredChatRequest(groundedPrompt, schema, completeOptions);
     const url = this.buildChatUrl();
-    const response = await this.requestWithRetry<AzureChatResponse>(url, request);
+    const response = await this.requestWithRetry<AzureChatResponse>(url, request, 4, completeOptions.signal);
 
     const rawText = this.extractChatText(response);
 
@@ -687,10 +729,12 @@ export class AzureProvider implements AIProvider {
     return {
       data: result.data,
       rawText,
-      usage: response.usage ? {
-        inputTokens: response.usage.prompt_tokens,
-        outputTokens: response.usage.completion_tokens,
+      usage: response.usage || searchResult?.usage ? {
+        inputTokens: (response.usage?.prompt_tokens ?? 0) + (searchResult?.usage?.inputTokens ?? 0),
+        outputTokens: (response.usage?.completion_tokens ?? 0) + (searchResult?.usage?.outputTokens ?? 0),
       } : undefined,
+      searchCitations: searchResult ? searchCitations : undefined,
+      searchCompleted: searchResult ? true : undefined,
     };
   }
 }

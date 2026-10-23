@@ -5,11 +5,14 @@ import { useEffect, useState } from "react";
 const SCROLL_THRESHOLD = 400;
 
 export function BackToTop() {
-  const [visible, setVisible] = useState(
-    () => (typeof window !== "undefined" && window.scrollY > SCROLL_THRESHOLD)
-  );
+  const [visible, setVisible] = useState(false);
+  const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
+    setMounted(true);
+    const initialVisible = typeof window !== "undefined" && window.scrollY > SCROLL_THRESHOLD;
+    setVisible(initialVisible);
+
     let ticking = false;
 
     const onScroll = () => {
@@ -29,7 +32,7 @@ export function BackToTop() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  if (!visible) return null;
+  if (!mounted || !visible) return null;
 
   return (
     <button

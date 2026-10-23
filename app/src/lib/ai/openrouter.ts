@@ -341,7 +341,7 @@ export class OpenRouterProvider implements AIProvider {
             "Authorization": `Bearer ${this.apiKey}`,
             // Optional: identify the application for OpenRouter analytics
             "HTTP-Referer": "https://curriculum-generator-alpha.vercel.app",
-            "X-Title": "Curriculum Generator",
+            "X-Title": "Curriculize",
           },
           body: JSON.stringify(requestBody),
           signal,

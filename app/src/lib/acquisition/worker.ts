@@ -46,15 +46,15 @@ function getServiceClient() {
 }
 
 // Lazy AI provider getter
-function getAI() {
-  return getAIProvider();
+function getAI(operation: string) {
+  return getAIProvider(undefined, { operation });
 }
 
 /**
  * Call AI provider with web search for curriculum skeleton.
  */
 async function callAISkeleton(prompt: string): Promise<string> {
-  const textResult: AICompleteResult = await getAI().complete(prompt, { useSearch: true, maxTokens: 4000 });
+  const textResult: AICompleteResult = await getAI("worker_initial_discovery").complete(prompt, { useSearch: true, maxTokens: 4000 });
   return textResult.text;
 }
 
@@ -62,7 +62,7 @@ async function callAISkeleton(prompt: string): Promise<string> {
  * Call AI provider for source discovery (no search).
  */
 async function callAISources(prompt: string): Promise<string> {
-  const textResult: AICompleteResult = await getAI().complete(prompt, { useSearch: false, maxTokens: 2000 });
+  const textResult: AICompleteResult = await getAI("worker_source_discovery").complete(prompt, { useSearch: false, maxTokens: 2000 });
   return textResult.text;
 }
 
@@ -70,7 +70,7 @@ async function callAISources(prompt: string): Promise<string> {
  * Call AI provider for topic-level resource discovery.
  */
 async function callAIDiscover(prompt: string): Promise<string> {
-  const textResult: AICompleteResult = await getAI().complete(prompt, { useSearch: true, maxTokens: 2000 });
+  const textResult: AICompleteResult = await getAI("worker_topic_discovery").complete(prompt, { useSearch: true, maxTokens: 2000 });
   return textResult.text;
 }
 
@@ -78,7 +78,7 @@ async function callAIDiscover(prompt: string): Promise<string> {
  * Call AI provider for per-understanding batch discovery.
  */
 async function callAITopicBatch(prompt: string): Promise<string> {
-  const textResult: AICompleteResult = await getAI().complete(prompt, { useSearch: true, maxTokens: 2000 });
+  const textResult: AICompleteResult = await getAI("worker_resource_discovery").complete(prompt, { useSearch: true, maxTokens: 2000 });
   return textResult.text;
 }
 

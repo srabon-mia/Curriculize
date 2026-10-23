@@ -112,6 +112,10 @@ export interface AIStructuredResult<T> {
     inputTokens: number;
     outputTokens: number;
   };
+  /** Search results used to ground this structured response, when useSearch=true */
+  searchCitations?: AISearchCitation[];
+  /** Whether the required web search completed before structured generation */
+  searchCompleted?: boolean;
 }
 
 /**
