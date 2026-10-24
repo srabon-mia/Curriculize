@@ -95,6 +95,12 @@ export default function GeneratePage({
         reconnectAttemptsRef.current = 0;
       }
 
+      // A durable status response proves the job can still be observed. Do not
+      // let earlier network errors exhaust the client retry budget.
+      if (["pending", "running", "waiting", "status_unavailable"].includes(data.step)) {
+        reconnectAttemptsRef.current = 0;
+      }
+
       if (data.step === "already_claimed") {
         es.close();
         router.push(`/curriculum/${id}`);
@@ -167,6 +173,19 @@ export default function GeneratePage({
           reconnectTimerRef.current = null;
           connectRef.current?.();
         }, 2000);
+      }
+    });
+
+    // The server intentionally closes its observer stream before the route
+    // execution limit. Reconnect without counting this as a transport failure.
+    es.addEventListener("continue", () => {
+      es.close();
+      if (esRef.current === es) esRef.current = null;
+      if (reconnectTimerRef.current === null) {
+        reconnectTimerRef.current = setTimeout(() => {
+          reconnectTimerRef.current = null;
+          connectRef.current?.();
+        }, 1000);
       }
     });
 

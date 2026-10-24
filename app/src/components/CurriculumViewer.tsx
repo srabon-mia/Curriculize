@@ -23,6 +23,8 @@ const RESOURCE_TYPE_COLOR: Record<string, string> = {
   other: "bg-canvas-subtle text-text-secondary border border-border-default",
 };
 
+type CoverageSummary = { topicShortfalls: number; understandingShortfalls: number };
+
 function ResourceLink({ resource }: { resource: Resource }) {
   const typeLabel =
     RESOURCE_TYPE_LABEL[resource.resource_type] ?? "Resource";
@@ -78,6 +80,7 @@ export function CurriculumViewer({
   );
   const [generationFinished, setGenerationFinished] = useState(false);
   const [coverageStatus, setCoverageStatus] = useState<"pending" | "complete" | "insufficient" | "failed">("pending");
+  const [coverageSummary, setCoverageSummary] = useState<CoverageSummary | null>(null);
 
   // Poll for background resource updates every 30 seconds
   // Stops only after quality targets are met or generation reaches a terminal state.
@@ -97,19 +100,25 @@ export function CurriculumViewer({
         complete: boolean;
         generation_finished?: boolean;
         coverage_status?: "pending" | "complete" | "insufficient" | "failed";
+        topics?: Array<{ sufficient: boolean }>;
+        understandings?: Array<{ sufficient: boolean }>;
       };
+
+      if (Array.isArray(data.topics) && Array.isArray(data.understandings)) {
+        setCoverageSummary({
+          topicShortfalls: data.topics.filter((topic) => !topic.sufficient).length,
+          understandingShortfalls: data.understandings.filter((understanding) => !understanding.sufficient).length,
+        });
+      }
 
       if (data.complete) {
         stopped = true;
+        setGenerationFinished(true);
         setCoverageStatus("complete");
-        return;
-      }
-
-      if (data.generation_finished) {
+      } else if (data.generation_finished) {
         stopped = true;
         setGenerationFinished(true);
         setCoverageStatus(data.coverage_status ?? "failed");
-        return;
       }
 
       // Refetch all resources for the current node
@@ -290,6 +299,16 @@ export function CurriculumViewer({
       <div className="flex-1 overflow-y-auto">
         {selectedNode && (
           <div className="max-w-3xl mx-auto px-6 sm:px-10 py-8 sm:py-10">
+            {generationFinished && coverageStatus === "insufficient" && (
+              <div className="mb-6 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900" role="status">
+                <p className="font-semibold">Generation finished, but resource coverage is incomplete.</p>
+                <p className="mt-1">
+                  {coverageSummary
+                    ? `${coverageSummary.topicShortfalls} topic(s) are below 3 resources and ${coverageSummary.understandingShortfalls} concept(s) are below 2.`
+                    : "Some topics or concepts have fewer verified resources than the quality targets."} Available verified resources remain listed; sections below show the gaps.
+                </p>
+              </div>
+            )}
             {/* Topic header */}
             <div className="mb-8 pb-6 border-b border-border-subtle">
               <p className="text-xs font-display font-semibold uppercase tracking-[0.18em] text-brand-forest mb-2">
@@ -498,4 +517,4 @@ export function CurriculumViewer({
       </div>
     </div>
   );
-}
+}

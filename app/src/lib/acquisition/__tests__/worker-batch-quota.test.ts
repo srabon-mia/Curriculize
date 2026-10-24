@@ -141,5 +141,6 @@ describe('durable worker batch quota', () => {
     expect(mocks.releaseJobClaim).toHaveBeenCalledTimes(3);
     expect(mocks.getJobById).toHaveBeenCalledTimes(4);
     expect(mocks.getJobById).toHaveBeenCalledWith('same-job');
+    expect(mocks.complete.mock.calls.every(([, options]) => options.maxTokens === 4000)).toBe(true);
   });
 });

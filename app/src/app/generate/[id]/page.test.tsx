@@ -165,6 +165,28 @@ describe("GeneratePage - EventSource connection", () => {
     vi.useRealTimers();
   });
 
+  it("does not exhaust retries while durable status is observable and reconnects after an observer window", async () => {
+    vi.useFakeTimers();
+    const { queryByText, unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      act(() => eventSourceInstances[eventSourceInstances.length - 1].listeners.get("error")?.({ data: undefined } as MessageEvent));
+      await act(async () => vi.advanceTimersByTimeAsync(2000));
+    }
+    act(() => eventSourceInstances[eventSourceInstances.length - 1].listeners.get("status")?.({
+      data: JSON.stringify({ message: "Generation is still running", step: "running", job_id: "job-1" }),
+    } as MessageEvent));
+    act(() => eventSourceInstances[eventSourceInstances.length - 1].listeners.get("continue")?.({ data: "{}" } as MessageEvent));
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+
+    expect(eventSourceInstances).toHaveLength(6);
+    expect(queryByText(/could not make progress after several attempts/i)).toBeNull();
+    unmount();
+    vi.useRealTimers();
+  });
+
   it("does not reset the retry limit when the same unfinished topic reports discovery again", async () => {
     vi.useFakeTimers();
     const { getByText, unmount } = render(

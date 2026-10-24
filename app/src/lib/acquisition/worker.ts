@@ -100,7 +100,10 @@ async function callAIDiscover(prompt: string): Promise<string> {
  * Call AI provider for per-understanding batch discovery.
  */
 async function callAITopicBatch(prompt: string): Promise<string> {
-  const textResult: AICompleteResult = await getAI("worker_resource_discovery").complete(prompt, { useSearch: true, maxTokens: 2000 });
+  // This response contains candidates for every understanding in a topic.
+  // 2,000 tokens can truncate the requested 2-per-understanding list; a
+  // larger response cap adds no extra AI call and is still bounded.
+  const textResult: AICompleteResult = await getAI("worker_resource_discovery").complete(prompt, { useSearch: true, maxTokens: 4000 });
   return textResult.text;
 }
 
@@ -204,7 +207,7 @@ function parseCandidates(text: string): ResourceCandidate[] {
 /**
  * Parse per-understanding batch resources from AI response.
  */
-interface BatchResource {
+export interface BatchResource {
   url: string;
   title: string;
   resource_type: string;
@@ -214,16 +217,84 @@ interface BatchResource {
   understanding_codes: string[];
 }
 
-function parseBatchResources(text: string): BatchResource[] {
-  try {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return [];
-    const parsed = JSON.parse(match[0]);
-    if (!Array.isArray(parsed.topic_resources)) return [];
-    return parsed.topic_resources as BatchResource[];
-  } catch {
-    return [];
+function normalizeBatchResource(value: unknown): BatchResource | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.url !== "string" || !candidate.url.trim() ||
+      typeof candidate.title !== "string" || !candidate.title.trim() ||
+      !Array.isArray(candidate.understanding_codes) || candidate.understanding_codes.length === 0 ||
+      !candidate.understanding_codes.every((code) => typeof code === "string" && code.trim())) {
+    return null;
   }
+  return {
+    url: candidate.url,
+    title: candidate.title,
+    resource_type: typeof candidate.resource_type === "string" ? candidate.resource_type : "other",
+    source_domain: typeof candidate.source_domain === "string" ? candidate.source_domain : "",
+    ai_note: typeof candidate.ai_note === "string" ? candidate.ai_note : "",
+    license_status: typeof candidate.license_status === "string" ? candidate.license_status : "link_only",
+    understanding_codes: candidate.understanding_codes as string[],
+  };
+}
+
+/**
+ * Parse complete candidates even when the model truncates the outer JSON after
+ * emitting valid resource objects. Incomplete objects are ignored; every
+ * recovered URL still passes the same acquisition and verification pipeline.
+ */
+export function parseBatchResources(text: string): BatchResource[] {
+  const keyIndex = text.indexOf('"topic_resources"');
+  const arrayStart = keyIndex < 0 ? -1 : text.indexOf("[", keyIndex);
+  if (arrayStart < 0) return [];
+
+  try {
+    const parsed: unknown = JSON.parse(text.slice(text.lastIndexOf("{", keyIndex), text.lastIndexOf("}") + 1));
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      const topicResources = (parsed as Record<string, unknown>).topic_resources;
+      if (!Array.isArray(topicResources)) return [];
+      return topicResources
+        .map(normalizeBatchResource)
+        .filter((candidate): candidate is BatchResource => candidate !== null);
+    }
+  } catch {
+    // A truncated outer object can still contain complete, independently
+    // parseable candidate objects. Fall through to the bounded scanner.
+  }
+
+  const resources: BatchResource[] = [];
+  let objectStart = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = arrayStart + 1; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === "{") {
+      if (depth === 0) objectStart = i;
+      depth++;
+    } else if (char === "}") {
+      depth--;
+      if (depth === 0 && objectStart >= 0) {
+        try {
+          const resource = normalizeBatchResource(JSON.parse(text.slice(objectStart, i + 1)));
+          if (resource) resources.push(resource);
+        } catch {
+          // Ignore this malformed item and continue parsing later complete ones.
+        }
+        objectStart = -1;
+      }
+    } else if (char === "]" && depth === 0) {
+      break;
+    }
+  }
+  return resources;
 }
 
 /**
@@ -767,74 +838,105 @@ export async function processBatchDiscovery(
         if (!reservation.reserved) {
           return reservation.reason === "budget_exhausted" ? "budget_exhausted" : "ownership_lost";
         }
-        const batchResources = parseBatchResources(await callAITopicBatch(prompt));
+        const batchText = await callAITopicBatch(prompt);
+        const batchResources = parseBatchResources(batchText);
+        let associatedTargetCount = 0;
+        let malformedCandidateCount = 0;
+        let fetchFailureCount = 0;
+        let verificationFailureCount = 0;
+        let persistedAssociationCount = 0;
         for (const candidate of batchResources) {
-        if (!candidate.url || !candidate.title) continue;
+          if (!candidate.url || !candidate.title) continue;
 
-        const targetMuIds = mapUnderstandingCodesToIds(
-          candidate.understanding_codes,
-          muRows.map((mu) => ({
-            id: mu.id as string,
-            code: (mu.code as string | null) ?? null,
-            external_key: (mu.external_key as string | null) ?? null,
-          }))
-        );
-        if (targetMuIds.length === 0) {
-          console.warn(`[worker] Skipping unassociated batch resource for topic ${nodeId}`);
-          continue;
-        }
-
-        for (const muId of targetMuIds) {
-          const discoveryCandidate = {
-            url: candidate.url,
-            title: candidate.title,
-            sourceDomain: candidate.source_domain || new URL(candidate.url).hostname,
-            resourceType: normalizeResourceType(candidate.resource_type),
-            aiNote: candidate.ai_note || '',
-          };
-
-          const licenseStatus = candidate.license_status === 'cc_open' ? 'cc_open' : 'link_only';
-          const resourceType = normalizeResourceType(candidate.resource_type);
-
-          const acquisitionResult = await acquireCandidate(
-            { url: discoveryCandidate.url, title: discoveryCandidate.title, sourceDomain: discoveryCandidate.sourceDomain, resourceType, aiNote: discoveryCandidate.aiNote },
-            { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000 },
+          const targetMuIds = mapUnderstandingCodesToIds(
+            candidate.understanding_codes,
+            muRows.map((mu) => ({
+              id: mu.id as string,
+              code: (mu.code as string | null) ?? null,
+              external_key: (mu.external_key as string | null) ?? null,
+            }))
           );
-
-          if (!acquisitionResult.success || !acquisitionResult.acquiredPage || !acquisitionResult.structuredContent) continue;
-
-          const { acquiredPage, structuredContent } = acquisitionResult;
-          let educationalEvidence: ReturnType<typeof extractEducationalEvidence>;
-          let verificationResult: VerificationResult;
-          try {
-            educationalEvidence = extractEducationalEvidence(structuredContent);
-            verificationResult = verifyContent({
-              acquiredPage: {
-                contentHash: acquiredPage.contentHash,
-                canonicalUrl: acquiredPage.canonicalUrl.url,
-                finalUrl: acquiredPage.finalUrl,
-                statusCode: acquiredPage.statusCode,
-                contentType: acquiredPage.contentType,
-                acquiredAt: acquiredPage.acquiredAt,
-              },
-              structuredContent,
-              educationalEvidence,
-            });
-          } catch {
+          if (targetMuIds.length === 0) {
+            malformedCandidateCount++;
+            console.warn(`[worker] Skipping unassociated batch resource for topic ${nodeId}`);
             continue;
           }
-          const persistResult = await persistWithFence(job.id, job.claim_token, {
-            acquiredPage,
-            structuredContent,
-            educationalEvidence,
-            verificationResult,
-            target: { understandingId: muId },
-            acquisitionJobId: job.id,
-            callerMetadata: { resourceType, licenseStatus, aiNote: candidate.ai_note ?? null },
-          });
-          requireSuccessfulPersistence(persistResult, job.id, nodeId);
+          associatedTargetCount += targetMuIds.length;
+
+          for (const muId of targetMuIds) {
+            let sourceDomain = candidate.source_domain;
+            try {
+              sourceDomain ||= new URL(candidate.url).hostname;
+            } catch {
+              malformedCandidateCount++;
+              continue;
+            }
+            const discoveryCandidate = {
+              url: candidate.url,
+              title: candidate.title,
+              sourceDomain,
+              resourceType: normalizeResourceType(candidate.resource_type),
+              aiNote: candidate.ai_note || '',
+            };
+
+            const licenseStatus = candidate.license_status === 'cc_open' ? 'cc_open' : 'link_only';
+            const resourceType = normalizeResourceType(candidate.resource_type);
+
+            const acquisitionResult = await acquireCandidate(
+              { url: discoveryCandidate.url, title: discoveryCandidate.title, sourceDomain: discoveryCandidate.sourceDomain, resourceType, aiNote: discoveryCandidate.aiNote },
+              { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000 },
+            );
+
+            if (!acquisitionResult.success || !acquisitionResult.acquiredPage || !acquisitionResult.structuredContent) {
+              fetchFailureCount++;
+              continue;
+            }
+
+            const { acquiredPage, structuredContent } = acquisitionResult;
+            let educationalEvidence: ReturnType<typeof extractEducationalEvidence>;
+            let verificationResult: VerificationResult;
+            try {
+              educationalEvidence = extractEducationalEvidence(structuredContent);
+              verificationResult = verifyContent({
+                acquiredPage: {
+                  contentHash: acquiredPage.contentHash,
+                  canonicalUrl: acquiredPage.canonicalUrl.url,
+                  finalUrl: acquiredPage.finalUrl,
+                  statusCode: acquiredPage.statusCode,
+                  contentType: acquiredPage.contentType,
+                  acquiredAt: acquiredPage.acquiredAt,
+                },
+                structuredContent,
+                educationalEvidence,
+              });
+            } catch {
+              verificationFailureCount++;
+              continue;
+            }
+            if (verificationResult.status !== 'verified') verificationFailureCount++;
+            const persistResult = await persistWithFence(job.id, job.claim_token, {
+              acquiredPage,
+              structuredContent,
+              educationalEvidence,
+              verificationResult,
+              target: { understandingId: muId },
+              acquisitionJobId: job.id,
+              callerMetadata: { resourceType, licenseStatus, aiNote: candidate.ai_note ?? null },
+            });
+            requireSuccessfulPersistence(persistResult, job.id, nodeId);
+            persistedAssociationCount++;
+          }
         }
-        }
+        console.info('[worker] Batch candidate processing summary', {
+          topic_id: nodeId,
+          response_chars: batchText.length,
+          parsed_candidates: batchResources.length,
+          associated_targets: associatedTargetCount,
+          malformed_or_unassociated: malformedCandidateCount,
+          fetch_failures: fetchFailureCount,
+          verification_failures: verificationFailureCount,
+          persisted_rows: persistedAssociationCount,
+        });
         return "attempted";
       },
       measureEligibleResources: async () => {

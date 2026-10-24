@@ -665,7 +665,217 @@ export async function failJob(
   return true;
 }
 
+const OBSERVER_POLL_MS = 10_000;
+const OBSERVER_WINDOW_MS = 3.5 * 60_000;
+
+/**
+ * The browser connection only observes durable state. The scheduled processor
+ * is the sole owner of discovery work; this stream yields before Vercel's
+ * request limit so the client can reconnect without starting another job.
+ */
 export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params;
+  const encoder = new TextEncoder();
+  let closed = false;
+  let cancelPoll: (() => void) | null = null;
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (event: string, data: unknown) => {
+        if (closed || request.signal.aborted) return;
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      };
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        try { controller.close(); } catch { /* client disconnected */ }
+      };
+
+      try {
+        const { data: curriculum, error: curriculumError } = await supabase
+          .from("curricula")
+          .select("title, notes")
+          .eq("id", id)
+          .single();
+        if (curriculumError) {
+          send("status", { message: "Checking saved generation status…", step: "status_unavailable" });
+          send("continue", {});
+          close();
+          return;
+        }
+        if (!curriculum) {
+          send("error", { message: "Curriculum not found." });
+          close();
+          return;
+        }
+
+        const notes = curriculum.notes ? JSON.parse(curriculum.notes) as Record<string, unknown> : {};
+        const inputData = {
+          topic: curriculum.title,
+          grade_level: notes.grade_level ?? "high school",
+          difficulty: notes.difficulty ?? "standard",
+          existing_knowledge: notes.existing_knowledge ?? "",
+          learning_goal: notes.learning_goal ?? "understand the subject",
+          time_available: notes.time_available ?? "no time pressure",
+          added_context: notes.added_context ?? "",
+        };
+
+        // A reconnect to a terminal job must observe it, never create a second job.
+        const { data: latestJob, error: latestError } = await supabase
+          .from("acquisition_jobs")
+          .select("id, status, error, result_data")
+          .eq("curriculum_id", id)
+          .eq("job_type", "curriculum_generation")
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (latestError) {
+          send("status", { message: "Generation is saved; checking its latest status…", step: "status_unavailable" });
+          send("continue", {});
+          close();
+          return;
+        }
+
+        if (latestJob?.status === "completed") {
+          send("complete", { curriculum_id: id, phase: "background" });
+          close();
+          return;
+        }
+        if (latestJob?.status === "failed") {
+          send("error", { message: latestJob.error || "Generation failed." });
+          close();
+          return;
+        }
+
+        let jobId = latestJob?.id as string | undefined;
+        if (!jobId) {
+          const { data: inserted, error: insertError } = await supabase
+            .from("acquisition_jobs")
+            .insert({
+              curriculum_id: id,
+              job_type: "curriculum_generation",
+              status: "pending",
+              input_data: inputData,
+              budget_limits: DEFAULT_BUDGET_LIMITS,
+              created_by: null,
+            })
+            .select("id")
+            .single();
+
+          if (insertError?.code === "23505") {
+            // Another browser request or processor created the active job.
+            // Re-read it instead of inserting a duplicate or claiming it.
+            const { data: activeJob, error: activeError } = await supabase
+              .from("acquisition_jobs")
+              .select("id, status, error, result_data")
+              .eq("curriculum_id", id)
+              .eq("job_type", "curriculum_generation")
+              .order("created_at", { ascending: false })
+              .limit(1)
+              .maybeSingle();
+            if (activeError) throw new Error(`Could not observe active generation job: ${activeError.message}`);
+            if (activeJob?.status === "completed") {
+              send("complete", { curriculum_id: id, phase: "background" });
+              close();
+              return;
+            }
+            if (activeJob?.status === "failed") {
+              send("error", { message: activeJob.error || "Generation failed." });
+              close();
+              return;
+            }
+            jobId = activeJob?.id;
+          } else if (insertError) {
+            throw new Error(`Could not create durable generation job: ${insertError.message}`);
+          } else {
+            jobId = inserted?.id;
+          }
+        }
+        if (!jobId) throw new Error("Could not register or observe the durable generation job.");
+
+        send("status", { message: "Connected to saved generation progress.", step: "reconnect", job_id: jobId, is_reconnect: true });
+        const startedAt = Date.now();
+        while (!closed && !request.signal.aborted && Date.now() - startedAt < OBSERVER_WINDOW_MS) {
+          const { data: current, error } = await supabase
+            .from("acquisition_jobs")
+            .select("status, error, result_data")
+            .eq("id", jobId)
+            .single();
+
+          if (error || !current) {
+            // A temporary status read failure is not a failed generation.
+            send("status", { message: "Generation is saved; checking its latest status…", step: "status_unavailable", job_id: jobId });
+          } else if (current.status === "completed") {
+            send("complete", { curriculum_id: id, phase: "background" });
+            close();
+            return;
+          } else if (current.status === "failed") {
+            send("error", { message: current.error || "Generation failed." });
+            close();
+            return;
+          } else {
+            const resultData = current.result_data as {
+              checkpoint?: { completedTopicIds?: unknown[] };
+              batchCheckpoint?: { completedTopicIds?: unknown[] };
+            } | null;
+            const topicCount = resultData?.checkpoint?.completedTopicIds?.length ?? 0;
+            const batchCount = resultData?.batchCheckpoint?.completedTopicIds?.length ?? 0;
+            const pending = current.status === "pending";
+            send("status", {
+              message: pending
+                ? "Generation is queued and will resume from its saved checkpoints."
+                : `Generation is running. ${topicCount} topic(s) and ${batchCount} understanding batch(es) are checkpointed.`,
+              step: pending ? "pending" : "running",
+              current: topicCount + batchCount,
+              total: -1,
+              job_id: jobId,
+            });
+          }
+
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(() => {
+              cancelPoll = null;
+              resolve();
+            }, OBSERVER_POLL_MS);
+            cancelPoll = () => {
+              clearTimeout(timer);
+              cancelPoll = null;
+              resolve();
+            };
+          });
+        }
+
+        if (!closed && !request.signal.aborted) {
+          send("continue", { job_id: jobId });
+          close();
+        }
+      } catch (error) {
+        console.error("[stream] Durable job observation failed:", error);
+        send("error", { message: "Could not read the saved generation status. Please reconnect." });
+        close();
+      }
+    },
+    cancel() {
+      // Closing the browser stream stops observation only; it never fails the job.
+      closed = true;
+      cancelPoll?.();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    },
+  });
+}
+
+// Kept for focused regression coverage of the previous inline generation
+// implementation while the durable worker owns production requests.
+export async function legacyGenerationGet(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {

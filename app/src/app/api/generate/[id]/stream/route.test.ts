@@ -47,6 +47,7 @@ let persistedResumeMus: Array<any> = [];
 let simulatedResumeJob: any = null;
 let simulatedCurriculum: any = null;
 let observerRunningJob: any = null;
+let durableJobRow: any = null;
 
 // ============================================================
 // Configurable RPC result overrides for lifecycle testing.
@@ -211,9 +212,10 @@ function createMockSupabaseClient() {
           selectChain.single = vi.fn().mockResolvedValue({
             data: resumeScenario && simulatedResumeJob
               ? { ...simulatedResumeJob, curricula: { status: "draft" } }
-              : observerRunningJob,
+              : durableJobRow ?? observerRunningJob,
             error: null,
           });
+          selectChain.maybeSingle = vi.fn().mockResolvedValue({ data: durableJobRow, error: null });
           return selectChain;
         });
         tableChain.insert = vi.fn().mockImplementation((data: any) => {
@@ -226,12 +228,21 @@ function createMockSupabaseClient() {
               data: null,
               error: { code: "23505", message: "active generation already exists" },
             });
+          } else if (!resumeScenario && durableJobRow && ["pending", "running"].includes(durableJobRow.status)) {
+            insertChain.single = vi.fn().mockResolvedValue({
+              data: null,
+              error: { code: "23505", message: "active generation already exists" },
+            });
           } else if (jobInsertMockError) {
             insertChain.single = vi.fn().mockResolvedValue({
               data: null,
               error: jobInsertMockError,
             });
           } else {
+            durableJobRow = {
+              id: "job-1", claim_token: "tok-real-uuid", claim_version: 1,
+              status: data.status, result_data: {}, curriculum_id: data.curriculum_id,
+            };
             if (resumeScenario) {
               simulatedResumeJob = {
                 id: "job-1", claim_token: "tok-real-uuid", claim_version: 1,
@@ -275,6 +286,12 @@ function createMockSupabaseClient() {
 
       // Default: claim_next_job returns null (no pending job found)
       if (name === "claim_next_job") {
+        if (!resumeScenario && durableJobRow?.status === "pending") {
+          durableJobRow.status = "running";
+          durableJobRow.claim_token = "tok-reclaimed";
+          durableJobRow.claim_version += 1;
+          return Promise.resolve({ data: durableJobRow, error: null });
+        }
         if (resumeScenario && simulatedResumeJob?.status === "pending") {
           simulatedResumeJob.status = "running";
           simulatedResumeJob.claim_version += 1;
@@ -310,6 +327,11 @@ function createMockSupabaseClient() {
       }
       if (resumeScenario && name === "release_job_claim") {
         simulatedResumeJob.status = "pending";
+        return Promise.resolve({ data: true, error: null });
+      }
+      if (!resumeScenario && name === "release_job_claim" && durableJobRow) {
+        durableJobRow.status = "pending";
+        durableJobRow.claim_token = null;
         return Promise.resolve({ data: true, error: null });
       }
       if (resumeScenario && name === "save_job_sources") {
@@ -377,7 +399,9 @@ vi.mock("@/lib/acquisition/jobTypes", () => ({
 }));
 
 // Import the route AFTER all mocks are registered
-const { GET } = await import("./route");
+// These integration tests retain coverage of the former inline implementation;
+// production GET now only observes jobs owned by the durable processor.
+const { legacyGenerationGet: GET, GET: observeGeneration } = await import("./route");
 
 // ============================================================
 // Test data factories
@@ -634,6 +658,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     simulatedResumeJob = null;
     simulatedCurriculum = null;
     observerRunningJob = null;
+    durableJobRow = null;
 
     mockAIInstance = new MockProvider();
     vi.mocked((await import("@/lib/ai")).getAIProvider).mockImplementation(() => mockAIInstance);
@@ -675,6 +700,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     persistedResumeMus = [];
     simulatedResumeJob = null;
     simulatedCurriculum = null;
+    durableJobRow = null;
     mockAIInstance = undefined as any;
   });
 
@@ -1454,6 +1480,15 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
 // ============================================================
 
 describe("Skeleton JSON parsing robustness", () => {
+  beforeEach(() => {
+    durableJobRow = null;
+    observerRunningJob = null;
+    jobInsertMockError = null;
+    resumeScenario = false;
+    resetRpcOverrides();
+    resetRpcSequences();
+  });
+
   // Helper to create a mock curriculum with nodes
   function createMockCurriculumWithNodes() {
     return {
@@ -1630,6 +1665,7 @@ describe("Skeleton retry with budget/ownership checks", () => {
     originalSetInterval = global.setInterval;
     heartbeatCallback = undefined;
     heartbeatTimer = undefined;
+    durableJobRow = null;
     vi.clearAllMocks();
     capturedInserts.length = 0;
     capturedNodeInserts.length = 0;
@@ -1844,5 +1880,107 @@ describe("Skeleton retry with budget/ownership checks", () => {
       (e) => e.event === "error" && e.data.message.includes("ownership")
     );
     expect(ownershipLostEvents.length).toBeGreaterThan(0);
+  });
+});
+
+describe("Durable generation stream observer", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetRpcOverrides();
+    resetRpcSequences();
+    jobInsertMockError = null;
+    resumeScenario = false;
+    simulatedResumeJob = null;
+    simulatedCurriculum = null;
+    observerRunningJob = null;
+    durableJobRow = null;
+    capturedInserts.length = 0;
+  });
+
+  async function readEvents(response: Response, count = 4): Promise<string[]> {
+    const reader = response.body!.getReader();
+    const events: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const result = await reader.read();
+      if (result.done) break;
+      events.push(new TextDecoder().decode(result.value));
+      if (events.some((chunk) => chunk.includes("event: complete") || chunk.includes("event: error"))) break;
+    }
+    await reader.cancel();
+    return events;
+  }
+
+  function request(): Request {
+    return new Request("http://localhost/api/generate/test-curriculum-id/stream", {
+      headers: { Accept: "text/event-stream" },
+    });
+  }
+
+  it("observes a running job after the prior stream owner disappeared, without doing discovery", async () => {
+    durableJobRow = {
+      id: "job-1", status: "running", error: null, claim_token: "prior-owner",
+      claim_version: 3, result_data: { checkpoint: { completedTopicIds: ["topic-1"] } },
+    };
+    const response = await observeGeneration(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const events = await readEvents(response, 2);
+
+    expect(events.join("\n")).toContain('"step":"running"');
+    expect(events.join("\n")).toContain('"current":1');
+    expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("reserve_ai_call", expect.anything());
+    expect(durableJobRow.status).toBe("running");
+    expect(durableJobRow.result_data.checkpoint.completedTopicIds).toEqual(["topic-1"]);
+  });
+
+  it("creates one pending job and reuses it on reconnect without taking a processing claim", async () => {
+    const first = await observeGeneration(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const firstEvents = await readEvents(first, 2);
+    expect(firstEvents.join("\n")).toContain('"step":"pending"');
+    expect(durableJobRow.status).toBe("pending");
+
+    const reconnect = await observeGeneration(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const reconnectEvents = await readEvents(reconnect, 2);
+
+    expect(reconnectEvents.join("\n")).toContain('"step":"pending"');
+    expect(capturedJobInserts()).toHaveLength(1);
+    expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("claim_next_job", expect.anything());
+    expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("reserve_ai_call", expect.anything());
+  });
+
+  it("emits a terminal complete event when the durable job is completed", async () => {
+    durableJobRow = { id: "job-1", status: "completed", error: null, result_data: {} };
+
+    const response = await observeGeneration(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const events = await readEvents(response);
+
+    expect(events.join("\n")).toContain("event: complete");
+    expect(events.join("\n")).not.toContain("event: continue");
+    expect(capturedJobInserts()).toHaveLength(0);
+  });
+
+  it("emits the durable failure instead of retrying or creating another job", async () => {
+    durableJobRow = { id: "job-1", status: "failed", error: "saved worker failure", result_data: {} };
+
+    const response = await observeGeneration(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const events = await readEvents(response);
+
+    expect(events.join("\n")).toContain("event: error");
+    expect(events.join("\n")).toContain("saved worker failure");
+    expect(capturedJobInserts()).toHaveLength(0);
+  });
+
+  it("reclaims a pending job through the existing claim path without duplicating its checkpoint", async () => {
+    durableJobRow = {
+      id: "job-1", status: "pending", error: null, claim_token: null,
+      claim_version: 4, result_data: { checkpoint: { completedTopicIds: ["topic-1"] } },
+    };
+
+    const response = await observeGeneration(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const events = await readEvents(response, 2);
+
+    expect(events.join("\n")).toContain('"step":"pending"');
+    expect(durableJobRow.id).toBe("job-1");
+    expect(durableJobRow.result_data.checkpoint.completedTopicIds).toEqual(["topic-1"]);
+    expect(capturedJobInserts()).toHaveLength(0);
+    expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("reserve_ai_call", expect.anything());
   });
 });
