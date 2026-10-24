@@ -27,6 +27,7 @@ import { buildDiscoverPrompt, buildTopicBatchPrompt } from '@/lib/prompts/discov
 import { buildSourceDiscoveryPrompt } from '@/lib/prompts/sources';
 import { buildSkeletonPrompt } from '@/lib/prompts/skeleton';
 import { getAIProvider } from '@/lib/ai';
+import { normalizeResourceType } from '@/lib/acquisition/resourceTypes';
 import { getNodesWithUnderstandings, type NodeWithChildren } from '@/lib/curriculum-data';
 import { createClient } from '@supabase/supabase-js';
 import type { AICompleteResult } from '@/lib/ai/types';
@@ -551,14 +552,11 @@ export async function processJob(job: JobClaimResult): Promise<void> {
       const candidates = parseCandidates(topicText);
 
       // Process candidates through acquisition pipeline
-      const validTypes = ['video', 'text', 'textbook', 'problem_set', 'reference_tool', 'practice_exam', 'other'];
-
       for (const candidate of candidates) {
         if (!candidate.url || !candidate.title) continue;
 
-        const resourceType = ['video', 'text', 'textbook', 'problem_set', 'reference_tool', 'practice_exam', 'other'].includes(candidate.resource_type)
-          ? candidate.resource_type : 'other';
-        const mappedCandidate = mapToDiscoveryCandidate(candidate, []);
+        const resourceType = normalizeResourceType(candidate.resource_type);
+        const mappedCandidate = mapToDiscoveryCandidate({ ...candidate, resource_type: resourceType }, []);
 
         // Acquire and process through pipeline (deterministic - no AI call)
         const acquisitionResult = await acquireCandidate(
@@ -815,12 +813,12 @@ async function processBatchDiscovery(
             url: candidate.url,
             title: candidate.title,
             sourceDomain: candidate.source_domain || new URL(candidate.url).hostname,
-            resourceType: candidate.resource_type || 'other',
+            resourceType: normalizeResourceType(candidate.resource_type),
             aiNote: candidate.ai_note || '',
           };
 
           const licenseStatus = candidate.license_status === 'cc_open' ? 'cc_open' : 'link_only';
-          const resourceType = candidate.resource_type || 'other';
+          const resourceType = normalizeResourceType(candidate.resource_type);
 
           const acquisitionResult = await acquireCandidate(
             { url: discoveryCandidate.url, title: discoveryCandidate.title, sourceDomain: discoveryCandidate.sourceDomain, resourceType, aiNote: discoveryCandidate.aiNote },

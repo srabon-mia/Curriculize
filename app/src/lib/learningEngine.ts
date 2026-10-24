@@ -42,6 +42,7 @@ import {
   type DiscoveryCandidate,
   type AcquisitionResult,
 } from "@/lib/acquisition";
+import { normalizeResourceType } from "@/lib/acquisition/resourceTypes";
 import { extractEducationalEvidence } from "@/lib/evidence";
 import { verifyContent, type VerificationResult } from "@/lib/verification";
 import {
@@ -198,7 +199,7 @@ export async function discoverVerifiedResource(
     verificationResult,
     target: params.target,
     callerMetadata: {
-      resourceType: params.candidate.resourceType,
+      resourceType: normalizeResourceType(params.candidate.resourceType),
       licenseStatus: params.candidate.licenseStatus,
       aiNote: params.candidate.aiNote,
     },

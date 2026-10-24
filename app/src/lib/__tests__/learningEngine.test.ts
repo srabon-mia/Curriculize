@@ -169,6 +169,27 @@ describe("discoverVerifiedResource — Phase 12 cutover", () => {
     expect(pIn.verificationResult.status).toBe("verified");
   });
 
+  it.each([
+    ["text|practice_exam", "text"],
+    ["unsupported_resource_type", "other"],
+    ["video", "video"],
+  ])("normalizes persistence resource type %s to %s", async (inputResourceType, expectedResourceType) => {
+    mockedAcquire.mockResolvedValue({ candidate: { url: "https://example.org/lesson/intro" }, success: true, acquiredPage, cleanedPage, structuredContent } as AcquisitionResult);
+    mockedVerify.mockReturnValue(verifiedResult());
+    mockedPersist.mockResolvedValue(persistedResource());
+
+    await discoverVerifiedResource(
+      {
+        candidate: { url: "https://example.org/lesson/intro", resourceType: inputResourceType },
+        target: { nodeId: "node-1" },
+      },
+      { cache }
+    );
+
+    expect(mockedPersist).toHaveBeenCalledTimes(1);
+    expect(mockedPersist.mock.calls[0][0].callerMetadata?.resourceType).toBe(expectedResourceType);
+  });
+
   it("acquisition failure returns null and does NOT call verify or persist", async () => {
     mockedAcquire.mockResolvedValue({ candidate: { url: "https://broken.test/x" }, success: false, error: { code: "ACQUISITION_FAILED", message: "timeout" } } as AcquisitionResult);
 

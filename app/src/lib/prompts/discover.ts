@@ -75,7 +75,7 @@ Return ONLY a JSON object, no other text, no markdown backticks:
     {
       "url": "...",
       "title": "...",
-      "resource_type": "video|text|textbook|problem_set|reference_tool|practice_exam|other",
+      "resource_type": "text",
       "source_domain": "...",
       "ai_note": "one sentence why this is useful",
       "license_status": "cc_open|link_only",
@@ -87,6 +87,7 @@ Return ONLY a JSON object, no other text, no markdown backticks:
 Rules:
 - Find 8-12 resources total that collectively cover all the concepts
 - Each resource should list which understanding codes it covers in understanding_codes
+- resource_type must be exactly one of: "video", "text", "textbook", "problem_set", "reference_tool", "practice_exam", "other". Do not combine values.
 - If a resource covers the whole topic generally, list all codes
 - Only freely accessible resources, no login or payment required
 - Match difficulty to the course level — advanced courses need advanced resources

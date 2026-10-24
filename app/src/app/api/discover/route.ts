@@ -9,6 +9,7 @@ import {
   type AcquisitionResult,
   DEFAULT_ACQUISITION_OPTIONS,
 } from "@/lib/acquisition";
+import { normalizeResourceType } from "@/lib/acquisition/resourceTypes";
 import { extractEducationalEvidence } from "@/lib/evidence";
 import { verifyContent } from "@/lib/verification";
 import { persistVerifiedResource, type PersistenceResult } from "@/lib/persistence";
@@ -24,11 +25,6 @@ type ResourceCandidate = {
   ai_note: string;
   license_status: "cc_open" | "link_only" | "unknown_review_needed";
 };
-
-const VALID_TYPES = [
-  "video", "text", "textbook", "problem_set",
-  "reference_tool", "practice_exam", "other"
-];
 
 // Lazy AI provider getter - avoids initialization at module load time (build time)
 function getAI(operation: string): ReturnType<typeof getAIProvider> {
@@ -240,12 +236,10 @@ export async function POST(request: Request) {
     }
 
     // Validate resource type
-    const resourceType = VALID_TYPES.includes(candidate.resource_type)
-      ? candidate.resource_type
-      : "other";
+    const resourceType = normalizeResourceType(candidate.resource_type);
 
     // Map to DiscoveryCandidate for the acquisition pipeline
-    const discoveryCandidate = mapToDiscoveryCandidate(candidate);
+    const discoveryCandidate = mapToDiscoveryCandidate({ ...candidate, resource_type: resourceType });
 
     // ---- ACQUISITION ----
     // Check budget before acquisition (network call, may take several seconds)
