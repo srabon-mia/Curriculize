@@ -111,6 +111,7 @@ export function CurriculumViewer({
         });
       }
 
+      const terminal = data.complete || data.generation_finished === true;
       if (data.complete) {
         stopped = true;
         setGenerationFinished(true);
@@ -121,39 +122,16 @@ export function CurriculumViewer({
         setCoverageStatus(data.coverage_status ?? "failed");
       }
 
-      // Refetch all resources for the current node
-      if (selectedNodeId) {
-        const nodeRes = await fetch(`/api/resources?node_id=${selectedNodeId}`);
-        if (nodeRes.ok) {
-          const nodeData = await nodeRes.json();
-          // Apply eligibility gate: only approved + content_type_verified resources
-          const eligibleNodeResources = (nodeData.resources ?? []).filter(
-            (r: Resource) => r.status === "approved" && r.content_type_verified === true
-          );
-          // Also fetch MU resources
-          const currentNode = nodes.find((n) => n.id === selectedNodeId);
-          if (currentNode) {
-            const muFetches = currentNode.major_understandings.map(async (mu) => {
-              const muRes = await fetch(
-                `/api/resources?major_understanding_id=${mu.id}`
-              );
-              if (muRes.ok) {
-                const muData = await muRes.json();
-                const eligibleMuResources = (muData.resources ?? []).filter(
-                  (r: Resource) => r.status === "approved" && r.content_type_verified === true
-                );
-                setResourcesByTarget((prev) => ({
-                  ...prev,
-                  [`mu:${mu.id}`]: eligibleMuResources,
-                }));
-              }
-            });
-            await Promise.all(muFetches);
+      // The public assembly endpoint returns every displayed target and applies
+      // the same approved + verified filter as the server-rendered page.
+      // Refresh the full map at terminal status; /api/resources is admin-only.
+      if (terminal) {
+        const assemblyRes = await fetch(`/api/curricula/${curriculumId}/assemble`);
+        if (assemblyRes.ok) {
+          const assemblyData = await assemblyRes.json();
+          if (assemblyData.resourcesByTarget && typeof assemblyData.resourcesByTarget === "object") {
+            setResourcesByTarget(assemblyData.resourcesByTarget as Record<string, Resource[]>);
           }
-          setResourcesByTarget((prev) => ({
-            ...prev,
-            [`node:${selectedNodeId}`]: eligibleNodeResources,
-          }));
         }
       }
     }
@@ -239,15 +217,11 @@ export function CurriculumViewer({
           {nodes.map((node) => {
             const isSelected = node.id === selectedNodeId;
             const muCount = node.major_understandings.length;
-            const resourceCount = Object.entries(resourcesByTarget)
-              .filter(
-                ([key]) =>
-                  key === `node:${node.id}` ||
-                  node.major_understandings.some(
-                    (mu) => key === `mu:${mu.id}`
-                  )
-              )
-              .reduce((sum, [, rs]) => sum + rs.length, 0);
+            const topicResourceCount = (resourcesByTarget[`node:${node.id}`] ?? []).length;
+            const conceptResourceCount = node.major_understandings.reduce(
+              (sum, mu) => sum + (resourcesByTarget[`mu:${mu.id}`] ?? []).length,
+              0
+            );
 
             return (
               <li key={node.id}>
@@ -271,14 +245,14 @@ export function CurriculumViewer({
                     <span className="text-[11px] text-text-tertiary">
                       {muCount} concept{muCount !== 1 ? "s" : ""}
                     </span>
-                    {resourceCount > 0 && (
-                      <>
-                        <span className="text-border-default">·</span>
-                        <span className="text-[11px] font-medium text-brand-forest">
-                          {resourceCount} resource{resourceCount !== 1 ? "s" : ""}
-                        </span>
-                      </>
-                    )}
+                    <span className="text-border-default">·</span>
+                    <span className="text-[11px] font-medium text-brand-forest">
+                      {topicResourceCount} topic-wide
+                    </span>
+                    <span className="text-border-default">·</span>
+                    <span className="text-[11px] font-medium text-brand-forest">
+                      {conceptResourceCount} concept-level
+                    </span>
                     {node.exam_weight_pct && (
                       <>
                         <span className="text-border-default">·</span>
@@ -326,7 +300,7 @@ export function CurriculumViewer({
               )}
               {coverageStatus === "insufficient" && selectedTopicResourceCount < 3 && (
                 <p className="mt-3 text-sm text-amber-800" role="status">
-                  Resource coverage is incomplete: {selectedTopicResourceCount} verified resources are available for this topic; the quality target is at least 3.
+                  Topic-wide resource coverage is incomplete: {selectedTopicResourceCount} topic-wide verified resource{selectedTopicResourceCount === 1 ? " is" : "s are"} attached directly to this topic; the target is at least 3. Resources attached to understandings are counted separately.
                 </p>
               )}
               {coverageStatus === "failed" && (
