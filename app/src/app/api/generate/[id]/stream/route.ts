@@ -873,7 +873,8 @@ export async function GET(
             `[stream] Structured output failed, falling back to text extraction: ${err instanceof Error ? err.message : String(err)}`
           );
 
-          const skeletonText = await callAI(skeletonPrompt, true, "skeleton_fallback");
+          const fallbackPrompt = `${skeletonPrompt}\n\nFallback instructions: Create an original, logically ordered curriculum skeleton from the student's request alone. Do not claim it is adapted from a source. Set source_type to "ai_organized", source_attribution to null, and source_url to null. Do not invent citations, URLs, or claims of verification. Return only the JSON object matching the schema above.`;
+          const skeletonText = await callAI(fallbackPrompt, false, "skeleton_fallback");
 
           // Check ownership after AI call — if lost, fail the job
           if (ownershipLost) {
@@ -899,6 +900,7 @@ export async function GET(
           const skeletonParseStartTime = Date.now();
           const parsed = extractSkeletonJson(skeletonText);
           let parseDurationMs = Date.now() - skeletonParseStartTime;
+          skeletonParsed = parsed;
 
           // If initial parse failed, attempt one bounded corrective retry
           if (!parsed) {
@@ -953,8 +955,8 @@ export async function GET(
           }
 
           // Retry with explicit instruction to return valid JSON only
-          const retryPrompt = `${skeletonPrompt}\n\nIMPORTANT: Your previous response could not be parsed as valid JSON. You MUST return ONLY a valid JSON object matching the exact schema specified. No markdown, no explanation, no additional text. Start with { and end with }.`;
-          const skeletonRetry = await callAI(retryPrompt, true, "skeleton_retry");
+          const retryPrompt = `${fallbackPrompt}\n\nYour previous fallback response was invalid or did not match the schema. Correct it and return ONLY the required JSON structure. Do not include markdown, explanation, citations, URLs, or any text outside the JSON object. Ensure every required field and nested field matches the schema exactly.`;
+          const skeletonRetry = await callAI(retryPrompt, false, "skeleton_retry");
 
           // Check ownership after retry AI call
           if (ownershipLost) {

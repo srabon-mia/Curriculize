@@ -40,6 +40,7 @@ import type { LearnParams, LearnResult } from "@/lib/learningEngine";
 const capturedInserts: Array<{ table: string; resources: any[] }> = [];
 const capturedNodeInserts: Array<any> = [];
 const capturedMuInserts: Array<any> = [];
+const capturedCurriculumUpdates: Array<any> = [];
 
 // ============================================================
 // Configurable RPC result overrides for lifecycle testing.
@@ -129,9 +130,12 @@ function createMockSupabaseClient() {
           );
           return selectChain;
         });
-        tableChain.update.mockImplementation(() => ({
+        tableChain.update.mockImplementation((payload: any) => {
+          capturedCurriculumUpdates.push(payload);
+          return ({
           eq: vi.fn().mockResolvedValue({ data: null, error: null }),
-        }));
+          });
+        });
       }
 
       if (table === "nodes") {
@@ -530,6 +534,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     capturedInserts.length = 0;
     capturedNodeInserts.length = 0;
     capturedMuInserts.length = 0;
+    capturedCurriculumUpdates.length = 0;
     resetRpcOverrides();
 
     mockAIInstance = new MockProvider();
@@ -562,6 +567,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     capturedInserts.length = 0;
     capturedNodeInserts.length = 0;
     capturedMuInserts.length = 0;
+    capturedCurriculumUpdates.length = 0;
     resetRpcOverrides();
     resetRpcSequences();
     jobInsertMockError = null;
@@ -1236,6 +1242,10 @@ describe("Skeleton retry with budget/ownership checks", () => {
     heartbeatCallback = undefined;
     heartbeatTimer = undefined;
     vi.clearAllMocks();
+    capturedInserts.length = 0;
+    capturedNodeInserts.length = 0;
+    capturedMuInserts.length = 0;
+    capturedCurriculumUpdates.length = 0;
     resetRpcOverrides();
     resetRpcSequences();
     capturedInserts.length = 0;
@@ -1267,6 +1277,81 @@ describe("Skeleton retry with budget/ownership checks", () => {
     await Promise.resolve();
     await Promise.resolve();
   }
+
+  const schemaValidSkeleton = '{"title":"Fallback Curriculum","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[{"title":"Topic","order_index":1,"major_understandings":[{"code":"1.1","description":"Concept"}]}]}';
+
+  it("falls back without search after a citation-free structured search failure and persists before success", async () => {
+    const { getAIProvider } = await import("@/lib/ai");
+    const structured = vi.fn(async (_prompt: string, options: any) => {
+      throw new Error("Azure web search completed without source citations; structured discovery was not generated.");
+    });
+    const complete = vi.fn(async (prompt: string, options: any) => {
+      expect(options.useSearch).toBe(false);
+      expect(prompt).toContain('source_type to "ai_organized"');
+      return { text: schemaValidSkeleton, usage: { inputTokens: 20, outputTokens: 30 } };
+    });
+    vi.mocked(getAIProvider).mockReturnValue({
+      structured,
+      complete,
+      name: "azure",
+      capabilities: { structuredOutput: true, webSearch: true, streaming: false },
+    } as any);
+
+    const events = await runStreamAndCaptureEvents();
+    const parsed = events.map(parseSseEvent);
+    const skeletonEventIndex = parsed.findIndex((event) => event.event === "skeleton");
+    expect(structured.mock.calls[0][1].useSearch).toBe(true);
+    expect(complete).toHaveBeenCalled();
+    expect(capturedCurriculumUpdates).toContainEqual({
+      title: "Fallback Curriculum",
+      source_type: "ai_organized",
+      source_attribution: null,
+      source_url: null,
+    });
+    expect(skeletonEventIndex).toBeGreaterThan(-1);
+    expect(parsed[skeletonEventIndex].data).toEqual({ title: "Fallback Curriculum", topic_count: 1 });
+  });
+
+  it("uses a no-search corrective retry after malformed fallback and preserves failure without false success", async () => {
+    const { getAIProvider } = await import("@/lib/ai");
+    const structured = vi.fn().mockRejectedValue(new Error("Azure web search completed without source citations"));
+    const complete = vi.fn()
+      .mockResolvedValueOnce({ text: "not JSON", usage: { inputTokens: 10, outputTokens: 5 } })
+      .mockResolvedValueOnce({ text: schemaValidSkeleton, usage: { inputTokens: 10, outputTokens: 5 } });
+    vi.mocked(getAIProvider).mockReturnValue({
+      structured,
+      complete,
+      name: "azure",
+      capabilities: { structuredOutput: true, webSearch: true, streaming: false },
+    } as any);
+
+    const events = await runStreamAndCaptureEvents();
+    const parsed = events.map(parseSseEvent);
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect(complete.mock.calls.every(([, options]) => options.useSearch === false)).toBe(true);
+    expect(complete.mock.calls[1][0]).toContain("return ONLY the required JSON structure");
+    expect(parsed.filter((event) => event.event === "skeleton")).toHaveLength(1);
+    expect(capturedCurriculumUpdates[0]?.title).toBe("Fallback Curriculum");
+  });
+
+  it("emits failure and no skeleton event when fallback and corrective retry are invalid", async () => {
+    const { getAIProvider } = await import("@/lib/ai");
+    const structured = vi.fn().mockRejectedValue(new Error("Azure web search completed without source citations"));
+    const complete = vi.fn().mockResolvedValue({ text: "not JSON", usage: { inputTokens: 10, outputTokens: 5 } });
+    vi.mocked(getAIProvider).mockReturnValue({
+      structured,
+      complete,
+      name: "azure",
+      capabilities: { structuredOutput: true, webSearch: true, streaming: false },
+    } as any);
+
+    const parsed = (await runStreamAndCaptureEvents()).map(parseSseEvent);
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect(complete.mock.calls.every(([, options]) => options.useSearch === false)).toBe(true);
+    expect(parsed.some((event) => event.event === "error" && event.data.message === "Failed to generate curriculum structure")).toBe(true);
+    expect(parsed.some((event) => event.event === "skeleton")).toBe(false);
+    expect(capturedCurriculumUpdates).toHaveLength(0);
+  });
 
   it("attempts at most one corrective retry on parse failure", async () => {
     // First response: invalid JSON
