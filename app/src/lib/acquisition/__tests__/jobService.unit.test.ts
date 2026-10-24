@@ -165,15 +165,13 @@ describe("Job Service Layer - RPC Contract Verification", () => {
       expect(result).toBeNull();
     });
 
-    it("returns null when RPC returns an error", async () => {
+    it("throws a typed error when the claim RPC fails", async () => {
       (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         data: null,
         error: new Error("DB error"),
       });
 
-      const result = await claimNextJob();
-
-      expect(result).toBeNull();
+      await expect(claimNextJob()).rejects.toMatchObject({ name: "JobClaimRpcError" });
     });
   });
 

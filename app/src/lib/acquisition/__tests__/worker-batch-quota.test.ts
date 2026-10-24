@@ -39,7 +39,70 @@ vi.mock('@/lib/acquisition/engine', () => ({
   DEFAULT_ACQUISITION_OPTIONS: {},
 }));
 
-import { processBatchDiscovery } from '@/lib/acquisition/worker';
+import {
+  callAIDiscover,
+  createTopicDiscoveryMetrics,
+  logTopicDiscoveryMetrics,
+  processBatchDiscovery,
+} from '@/lib/acquisition/worker';
+
+describe('topic discovery diagnostics', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('passes safe curriculum, job, topic, and operation context to Azure diagnostics', async () => {
+    mocks.complete.mockResolvedValue({ text: '[]' });
+
+    await callAIDiscover('prompt is not logged', {
+      curriculumId: 'curriculum-1',
+      jobId: 'job-1',
+      topicId: 'topic-1',
+    });
+
+    expect(mocks.complete).toHaveBeenCalledWith('prompt is not logged', {
+      useSearch: true,
+      maxTokens: 2000,
+      diagnostics: {
+        curriculumId: 'curriculum-1',
+        jobId: 'job-1',
+        topicId: 'topic-1',
+        operation: 'worker_topic_discovery',
+      },
+    });
+  });
+
+  it('logs aggregate topic-stage counts without candidate URLs or output text', () => {
+    const metrics = createTopicDiscoveryMetrics();
+    Object.assign(metrics, {
+      responseTextChars: 120,
+      parsedCandidates: 4,
+      rejectedUrlOrTitle: 1,
+      fetchFailures: 1,
+      contentExtractionFailures: 0,
+      verificationRejections: 1,
+      persistenceSuccesses: 1,
+      persistenceFailures: 0,
+      eligibleAssociations: 1,
+    });
+    const log = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+
+    logTopicDiscoveryMetrics('topic-1', metrics);
+
+    expect(log).toHaveBeenCalledWith('[worker] Topic candidate processing summary', {
+      topic_id: 'topic-1',
+      response_text_chars: 120,
+      parsed_candidates: 4,
+      rejected_url_or_title: 1,
+      fetch_failures: 1,
+      content_extraction_failures: 0,
+      verification_rejections: 1,
+      persistence_successes: 1,
+      persistence_failures: 0,
+      final_eligible_associations: 1,
+    });
+    expect(JSON.stringify(log.mock.calls)).not.toContain('http');
+    log.mockRestore();
+  });
+});
 
 function queryResult(data: unknown) {
   const query: Record<string, unknown> = {};

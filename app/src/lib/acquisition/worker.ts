@@ -91,8 +91,24 @@ async function callAISources(prompt: string): Promise<string> {
 /**
  * Call AI provider for topic-level resource discovery.
  */
-async function callAIDiscover(prompt: string): Promise<string> {
-  const textResult: AICompleteResult = await getAI("worker_topic_discovery").complete(prompt, { useSearch: true, maxTokens: 2000 });
+export async function callAIDiscover(
+  prompt: string,
+  diagnostics: {
+    curriculumId: string;
+    jobId: string;
+    topicId: string;
+  }
+): Promise<string> {
+  const textResult: AICompleteResult = await getAI("worker_topic_discovery").complete(prompt, {
+    useSearch: true,
+    maxTokens: 2000,
+    diagnostics: {
+      curriculumId: diagnostics.curriculumId,
+      jobId: diagnostics.jobId,
+      topicId: diagnostics.topicId,
+      operation: 'worker_topic_discovery',
+    },
+  });
   return textResult.text;
 }
 
@@ -193,6 +209,51 @@ interface ResourceCandidate {
   ai_note: string;
   license_status: 'cc_open' | 'link_only' | 'unknown_review_needed';
 }
+
+export interface TopicDiscoveryMetrics {
+  responseTextChars: number;
+  parsedCandidates: number;
+  rejectedUrlOrTitle: number;
+  fetchFailures: number;
+  contentExtractionFailures: number;
+  verificationRejections: number;
+  persistenceSuccesses: number;
+  persistenceFailures: number;
+  eligibleAssociations: number | null;
+}
+
+export function createTopicDiscoveryMetrics(): TopicDiscoveryMetrics {
+  return {
+    responseTextChars: 0,
+    parsedCandidates: 0,
+    rejectedUrlOrTitle: 0,
+    fetchFailures: 0,
+    contentExtractionFailures: 0,
+    verificationRejections: 0,
+    persistenceSuccesses: 0,
+    persistenceFailures: 0,
+    eligibleAssociations: null,
+  };
+}
+
+export function logTopicDiscoveryMetrics(topicId: string, metrics: TopicDiscoveryMetrics): void {
+  console.info('[worker] Topic candidate processing summary', {
+    topic_id: topicId,
+    response_text_chars: metrics.responseTextChars,
+    parsed_candidates: metrics.parsedCandidates,
+    rejected_url_or_title: metrics.rejectedUrlOrTitle,
+    fetch_failures: metrics.fetchFailures,
+    content_extraction_failures: metrics.contentExtractionFailures,
+    verification_rejections: metrics.verificationRejections,
+    persistence_successes: metrics.persistenceSuccesses,
+    persistence_failures: metrics.persistenceFailures,
+    final_eligible_associations: metrics.eligibleAssociations,
+  });
+}
+
+const URL_VALIDATION_FAILURES = new Set([
+  'INVALID_URL', 'BLOCKED_URL', 'DNS_RESOLUTION_FAILED', 'BLOCKED_RESOLVED_IP', 'UNSAFE_REDIRECT',
+]);
 
 function parseCandidates(text: string): ResourceCandidate[] {
   try {
@@ -606,7 +667,10 @@ export async function processJob(job: JobClaimResult): Promise<void> {
         discoveredSources.map((s) => s.domain)
       );
 
-      const coverageOutcome = await runBoundedCoverageAttempts({
+      const discoveryMetrics = createTopicDiscoveryMetrics();
+      let coverageOutcome: Awaited<ReturnType<typeof runBoundedCoverageAttempts>>;
+      try {
+        coverageOutcome = await runBoundedCoverageAttempts({
         maxAttempts: MAX_COVERAGE_ATTEMPTS,
         threshold: 3,
         attempt: async () => {
@@ -616,16 +680,43 @@ export async function processJob(job: JobClaimResult): Promise<void> {
           if (!reservation.reserved) {
             return reservation.reason === "budget_exhausted" ? "budget_exhausted" : "ownership_lost";
           }
-          const candidates: ResourceCandidate[] = parseCandidates(await callAIDiscover(topicPrompt));
+          const responseText = await callAIDiscover(topicPrompt, {
+            curriculumId,
+            jobId: job.id,
+            topicId: nodeId,
+          });
+          discoveryMetrics.responseTextChars += responseText.length;
+          const candidates: ResourceCandidate[] = parseCandidates(responseText);
+          discoveryMetrics.parsedCandidates += candidates.length;
           for (const candidate of candidates) {
-            if (!candidate.url || !candidate.title) continue;
+            if (!candidate || typeof candidate.url !== 'string' || !candidate.url.trim() ||
+                typeof candidate.title !== 'string' || !candidate.title.trim()) {
+              discoveryMetrics.rejectedUrlOrTitle++;
+              continue;
+            }
             const resourceType = normalizeResourceType(candidate.resource_type);
-            const mappedCandidate = mapToDiscoveryCandidate({ ...candidate, resource_type: resourceType }, []);
+            let mappedCandidate: ReturnType<typeof mapToDiscoveryCandidate>;
+            try {
+              mappedCandidate = mapToDiscoveryCandidate({ ...candidate, resource_type: resourceType }, []);
+            } catch {
+              discoveryMetrics.rejectedUrlOrTitle++;
+              continue;
+            }
             const acquisitionResult = await acquireCandidate(
               { url: mappedCandidate.url, title: mappedCandidate.title, sourceDomain: mappedCandidate.sourceDomain, resourceType: mappedCandidate.resourceType, aiNote: mappedCandidate.aiNote },
               { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000 },
             );
-            if (!acquisitionResult.success || !acquisitionResult.acquiredPage || !acquisitionResult.structuredContent) continue;
+            if (!acquisitionResult.success) {
+              const code = acquisitionResult.error?.code;
+              if (code === 'EMPTY_CONTENT') discoveryMetrics.contentExtractionFailures++;
+              else if (code && URL_VALIDATION_FAILURES.has(code)) discoveryMetrics.rejectedUrlOrTitle++;
+              else discoveryMetrics.fetchFailures++;
+              continue;
+            }
+            if (!acquisitionResult.acquiredPage || !acquisitionResult.structuredContent) {
+              discoveryMetrics.contentExtractionFailures++;
+              continue;
+            }
             const { acquiredPage, structuredContent } = acquisitionResult;
             let educationalEvidence: ReturnType<typeof extractEducationalEvidence>;
             let verificationResult: VerificationResult;
@@ -644,22 +735,31 @@ export async function processJob(job: JobClaimResult): Promise<void> {
                 educationalEvidence,
               });
             } catch {
+              discoveryMetrics.verificationRejections++;
               continue;
             }
-            const persistResult = await persistWithFence(job.id, job.claim_token!, {
-              acquiredPage,
-              structuredContent,
-              educationalEvidence,
-              verificationResult,
-              target: { nodeId },
-              acquisitionJobId: job.id,
-              callerMetadata: {
-                resourceType: mappedCandidate.resourceType,
-                licenseStatus: mappedCandidate.licenseStatus,
-                aiNote: candidate.ai_note ?? null,
-              },
-            });
-            requireSuccessfulPersistence(persistResult, job.id, nodeId);
+            if (verificationResult.status !== 'verified') discoveryMetrics.verificationRejections++;
+            try {
+              const persistResult = await persistWithFence(job.id, job.claim_token!, {
+                acquiredPage,
+                structuredContent,
+                educationalEvidence,
+                verificationResult,
+                target: { nodeId },
+                acquisitionJobId: job.id,
+                callerMetadata: {
+                  resourceType: mappedCandidate.resourceType,
+                  licenseStatus: mappedCandidate.licenseStatus,
+                  aiNote: candidate.ai_note ?? null,
+                },
+              });
+              requireSuccessfulPersistence(persistResult, job.id, nodeId);
+              if (persistResult.resource_id) discoveryMetrics.persistenceSuccesses++;
+              else discoveryMetrics.persistenceFailures++;
+            } catch (error) {
+              discoveryMetrics.persistenceFailures++;
+              throw error;
+            }
           }
           return "attempted";
         },
@@ -667,7 +767,9 @@ export async function processJob(job: JobClaimResult): Promise<void> {
           const { data, error } = await supabase.from("resources").select("id")
             .eq("node_id", nodeId).eq("status", "approved").eq("content_type_verified", true);
           if (error) throw new Error(`Failed to measure topic resource coverage: ${error.message}`);
-          return data?.length ?? 0;
+          const eligibleAssociations = data?.length ?? 0;
+          discoveryMetrics.eligibleAssociations = eligibleAssociations;
+          return eligibleAssociations;
         },
         record: async ({ resourcesFound, sufficient, budgetExhausted, attemptId }) => {
           const result = await recordResourceCoverageAttempt({
@@ -680,7 +782,10 @@ export async function processJob(job: JobClaimResult): Promise<void> {
           }
           return result;
         },
-      });
+        });
+      } finally {
+        logTopicDiscoveryMetrics(nodeId, discoveryMetrics);
+      }
       if (coverageOutcome === "ownership_lost") return;
     }
 

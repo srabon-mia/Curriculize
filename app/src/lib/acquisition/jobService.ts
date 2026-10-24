@@ -104,11 +104,23 @@ export async function claimNextJob(jobType: string = 'curriculum_generation', cu
     p_curriculum_id: curriculumId ?? null,
   });
 
-  if (error || !data) {
+  if (error) {
+    throw new JobClaimRpcError();
+  }
+
+  if (!data) {
     return null;
   }
 
   return data as JobClaimResult;
+}
+
+/** Distinguishes an RPC failure from a successfully observed empty queue. */
+export class JobClaimRpcError extends Error {
+  constructor() {
+    super('claim_next_job RPC failed');
+    this.name = 'JobClaimRpcError';
+  }
 }
 
 /**

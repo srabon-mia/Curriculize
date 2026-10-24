@@ -18,7 +18,18 @@ export async function POST(request: Request) {
     await recoverStaleJobs();
 
     // Claim and process jobs (one per invocation to stay within timeout)
-    const job = await claimNextJob('curriculum_generation');
+    let job;
+    try {
+      job = await claimNextJob('curriculum_generation');
+    } catch (error) {
+      // Do not report a database/RPC failure as an empty queue. Log only safe
+      // operation metadata; RPC error details are intentionally not exposed.
+      console.error('[jobs/process] Job claim failed', {
+        operation: 'claim_next_job',
+        error_name: error instanceof Error ? error.name : 'UnknownError',
+      });
+      return NextResponse.json({ error: 'Job claim temporarily unavailable' }, { status: 503 });
+    }
 
     if (!job) {
       return NextResponse.json({ processed: 0, message: 'No pending jobs' });

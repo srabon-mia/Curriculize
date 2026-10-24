@@ -125,4 +125,21 @@ describe("POST /api/jobs/process", () => {
     expect(claimNextJob).toHaveBeenCalledTimes(1);
     expect(claimNextJob).toHaveBeenCalledWith("curriculum_generation");
   });
+
+  it("returns a retryable non-success response when the claim RPC fails", async () => {
+    (claimNextJob as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("database details must not be returned"));
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await POST(createRequest(`Bearer ${TEST_CRON_SECRET}`));
+    const json = await response.json();
+
+    expect(response.status).toBe(503);
+    expect(json.error).toBe("Job claim temporarily unavailable");
+    expect(JSON.stringify(json)).not.toContain("database details");
+    expect(errorLog).toHaveBeenCalledWith("[jobs/process] Job claim failed", {
+      operation: "claim_next_job",
+      error_name: "Error",
+    });
+    errorLog.mockRestore();
+  });
 });
