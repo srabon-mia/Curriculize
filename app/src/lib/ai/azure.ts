@@ -284,7 +284,18 @@ export class AzureProvider implements AIProvider {
     options: AICompleteOptions = {}
   ): AzureChatRequest {
     const baseRequest = this.buildChatRequest(prompt, options);
-    const jsonSchema = this.zodToJsonSchema(schema);
+    const convertedSchema = this.zodToJsonSchema(schema);
+    // Azure Structured Outputs requires the schema root to be an object. Keep
+    // the provider abstraction's array return type by carrying root arrays in
+    // a strict object wrapper and unwrapping them after parsing below.
+    const jsonSchema = this.isRootArraySchema(schema)
+      ? {
+          type: "object",
+          properties: { items: convertedSchema },
+          required: ["items"],
+          additionalProperties: false,
+        }
+      : convertedSchema;
 
     return {
       ...baseRequest,
@@ -298,6 +309,14 @@ export class AzureProvider implements AIProvider {
       },
       temperature: options.temperature ?? 0,
     };
+  }
+
+  private isRootArraySchema(schema: z.ZodSchema): boolean {
+    let current = schema as z.ZodSchema & { _def?: { typeName?: string; schema?: z.ZodSchema } };
+    while (current._def?.typeName === "ZodEffects" && current._def.schema) {
+      current = current._def.schema as typeof current;
+    }
+    return current._def?.typeName === "ZodArray";
   }
 
   /**
@@ -876,7 +895,17 @@ export class AzureProvider implements AIProvider {
       });
     }
 
-    const result = schema.safeParse(parsedJson);
+    let schemaInput: unknown = parsedJson;
+    if (this.isRootArraySchema(schema)) {
+      schemaInput = parsedJson !== null &&
+        typeof parsedJson === "object" &&
+        !Array.isArray(parsedJson) &&
+        Object.keys(parsedJson).length === 1 &&
+        Object.prototype.hasOwnProperty.call(parsedJson, "items")
+        ? (parsedJson as unknown as { items: unknown }).items
+        : undefined;
+    }
+    const result = schema.safeParse(schemaInput);
     if (!result.success) {
       console.warn("[Azure] Structured discovery rejected", {
         provider: "azure",

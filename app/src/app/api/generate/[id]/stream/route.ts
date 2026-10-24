@@ -11,6 +11,7 @@ import {
 import { createCache } from "@/lib/cache";
 import { AcquisitionDedupTracker } from "@/lib/acquisition";
 import { DEFAULT_BUDGET_LIMITS } from "@/lib/acquisition/jobTypes";
+import { CandidateArraySchema, SourcesArraySchema } from "@/lib/acquisition/discoverySchemas";
 import {
   reserveAICall,
   releaseJobClaim
@@ -226,20 +227,6 @@ async function callAIStructured<T>(
 
 /**
  * Call AI provider for source discovery (no search, smaller max tokens).
- /**
- * Schema for topic discovery candidates (array of resources).
- */
-const CandidateArraySchema = z.array(
-  z.object({
-    url: z.string().url(),
-    title: z.string().min(1),
-    resource_type: z.enum(["video", "text", "textbook", "problem_set", "reference_tool", "practice_exam", "other"]),
-    source_domain: z.string().min(1),
-    ai_note: z.string().min(1),
-    license_status: z.enum(["cc_open", "link_only", "unknown_review_needed"]),
-  })
-);
-
 /**
  * Schema for batch discovery response (object with topic_resources array).
  */
@@ -256,18 +243,6 @@ const BatchResponseSchema = z.object({
     })
   ),
 });
-
-/**
- * Schema for source discovery response (array of sources).
- */
-const SourcesArraySchema = z.array(
-  z.object({
-    domain: z.string().min(1),
-    name: z.string().min(1),
-    why: z.string().min(1),
-    best_for: z.string().min(1),
-  })
-);
 
 /**
  * Normalize an AI discovery candidate into the Learning Engine input shape.

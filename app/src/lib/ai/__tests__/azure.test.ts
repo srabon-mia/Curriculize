@@ -5,6 +5,7 @@
 
 import { AzureProvider } from "../azure";
 import { AIError } from "../types";
+import { CandidateArraySchema, SourcesArraySchema } from "../../acquisition/discoverySchemas";
 import { z } from "zod";
 
 const originalFetch = global.fetch;
@@ -742,6 +743,110 @@ describe("AzureProvider", () => {
     expect(body.response_format.json_schema.strict).toBe(true);
     expect(body.temperature).toBe(0); // Should default to 0 for structured output
     expect(mockFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  test("source discovery wraps its actual root-array schema and unwraps validated items", async () => {
+    const source = { domain: "khanacademy.org", name: "Khan Academy", why: "Clear lessons", best_for: "Foundations" };
+    mockFetch.mockResolvedValueOnce(createMockResponse({
+      json: {
+        id: "chatcmpl_source_discovery",
+        object: "chat.completion",
+        created: Date.now(),
+        model: "gpt-4.1-mini",
+        choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify({ items: [source] }) }, finish_reason: "stop" }],
+      },
+    }));
+
+    const result = await provider.structured("Find source platforms", { schema: SourcesArraySchema });
+    const request = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const responseSchema = request.response_format.json_schema.schema;
+
+    expect(responseSchema).toMatchObject({ type: "object", required: ["items"], additionalProperties: false });
+    expect(responseSchema.properties.items.type).toBe("array");
+    expect(result.data).toEqual([source]);
+  });
+
+  test("source discovery rejects malformed wrapped array items", async () => {
+    mockFetch.mockResolvedValueOnce(createMockResponse({
+      json: {
+        id: "chatcmpl_bad_source_discovery",
+        object: "chat.completion",
+        created: Date.now(),
+        model: "gpt-4.1-mini",
+        choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify({ items: [{ domain: "example.org" }] }) }, finish_reason: "stop" }],
+      },
+    }));
+
+    await expect(provider.structured("Find source platforms", { schema: SourcesArraySchema })).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+  });
+
+  test("topic discovery wraps its actual root-array schema while preserving web search citations", async () => {
+    const candidate = {
+      url: "https://www.khanacademy.org/math/geometry",
+      title: "Geometry",
+      resource_type: "text",
+      source_domain: "khanacademy.org",
+      ai_note: "Introduces core geometry concepts",
+      license_status: "link_only",
+    };
+    mockFetch
+      .mockResolvedValueOnce(createMockResponsesResponse({
+        json: {
+          id: "resp_topic_search",
+          object: "response",
+          created_at: Date.now(),
+          model: "gpt-4.1-mini",
+          output: [
+            { type: "web_search_call", status: "completed", action: { type: "search", query: "geometry", sources: [{ type: "url", url: "https://www.khanacademy.org/math/geometry" }] } },
+            { type: "message", role: "assistant", content: [{ type: "output_text", text: "Relevant geometry resource." }] },
+          ],
+        },
+      }))
+      .mockResolvedValueOnce(createMockResponse({
+        json: {
+          id: "chatcmpl_topic_discovery",
+          object: "chat.completion",
+          created: Date.now(),
+          model: "gpt-4.1-mini",
+          choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify({ items: [candidate] }) }, finish_reason: "stop" }],
+        },
+      }));
+
+    const result = await provider.structured("Find topic resources", { schema: CandidateArraySchema, useSearch: true });
+    const request = JSON.parse(mockFetch.mock.calls[1][1].body as string);
+    const responseSchema = request.response_format.json_schema.schema;
+
+    expect(responseSchema).toMatchObject({ type: "object", required: ["items"], additionalProperties: false });
+    expect(responseSchema.properties.items.type).toBe("array");
+    expect(result.data).toEqual([candidate]);
+    expect(result.searchCitations).toEqual([{ url: "https://www.khanacademy.org/math/geometry" }]);
+  });
+
+  test("topic discovery rejects malformed wrapped candidates after required web search", async () => {
+    mockFetch
+      .mockResolvedValueOnce(createMockResponsesResponse({
+        json: {
+          id: "resp_topic_search_malformed",
+          object: "response",
+          created_at: Date.now(),
+          model: "gpt-4.1-mini",
+          output: [
+            { type: "web_search_call", status: "completed", action: { type: "search", query: "geometry", sources: [{ type: "url", url: "https://example.org/geometry" }] } },
+            { type: "message", role: "assistant", content: [{ type: "output_text", text: "Research result." }] },
+          ],
+        },
+      }))
+      .mockResolvedValueOnce(createMockResponse({
+        json: {
+          id: "chatcmpl_topic_discovery_malformed",
+          object: "chat.completion",
+          created: Date.now(),
+          model: "gpt-4.1-mini",
+          choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify({ items: [{ url: "javascript:alert(1)" }] }) }, finish_reason: "stop" }],
+        },
+      }));
+
+    await expect(provider.structured("Find topic resources", { schema: CandidateArraySchema, useSearch: true })).rejects.toMatchObject({ code: "INVALID_REQUEST" });
   });
 
   test("structured() validates against Zod schema", async () => {

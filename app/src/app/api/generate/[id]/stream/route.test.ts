@@ -1587,7 +1587,7 @@ describe("Skeleton retry with budget/ownership checks", () => {
       source_url: null,
     });
     expect(skeletonEventIndex).toBeGreaterThan(-1);
-    expect(parsed[skeletonEventIndex].data).toEqual({ title: "Fallback Curriculum", topic_count: 1 });
+    expect(parsed[skeletonEventIndex].data).toEqual({ title: "Fallback Curriculum", topic_count: 1, resumed: false });
   });
 
   it("uses a no-search corrective retry after malformed fallback and preserves failure without false success", async () => {
