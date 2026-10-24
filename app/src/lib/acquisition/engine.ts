@@ -107,13 +107,6 @@ export async function acquireCandidate(
   dedupTracker?: AcquisitionDedupTracker,
   cache?: CacheStore
 ): Promise<AcquisitionResult> {
-  // Phase 11: Check resource-extraction cache before any work
-  if (cache) {
-    const cacheKey = resourceExtractionKey(candidate.url, options);
-    const cached = cache.getRaw<AcquisitionResult>(cacheKey);
-    if (cached) return cached;
-  }
-
   // URL validation
   let canonical: CanonicalUrl;
   try {
@@ -140,6 +133,15 @@ export async function acquireCandidate(
       success: false,
       error: { code: "DUPLICATE_URL", message: "URL already processed in this job" },
     };
+  }
+
+  // Check after the target-scoped duplicate guard: cache hits must still be
+  // rejected when the same URL is repeated within one topic, while a fresh
+  // topic tracker can reuse this acquired content without another fetch.
+  if (cache) {
+    const cacheKey = resourceExtractionKey(candidate.url, options);
+    const cached = cache.getRaw<AcquisitionResult>(cacheKey);
+    if (cached) return cached;
   }
 
   // Acquisition

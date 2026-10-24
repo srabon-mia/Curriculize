@@ -92,20 +92,38 @@ function extractSkeletonJson(text: string): Skeleton | null {
     }
   }
 
-  // Strategy 3: Try to find a valid JSON object by progressively shrinking the match
-  // This handles cases where greedy match captures too much
-  let match = text.match(/\{[\s\S]*\}/);
-  while (match) {
-    try {
-      const parsed = JSON.parse(match[0]);
-      const result = SkeletonSchema.safeParse(parsed);
-      if (result.success) return result.data;
-    } catch {
-      // Shrink from the end to find a valid object
-      const str = match[0];
-      const lastBrace = str.lastIndexOf('}');
-      if (lastBrace <= 0) break;
-      match = [str.slice(0, lastBrace + 1)];
+  // Strategy 3: scan complete top-level objects. Unlike repeatedly shrinking
+  // a greedy match, this always makes progress on malformed output and can
+  // select a valid object when the response contains multiple JSON objects.
+  let depth = 0;
+  let objectStart = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === "{") {
+      if (depth === 0) objectStart = i;
+      depth++;
+    } else if (char === "}" && depth > 0) {
+      depth--;
+      if (depth === 0 && objectStart >= 0) {
+        try {
+          const parsed = JSON.parse(text.slice(objectStart, i + 1));
+          const result = SkeletonSchema.safeParse(parsed);
+          if (result.success) return result.data;
+        } catch {
+          // Try the next complete top-level object, if any.
+        }
+        objectStart = -1;
+      }
     }
   }
 
@@ -463,7 +481,14 @@ async function attachAsObserver(curriculumId: string): Promise<ClaimResult> {
     | null
     | undefined;
 
-  const curriculumStatus = (runningJob as { curricula: { status: string }[] }).curricula?.[0]?.status ?? "draft";
+  const curriculumRelation = (runningJob as {
+    curricula?: { status: string } | { status: string }[] | null;
+  }).curricula;
+  const curriculumStatus = (
+    Array.isArray(curriculumRelation)
+      ? curriculumRelation[0]?.status
+      : curriculumRelation?.status
+  ) ?? "draft";
 
   return {
     mode: "observer",
@@ -1246,11 +1271,11 @@ export async function GET(
         // (pending admin approval) with content_type_verified derived from the
         // deterministic verification gate — never hardcoded.
         //
-        // A scoped cache + dedup tracker spans the topic loop AND the later
-        // background per-understanding batch so the same URL is acquired at
-        // most once within this generation request (Phase 11 cache keys).
+        // A scoped cache spans the topic loop AND the later background batch.
+        // URL/content deduplication is scoped to each topic because the same
+        // educational page may legitimately need a separate persisted link
+        // for multiple topics.
         const cache = createCache({ enabled: true, maxEntries: 200 });
-        const dedupTracker = new AcquisitionDedupTracker();
         const acquisitionJobId = ownerJobRecord.id;
 
         // Resume detection: read checkpoint to skip already-completed topics.
@@ -1294,6 +1319,11 @@ export async function GET(
             console.log(`[stream] Skipping topic ${nodeId} - already completed (checkpoint)`);
             continue;
           }
+
+          // Keep duplicate suppression within a topic. Sharing a content hash
+          // tracker across topics drops a valid candidate before it can be
+          // persisted against the other topic.
+          const dedupTracker = new AcquisitionDedupTracker();
 
           // Bounded work: yield when quota exhausted.
           // releaseJobClaim sets status='pending' without consuming a retry,
@@ -1455,15 +1485,43 @@ export async function GET(
               );
             }
 
-            // Checkpoint: track this topic's completion for recovery.
-            // Only checkpoint after all required work for this topic has durably persisted.
+            // A topic with no successfully verified, persisted resource is
+            // still unfinished. Leave it out of the checkpoint and release
+            // the claim so a deliberate retry can rediscover it.
+            const verifiedPersistedCount = persisted.filter(
+              (result) => result.verificationStatus === "verified"
+            ).length;
+            if (verifiedPersistedCount === 0) {
+              console.warn(
+                `[stream] Topic has no verified resources; keeping it pending: stream_id=${streamId}, job_id=${ownerJobRecord.id}, topic_id=${nodeId}`
+              );
+              clearHeartbeat();
+              const released = await releaseJobClaim(
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version
+              );
+              if (!released) {
+                send(controller, "error", {
+                  message: "No verified resources were saved for this topic, and the job could not be safely paused. Check its status before retrying.",
+                });
+              } else {
+                send(controller, "paused", {
+                  message: `No verified resources were saved for ${node.title}. Progress is saved and this topic can be retried.`,
+                });
+              }
+              controller.close();
+              return;
+            }
+
+            // Checkpoint only after a verified resource has durably persisted.
             try {
               const checkpointOk = await advanceCheckpoint(
                 ownerJobRecord.id,
                 ownerJobRecord.claim_token,
                 ownerJobRecord.claim_version,
                 nodeId,
-                persisted.length
+                verifiedPersistedCount
               );
               if (!checkpointOk) {
                 console.error(

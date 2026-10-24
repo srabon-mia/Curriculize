@@ -46,6 +46,7 @@ let persistedResumeNodes: Array<any> = [];
 let persistedResumeMus: Array<any> = [];
 let simulatedResumeJob: any = null;
 let simulatedCurriculum: any = null;
+let observerRunningJob: any = null;
 
 // ============================================================
 // Configurable RPC result overrides for lifecycle testing.
@@ -204,8 +205,8 @@ function createMockSupabaseClient() {
           const selectChain: any = { ...chain };
           selectChain.single = vi.fn().mockResolvedValue({
             data: resumeScenario && simulatedResumeJob
-              ? { ...simulatedResumeJob, curricula: [{ status: "draft" }] }
-              : null,
+              ? { ...simulatedResumeJob, curricula: { status: "draft" } }
+              : observerRunningJob,
             error: null,
           });
           return selectChain;
@@ -619,6 +620,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     persistedResumeMus = [];
     simulatedResumeJob = null;
     simulatedCurriculum = null;
+    observerRunningJob = null;
 
     mockAIInstance = new MockProvider();
     vi.mocked((await import("@/lib/ai")).getAIProvider).mockImplementation(() => mockAIInstance);
@@ -901,7 +903,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       expect(claimCalls.length).toBe(2);
     });
 
-    it("on unique violation with no pending job to retry, reports already_claimed", async () => {
+    it("attaches as an observer to the existing running job after an active-job conflict", async () => {
       // Both claim_next_job calls return null (no pending job)
       // and INSERT returns 23505 (another process owns a running job)
       setRpcSequence("claim_next_job", [
@@ -909,6 +911,15 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
         { data: null, error: null }, // retry: still no pending job
       ]);
       jobInsertMockError = { code: "23505", message: "duplicate key value" };
+      observerRunningJob = {
+        id: "running-job-id",
+        curriculum_id: "test-curriculum-id",
+        result_data: {
+          checkpoint: { completedTopicIds: ["node-1"] },
+          batchCheckpoint: { completedTopicIds: [] },
+        },
+        curricula: { status: "published" },
+      };
 
       const request = createMockRequest("test-curriculum-id");
       const response = await GET(request, {
@@ -925,8 +936,9 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
         }
       }
 
-      // Should receive the "already_claimed" status event
-      expect(events.some((e) => e.includes("already_claimed"))).toBe(true);
+      // Observer mode reports reconnect/waiting and does not start generation.
+      expect(events.some((event) => event.includes('"step":"waiting"'))).toBe(true);
+      expect(events.some((event) => event.includes('"job_id":"running-job-id"'))).toBe(true);
 
       // No resource inserts (pipeline never started)
       expect(allResourceInserts().length).toBe(0);
@@ -1200,6 +1212,102 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "sources prompt")).toHaveLength(1);
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(9);
     expect(allResourceInserts()).toHaveLength(9);
+    expect(new Set(allResourceInserts().map((resource) => resource.node_id)).size).toBe(9);
+
+    // The same acquired content can be linked independently to every topic;
+    // duplicate suppression must not be shared across topic targets.
+    const { discoverVerifiedResource } = await import("@/lib/learningEngine");
+    const topicOptions = vi.mocked(discoverVerifiedResource).mock.calls
+      .map(([, options]) => options)
+      .filter((options) => options?.dedupTracker);
+    const topicTrackers = topicOptions.map((options) => options!.dedupTracker);
+    expect(topicTrackers).toHaveLength(9);
+    expect(new Set(topicTrackers).size).toBe(9);
+    const topicCaches = topicOptions.map((options) => options!.cache);
+    expect(new Set(topicCaches).size).toBeLessThan(topicCaches.length);
+  });
+
+  it("pauses an unfinished topic and resumes it without reprocessing completed topics", async () => {
+    resumeScenario = true;
+    const { discoverVerifiedResource } = await import("@/lib/learningEngine");
+    const skeleton = {
+      title: "High School Geometry Semester Curriculum",
+      source_type: "ai_organized",
+      source_attribution: null,
+      source_url: null,
+      nodes: Array.from({ length: 9 }, (_, index) => ({
+        title: `Geometry Topic ${index + 1}`,
+        order_index: index + 1,
+        major_understandings: [{ code: `G${index + 1}.1`, description: `Geometry concept ${index + 1}` }],
+      })),
+    };
+    mockAIInstance.setResponse("skeleton prompt", {
+      structuredData: skeleton,
+      completeText: JSON.stringify(skeleton),
+    });
+    mockAIInstance.setResponse("sources prompt", {
+      structuredData: [],
+      completeText: "[]",
+    });
+    mockAIInstance.setResponse("discover prompt", {
+      structuredData: [{
+        url: "https://example.org/lesson",
+        title: "Test lesson",
+        resource_type: "text",
+        source_domain: "example.org",
+        ai_note: "Relevant lesson",
+        license_status: "link_only",
+      }],
+      completeText: "[]",
+    });
+    mockAIInstance.setResponse("batch prompt", {
+      structuredData: { topic_resources: [] },
+      completeText: '{"topic_resources":[]}',
+    });
+
+    const captureStream = async () => {
+      const response = await GET(createMockRequest("test-curriculum-id"), {
+        params: Promise.resolve({ id: "test-curriculum-id" }),
+      });
+      return (await consumeSseEvents(response, 10_000, originalSetTimeout)).map(parseSseEvent);
+    };
+
+    const initialEvents = await captureStream();
+    expect(initialEvents.some((event) => event.event === "yielded")).toBe(true);
+    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual([
+      "node-topic-1", "node-topic-2",
+    ]);
+
+    vi.mocked(discoverVerifiedResource).mockResolvedValue(null as any);
+    const failedTopicEvents = await captureStream();
+
+    expect(failedTopicEvents.some((event) => event.event === "paused" && event.data.message.includes("No verified resources were saved"))).toBe(true);
+    expect(failedTopicEvents.some((event) => event.event === "complete")).toBe(false);
+    expect(failedTopicEvents.find((event) => event.event === "status" && event.data.step === "skeleton")?.data.message).toBe("Loading the saved curriculum structure…");
+    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual([
+      "node-topic-1", "node-topic-2",
+    ]);
+    expect(simulatedResumeJob.status).toBe("pending");
+
+    await mockDiscoverVerifiedResource();
+    const retryEvents = await captureStream();
+    const retriedTopicStatuses = retryEvents
+      .filter((event) => event.event === "status" && event.data.step === "discovery")
+      .map((event) => event.data.message);
+    expect(retriedTopicStatuses).toEqual([
+      "Finding resources for: Geometry Topic 3",
+      "Finding resources for: Geometry Topic 4",
+    ]);
+    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual([
+      "node-topic-1", "node-topic-2", "node-topic-3", "node-topic-4",
+    ]);
+    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "skeleton prompt")).toHaveLength(1);
+    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(5);
+
+    const releaseCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls
+      .filter((call: any) => call[0] === "release_job_claim");
+    expect(releaseCalls).toHaveLength(3); // first quota yield, failed topic pause, then quota yield
+    expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.some((call: any) => call[0] === "complete_job")).toBe(false);
   });
 
   it("keeps an unverified topic pending after citation failure without losing prior checkpoints", async () => {
@@ -1416,7 +1524,7 @@ describe("Skeleton JSON parsing robustness", () => {
     const events = await runStreamWithSkeleton(validJson);
 
     // Should emit skeleton event
-    const skeletonEvents = events.filter((e) => e.includes('"skeleton"'));
+    const skeletonEvents = events.filter((event) => event.startsWith("event: skeleton\n"));
     expect(skeletonEvents.length).toBe(1);
     expect(skeletonEvents[0]).toContain("Test Curriculum");
   });
@@ -1425,7 +1533,7 @@ describe("Skeleton JSON parsing robustness", () => {
     const fencedJson = `\`\`\`json\n{"title":"Test Curriculum","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[{"title":"Test Topic","order_index":1,"major_understandings":[{"code":"1.1","description":"Concept 1"},{"code":"1.2","description":"Concept 2"}]}]}\n\`\`\``;
     const events = await runStreamWithSkeleton(fencedJson);
 
-    const skeletonEvents = events.filter((e) => e.includes('"skeleton"'));
+    const skeletonEvents = events.filter((event) => event.startsWith("event: skeleton\n"));
     expect(skeletonEvents.length).toBe(1);
     expect(skeletonEvents[0]).toContain("Test Curriculum");
   });
@@ -1434,7 +1542,7 @@ describe("Skeleton JSON parsing robustness", () => {
     const wrappedJson = `Here is the curriculum structure:\n{"title":"Test Curriculum","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[{"title":"Test Topic","order_index":1,"major_understandings":[{"code":"1.1","description":"Concept 1"}]}]}\nThat was the structure.`;
     const events = await runStreamWithSkeleton(wrappedJson);
 
-    const skeletonEvents = events.filter((e) => e.includes('"skeleton"'));
+    const skeletonEvents = events.filter((event) => event.startsWith("event: skeleton\n"));
     expect(skeletonEvents.length).toBe(1);
     expect(skeletonEvents[0]).toContain("Test Curriculum");
   });
@@ -1444,7 +1552,7 @@ describe("Skeleton JSON parsing robustness", () => {
     const events = await runStreamWithSkeleton(truncatedJson);
 
     // Should emit error event with the specific message
-    const errorEvents = events.filter((e) => e.includes('"error"'));
+    const errorEvents = events.filter((event) => event.startsWith("event: error\n"));
     expect(errorEvents.length).toBeGreaterThan(0);
     const errorData = JSON.parse(errorEvents[0].split("data: ")[1]);
     expect(errorData.message).toBe("Failed to generate curriculum structure");
@@ -1454,7 +1562,7 @@ describe("Skeleton JSON parsing robustness", () => {
     const invalidJson = `This is not JSON at all`;
     const events = await runStreamWithSkeleton(invalidJson);
 
-    const errorEvents = events.filter((e) => e.includes('"error"'));
+    const errorEvents = events.filter((event) => event.startsWith("event: error\n"));
     expect(errorEvents.length).toBeGreaterThan(0);
     const errorData = JSON.parse(errorEvents[0].split("data: ")[1]);
     expect(errorData.message).toBe("Failed to generate curriculum structure");
@@ -1465,7 +1573,7 @@ describe("Skeleton JSON parsing robustness", () => {
     const events = await runStreamWithSkeleton(multipleJson);
 
     // Should parse the first valid one that matches schema
-    const skeletonEvents = events.filter((e) => e.includes('"skeleton"'));
+    const skeletonEvents = events.filter((event) => event.startsWith("event: skeleton\n"));
     // The first object doesn't match schema, so it should pick the second valid one
     expect(skeletonEvents.length).toBe(1);
     expect(skeletonEvents[0]).toContain("Valid Curriculum");
@@ -1475,7 +1583,7 @@ describe("Skeleton JSON parsing robustness", () => {
     const invalidSchema = `{"title":"Test","nodes":[]}`; // missing source_type, source_attribution, source_url
     const events = await runStreamWithSkeleton(invalidSchema);
 
-    const errorEvents = events.filter((e) => e.includes('"error"'));
+    const errorEvents = events.filter((event) => event.startsWith("event: error\n"));
     expect(errorEvents.length).toBeGreaterThan(0);
     const errorData = JSON.parse(errorEvents[0].split("data: ")[1]);
     expect(errorData.message).toBe("Failed to generate curriculum structure");
@@ -1485,7 +1593,7 @@ describe("Skeleton JSON parsing robustness", () => {
     const invalidSchema = `{"title":"Test","source_type":"invalid","source_attribution":null,"source_url":null,"nodes":[{"title":"Topic","order_index":1,"major_understandings":[{"code":"1.1","description":"Concept"}]}]}`;
     const events = await runStreamWithSkeleton(invalidSchema);
 
-    const errorEvents = events.filter((e) => e.includes('"error"'));
+    const errorEvents = events.filter((event) => event.startsWith("event: error\n"));
     expect(errorEvents.length).toBeGreaterThan(0);
   });
 
@@ -1493,7 +1601,7 @@ describe("Skeleton JSON parsing robustness", () => {
     const invalidSchema = `{"title":"Test","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[]}`;
     const events = await runStreamWithSkeleton(invalidSchema);
 
-    const errorEvents = events.filter((e) => e.includes('"error"'));
+    const errorEvents = events.filter((event) => event.startsWith("event: error\n"));
     expect(errorEvents.length).toBeGreaterThan(0);
   });
 
@@ -1501,7 +1609,7 @@ describe("Skeleton JSON parsing robustness", () => {
     const invalidSchema = `{"title":"Test","source_type":"ai_organized","source_attribution":null,"source_url":null,"nodes":[{"title":"Topic","order_index":1}]}`;
     const events = await runStreamWithSkeleton(invalidSchema);
 
-    const errorEvents = events.filter((e) => e.includes('"error"'));
+    const errorEvents = events.filter((event) => event.startsWith("event: error\n"));
     expect(errorEvents.length).toBeGreaterThan(0);
   });
 });

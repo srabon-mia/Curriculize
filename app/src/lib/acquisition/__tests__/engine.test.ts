@@ -3,8 +3,16 @@
  */
 
 import { AcquisitionDedupTracker, validateCandidate, getCandidateDedupKey } from "../engine";
+import { acquireCandidate } from "../engine";
+import { acquireUrl } from "../http";
 import { AcquisitionError, isAcquisitionError } from "../errors";
 import type { DiscoveryCandidate } from "../types";
+import { createCache } from "@/lib/cache";
+import { canonicalizeUrl } from "@/lib/deterministic/url";
+import type { AcquiredPage } from "../types";
+import { vi } from "vitest";
+
+vi.mock("../http", () => ({ acquireUrl: vi.fn() }));
 
 describe("AcquisitionDedupTracker", () => {
   let tracker: AcquisitionDedupTracker;
@@ -48,6 +56,51 @@ describe("AcquisitionDedupTracker", () => {
     tracker.clear();
     expect(tracker.urlCount).toBe(0);
     expect(tracker.hashCount).toBe(0);
+  });
+});
+
+describe("acquireCandidate cache and target-scoped deduplication", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  test("reuses cached acquisition across topic trackers but rejects repeated URLs within one topic", async () => {
+    const url = "https://example.com/geometry-lesson";
+    const canonical = canonicalizeUrl(url);
+    if (!canonical) throw new Error("Test URL did not canonicalize");
+
+    const acquiredPage: AcquiredPage = {
+      finalUrl: url,
+      canonicalUrl: canonical,
+      statusCode: 200,
+      headers: { "content-type": "text/plain" },
+      body: "This geometry lesson explains lines, angles, and proofs.",
+      contentType: "text/plain",
+      charset: "utf-8",
+      contentHash: "same-geometry-content",
+      acquiredAt: new Date(0).toISOString(),
+      redirectChain: [],
+      resolvedIps: { ipv4: ["93.184.216.34"], ipv6: [] },
+    };
+    vi.mocked(acquireUrl).mockResolvedValue(acquiredPage);
+
+    const cache = createCache({ enabled: true, maxEntries: 10 });
+    const firstTopicTracker = new AcquisitionDedupTracker();
+    const firstTopic = await acquireCandidate(
+      { url }, {}, firstTopicTracker, cache
+    );
+    const secondTopic = await acquireCandidate(
+      { url }, {}, new AcquisitionDedupTracker(), cache
+    );
+    const duplicateWithinFirstTopic = await acquireCandidate(
+      { url }, {}, firstTopicTracker, cache
+    );
+
+    expect(firstTopic.success).toBe(true);
+    expect(secondTopic.success).toBe(true);
+    expect(vi.mocked(acquireUrl)).toHaveBeenCalledTimes(1);
+    expect(duplicateWithinFirstTopic).toMatchObject({
+      success: false,
+      error: { code: "DUPLICATE_URL" },
+    });
   });
 });
 
