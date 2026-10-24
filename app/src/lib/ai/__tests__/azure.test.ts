@@ -107,7 +107,7 @@ describe("AzureProvider", () => {
         id?: string;
         status?: "completed" | "in_progress" | "failed";
         query?: string;
-        action?: { type: "search"; query: string };
+        action?: { type: "search"; query: string; sources?: Array<{ type?: string; url?: string }> };
       }>;
       usage?: { input_tokens: number; output_tokens: number; total_tokens: number };
     };
@@ -887,6 +887,7 @@ describe("AzureProvider", () => {
     expect(searchBody.model).toBe("gpt-4.1-mini");
     expect(searchBody.tools).toEqual([{ type: "web_search" }]);
     expect(searchBody.tool_choice).toBe("required");
+    expect(searchBody.include).toEqual(["web_search_call.action.sources"]);
 
     expect(mockFetch.mock.calls[1][0]).toContain("/chat/completions");
     const structuredBody = JSON.parse(mockFetch.mock.calls[1][1].body as string);
@@ -905,7 +906,7 @@ describe("AzureProvider", () => {
 
   test("structured() rejects a completed Responses API search with no usable citations", async () => {
     const schema = z.object({ result: z.string() });
-    mockFetch.mockResolvedValueOnce(createMockResponsesResponse({
+    const citationFreeResponse = createMockResponsesResponse({
       json: {
         id: "resp_search_without_citations",
         object: "response",
@@ -926,15 +927,115 @@ describe("AzureProvider", () => {
           },
         ],
       },
-    }));
+    });
+    mockFetch.mockResolvedValueOnce(citationFreeResponse).mockResolvedValueOnce(citationFreeResponse);
 
     await expect(provider.structured("Test prompt", { schema, useSearch: true })).rejects.toMatchObject({
       code: "MODEL_ERROR",
       provider: "azure",
       message: "Azure web search completed without source citations; structured discovery was not generated.",
     });
-    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
     expect(mockFetch.mock.calls[0][0]).toContain("/responses?");
+    expect(mockFetch.mock.calls[1][0]).toContain("/responses?");
+  });
+
+  test("structured() retries a citation-free search once and grounds output in real citation annotations", async () => {
+    const schema = z.object({ result: z.string() });
+    mockFetch
+      .mockResolvedValueOnce(createMockResponsesResponse({
+        json: {
+          id: "resp_search_without_citations",
+          object: "response",
+          created_at: Date.now(),
+          model: "gpt-4.1-mini",
+          output: [
+            { type: "web_search_call", status: "completed", id: "search_1" },
+            { type: "message", role: "assistant", content: [{ type: "output_text", text: "No cited result." }] },
+          ],
+        },
+      }))
+      .mockResolvedValueOnce(createMockResponsesResponse({
+        json: {
+          id: "resp_search_with_citations",
+          object: "response",
+          created_at: Date.now(),
+          model: "gpt-4.1-mini",
+          output: [
+            { type: "web_search_call", status: "completed", id: "search_2" },
+            {
+              type: "message",
+              role: "assistant",
+              content: [{
+                type: "output_text",
+                text: "A cited educational result.",
+                annotations: [{ type: "url_citation", url: "https://example.org/geometry", title: "Geometry resource", start_index: 0, end_index: 10 }],
+              }],
+            },
+          ],
+        },
+      }))
+      .mockResolvedValueOnce(createMockResponse({
+        json: {
+          id: "chatcmpl_test",
+          object: "chat.completion",
+          created: Date.now(),
+          model: "gpt-4.1-mini",
+          choices: [{ index: 0, message: { role: "assistant", content: '{"result":"grounded"}' }, finish_reason: "stop" }],
+        },
+      }));
+
+    const result = await provider.structured("Find a geometry resource", { schema, useSearch: true });
+
+    expect(result.data).toEqual({ result: "grounded" });
+    expect(result.searchCitations).toEqual([{ url: "https://example.org/geometry", title: "Geometry resource" }]);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(mockFetch.mock.calls[0][0]).toContain("/responses?");
+    expect(mockFetch.mock.calls[1][0]).toContain("/responses?");
+    expect(mockFetch.mock.calls[2][0]).toContain("/chat/completions");
+    const structuredRequest = JSON.parse(mockFetch.mock.calls[2][1].body as string);
+    expect(structuredRequest.messages[0].content).toContain("https://example.org/geometry");
+  });
+
+  test("structured() extracts consulted URLs from Azure web_search_call.action.sources", async () => {
+    const schema = z.object({ result: z.string() });
+    mockFetch
+      .mockResolvedValueOnce(createMockResponsesResponse({
+        json: {
+          id: "resp_action_sources",
+          object: "response",
+          created_at: Date.now(),
+          model: "gpt-4.1-mini",
+          output: [
+            {
+              type: "web_search_call",
+              status: "completed",
+              id: "search_with_sources",
+              action: { type: "search", query: "geometry resource", sources: [{ type: "url", url: "https://example.org/consulted-geometry" }] },
+            },
+            { type: "message", role: "assistant", content: [{ type: "output_text", text: "Grounded research without inline annotations." }] },
+          ],
+        },
+      }))
+      .mockResolvedValueOnce(createMockResponse({
+        json: {
+          id: "chatcmpl_test",
+          object: "chat.completion",
+          created: Date.now(),
+          model: "gpt-4.1-mini",
+          choices: [{ index: 0, message: { role: "assistant", content: '{"result":"grounded"}' }, finish_reason: "stop" }],
+        },
+      }));
+
+    const result = await provider.structured("Find a geometry resource", { schema, useSearch: true });
+
+    expect(result.data).toEqual({ result: "grounded" });
+    expect(result.searchCitations).toEqual([{ url: "https://example.org/consulted-geometry" }]);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const searchRequest = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    expect(searchRequest.include).toEqual(["web_search_call.action.sources"]);
+    const groundedRequest = JSON.parse(mockFetch.mock.calls[1][1].body as string);
+    expect(groundedRequest.messages[0].content).toContain("https://example.org/consulted-geometry");
   });
 
   test("structured() with useSearch=true fails clearly and skips structured generation when web search fails", async () => {

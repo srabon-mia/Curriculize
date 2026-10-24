@@ -60,6 +60,7 @@ interface AzureResponsesRequest {
   temperature?: number;
   tools?: Array<{ type: "web_search" }>;
   tool_choice?: "auto" | "required" | { type: "web_search" };
+  include?: Array<"web_search_call.action.sources">;
   response_format?: { type: "json_schema"; json_schema: { name: string; schema: object; strict?: boolean } };
 }
 
@@ -90,6 +91,11 @@ interface AzureResponsesResponse {
     id?: string;
     status?: "completed" | "in_progress" | "failed";
     query?: string;
+    action?: {
+      type?: string;
+      query?: string;
+      sources?: Array<{ type?: string; url?: string }>;
+    };
   }>;
   usage?: {
     input_tokens: number;
@@ -262,6 +268,9 @@ export class AzureProvider implements AIProvider {
     // Enable web search tool - require it to ensure actual search happens
     request.tools = [{ type: "web_search" }];
     request.tool_choice = "required";
+    // Ask Responses API to return the actual consulted URLs even when the
+    // generated message omits inline citation annotations.
+    request.include = ["web_search_call.action.sources"];
 
     return request;
   }
@@ -589,8 +598,23 @@ export class AzureProvider implements AIProvider {
         if (output.status === "failed" && this.debug) {
           console.warn("[Azure] Web search call failed", { query: output.query, id: output.id });
         }
+        for (const source of output.action?.sources ?? []) {
+          if (!source.url) continue;
+          try {
+            const parsedUrl = new URL(source.url);
+            if (parsedUrl.protocol === "http:" || parsedUrl.protocol === "https:") {
+              citations.push({ url: source.url });
+            }
+          } catch {
+            // Ignore malformed source entries; they cannot ground a resource.
+          }
+        }
       }
     }
+
+    // The same consulted source can appear in both action.sources and
+    // message annotations. Keep one citation per URL.
+    const uniqueCitations = [...new Map(citations.map((citation) => [citation.url, citation])).values()];
 
     // Keep diagnostics structural only: never log user prompts or model output.
     const annotationLocations = summarizeAnnotationLocations(response.output);
@@ -603,14 +627,14 @@ export class AzureProvider implements AIProvider {
       search_call_statuses: searchCallStatuses,
       annotation_count: annotationCount,
       annotation_locations: annotationLocations,
-      extracted_url_count: citations.length,
+      extracted_url_count: uniqueCitations.length,
     });
 
     if (text === "" && this.debug) {
       console.warn("[Azure] Empty response content received", { output: response.output });
     }
 
-    return { text, citations, searchCompleted: sawSearchCall && allSearchCallsCompleted };
+    return { text, citations: uniqueCitations, searchCompleted: sawSearchCall && allSearchCallsCompleted };
   }
 
   /**
@@ -703,7 +727,7 @@ export class AzureProvider implements AIProvider {
    */
   async structured<T>(prompt: string, options: AIStructuredOptions<T>): Promise<AIStructuredResult<T>> {
     const { schema, useSearch = false, ...completeOptions } = options;
-    const searchResult = useSearch
+    let searchResult = useSearch
       ? await this.complete(prompt, { ...completeOptions, useSearch: true })
       : undefined;
 
@@ -714,10 +738,23 @@ export class AzureProvider implements AIProvider {
       });
     }
 
-    const searchCitations = searchResult?.searchCitations ?? [];
+    // Azure can complete a required web search without returning citation
+    // annotations. Retry the supported search once; never infer URLs from the
+    // search call or fabricate citation metadata.
+    let searchCitations = searchResult?.searchCitations ?? [];
+    if (searchResult && searchCitations.length === 0) {
+      searchResult = await this.complete(prompt, { ...completeOptions, useSearch: true });
+      if (searchResult.searchCompleted !== true) {
+        throw new AIError("MODEL_ERROR", "Azure web search did not complete; structured discovery was not generated.", {
+          retryable: false,
+          provider: "azure",
+        });
+      }
+      searchCitations = searchResult.searchCitations ?? [];
+    }
     if (searchResult && searchCitations.length === 0) {
       throw new AIError("MODEL_ERROR", "Azure web search completed without source citations; structured discovery was not generated.", {
-        retryable: false,
+        retryable: true,
         provider: "azure",
       });
     }

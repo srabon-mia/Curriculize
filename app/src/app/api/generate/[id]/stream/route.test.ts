@@ -621,6 +621,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     simulatedCurriculum = null;
 
     mockAIInstance = new MockProvider();
+    vi.mocked((await import("@/lib/ai")).getAIProvider).mockImplementation(() => mockAIInstance);
     await mockDiscoverVerifiedResource();
     resetRpcSequences();
     jobInsertMockError = null;
@@ -1199,6 +1200,71 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "sources prompt")).toHaveLength(1);
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(9);
     expect(allResourceInserts()).toHaveLength(9);
+  });
+
+  it("keeps an unverified topic pending after citation failure without losing prior checkpoints", async () => {
+    resumeScenario = true;
+    const skeleton = {
+      title: "High School Geometry Semester Curriculum",
+      source_type: "ai_organized",
+      source_attribution: null,
+      source_url: null,
+      nodes: Array.from({ length: 9 }, (_, index) => ({
+        title: `Geometry Topic ${index + 1}`,
+        order_index: index + 1,
+        major_understandings: [{ code: `G${index + 1}.1`, description: `Geometry concept ${index + 1}` }],
+      })),
+    };
+    mockAIInstance.setResponse("skeleton prompt", { structuredData: skeleton, completeText: JSON.stringify(skeleton) });
+    mockAIInstance.setResponse("sources prompt", { structuredData: [], completeText: "[]" });
+    mockAIInstance.setResponse("discover prompt", {
+      structuredData: [{
+        url: "https://example.org/geometry/topic",
+        title: "Geometry lesson",
+        resource_type: "text",
+        source_domain: "example.org",
+        ai_note: "Introductory geometry lesson",
+        license_status: "link_only",
+      }],
+      completeText: "[]",
+    });
+    mockAIInstance.setResponse("batch prompt", { structuredData: { topic_resources: [] }, completeText: '{"topic_resources":[]}' });
+
+    const firstResponse = await GET(createMockRequest("test-curriculum-id"), {
+      params: Promise.resolve({ id: "test-curriculum-id" }),
+    });
+    const firstEvents = (await consumeSseEvents(firstResponse, 10_000, originalSetTimeout)).map(parseSseEvent);
+    expect(firstEvents.some((event) => event.event === "yielded")).toBe(true);
+    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual(["node-topic-1", "node-topic-2"]);
+    const persistedNodeTitles = persistedResumeNodes.map((node) => node.title);
+
+    const baseProvider = mockAIInstance;
+    const discoveryFailure = new Error("Azure web search completed without source citations; structured discovery was not generated.");
+    const structured = vi.fn(async (prompt: string, options: any) => {
+      if (prompt === "discover prompt") throw discoveryFailure;
+      return baseProvider.structured(prompt, options);
+    });
+    vi.mocked((await import("@/lib/ai")).getAIProvider).mockReturnValue({
+      structured,
+      complete: baseProvider.complete.bind(baseProvider),
+      name: "azure",
+      capabilities: baseProvider.capabilities,
+    } as any);
+
+    const retryResponse = await GET(createMockRequest("test-curriculum-id"), {
+      params: Promise.resolve({ id: "test-curriculum-id" }),
+    });
+    const retryEvents = (await consumeSseEvents(retryResponse, 10_000, originalSetTimeout)).map(parseSseEvent);
+
+    expect(retryEvents.some((event) => event.event === "yielded" && event.data.message.includes("Source citations were unavailable"))).toBe(true);
+    expect(retryEvents.some((event) => event.event === "complete")).toBe(false);
+    expect(simulatedResumeJob.id).toBe("job-1");
+    expect(simulatedResumeJob.status).toBe("pending");
+    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual(["node-topic-1", "node-topic-2"]);
+    expect(persistedResumeNodes.map((node) => node.title)).toEqual(persistedNodeTitles);
+    expect(baseProvider.getCalls((call) => call.method === "structured" && call.prompt === "skeleton prompt")).toHaveLength(1);
+    expect(baseProvider.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(2);
+    expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.filter((call: any) => call[0] === "advance_checkpoint")).toHaveLength(2);
   });
 
   // ============================================================

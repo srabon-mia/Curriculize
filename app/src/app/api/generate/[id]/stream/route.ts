@@ -1516,7 +1516,33 @@ export async function GET(
               `Resource discovery failed for topic "${node.title}":`,
               err instanceof Error ? err.message : err
             );
-            // If rate limited, wait and the next topic will still run
+            // A failed discovery is not a successful empty result. Keep this
+            // topic uncheckpointed and release the claim so a later invocation
+            // retries from the persisted skeleton and prior topic checkpoints.
+            clearHeartbeat();
+            const released = await releaseJobClaim(
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version
+            );
+            if (!released) {
+              console.error(`[stream] Could not release job after topic discovery failure: job_id=${ownerJobRecord.id}`);
+              send(controller, "error", {
+                message: "Resource discovery could not verify sources. Please retry this generation later.",
+              });
+            } else {
+              const citationFailure = err instanceof Error &&
+                err.message.includes("Azure web search completed without source citations");
+              send(controller, "yielded", {
+                message: citationFailure
+                  ? `Source citations were unavailable for ${node.title}. This topic remains pending and will be retried.`
+                  : `Resource discovery could not be completed for ${node.title}. This topic remains pending and will be retried.`,
+                topicsCompleted: completedTopics.size,
+                totalTopics: nodeIds.length,
+              });
+            }
+            controller.close();
+            return;
           }
 
           // Stall detection: check if we've made no progress for too long
