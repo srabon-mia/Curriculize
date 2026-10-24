@@ -20,6 +20,16 @@ import {
 const DEFAULT_MAX_TOKENS = 4000;
 const DEFAULT_API_VERSION = "2024-12-01-preview";
 
+function getAzureProviderErrorCode(errorText: string): string | undefined {
+  try {
+    const payload = JSON.parse(errorText) as { error?: { code?: unknown }; code?: unknown };
+    const code = payload.error?.code ?? payload.code;
+    return typeof code === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(code) ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Azure OpenAI chat completions request format (OpenAI-compatible) */
 interface AzureChatRequest {
   model?: string;
@@ -370,24 +380,18 @@ export class AzureProvider implements AIProvider {
       }
 
       case "ZodString": {
-        const checks = def.checks ?? [];
-        const schema: Record<string, unknown> = { type: "string" };
-        for (const check of checks) {
-          if (check.kind === "min") schema.minLength = check.value;
-          if (check.kind === "max") schema.maxLength = check.value;
-          if (check.kind === "regex" && check.regex) schema.pattern = check.regex.source;
-          if (check.kind === "email") schema.format = "email";
-          if (check.kind === "url") schema.format = "uri";
-        }
-        return schema;
+        // Azure Structured Outputs rejects minLength, maxLength, pattern, and
+        // format. The original Zod schema still enforces these constraints
+        // after the response is decoded.
+        return { type: "string" };
       }
 
       case "ZodNumber": {
         const checks = def.checks ?? [];
         const schema: Record<string, unknown> = { type: "number" };
         for (const check of checks) {
-          if (check.kind === "min") schema.minimum = check.value;
-          if (check.kind === "max") schema.maximum = check.value;
+          // Azure rejects minimum/maximum; the original Zod schema validates
+          // the generated value after parsing.
           if (check.kind === "int") schema.type = "integer";
         }
         return schema;
@@ -497,6 +501,7 @@ export class AzureProvider implements AIProvider {
             statusCode: 429,
             retryable: true,
             provider: "azure",
+            providerErrorCode: getAzureProviderErrorCode(errorText),
           });
           if (retryAfter > 0) {
             if (this.debug) {
@@ -540,6 +545,7 @@ export class AzureProvider implements AIProvider {
             statusCode: response.status,
             retryable,
             provider: "azure",
+            providerErrorCode: getAzureProviderErrorCode(errorText),
           });
 
           if (!retryable) {
@@ -872,12 +878,31 @@ export class AzureProvider implements AIProvider {
 
     const request = this.buildStructuredChatRequest(groundedPrompt, schema, completeOptions);
     const url = this.buildChatUrl();
-    const response = await this.requestWithRetry<AzureChatResponse>(url, request, 4, completeOptions.signal);
+    let response: AzureChatResponse;
+    try {
+      response = await this.requestWithRetry<AzureChatResponse>(url, request, 4, completeOptions.signal);
+    } catch (error) {
+      const aiError = error instanceof AIError ? error : undefined;
+      console.error("[Azure] Structured response request failed", {
+        provider: "azure",
+        curriculum_id: diagnosticContext?.curriculumId,
+        job_id: diagnosticContext?.jobId,
+        stream_id: diagnosticContext?.streamId,
+        operation: diagnosticContext?.operation,
+        topic_id: diagnosticContext?.topicId,
+        attempt_number: searchAttempt,
+        failure_category: aiError?.statusCode === 400 ? "azure_response_format_rejected" : "azure_structured_request_failed",
+        status_code: aiError?.statusCode,
+        azure_error_code: aiError?.providerErrorCode,
+        ai_error_code: aiError?.code,
+      });
+      throw error;
+    }
 
-    const rawText = this.extractChatText(response);
-
+    let rawText = "";
     let parsedJson: T;
     try {
+      rawText = this.extractChatText(response);
       parsedJson = this.extractStructuredJson<T>(response);
     } catch (err) {
       console.warn("[Azure] Structured discovery rejected", {
@@ -888,7 +913,8 @@ export class AzureProvider implements AIProvider {
         operation: diagnosticContext?.operation,
         topic_id: diagnosticContext?.topicId,
         attempt_number: searchAttempt || 1,
-        failure_category: "malformed_json",
+        failure_category: rawText ? "malformed_json" : "empty_structured_response",
+        finish_reason: response.choices?.[0]?.finish_reason,
       });
       throw new AIError("INVALID_REQUEST", `Failed to parse structured response: ${err instanceof Error ? err.message : String(err)}`, {
         provider: "azure",
@@ -916,6 +942,10 @@ export class AzureProvider implements AIProvider {
         topic_id: diagnosticContext?.topicId,
         attempt_number: searchAttempt || 1,
         failure_category: "schema_validation",
+        validation_issues: result.error.issues.map((issue) => ({
+          path: issue.path.join("."),
+          message: issue.message,
+        })),
       });
       const errorMessages = result.error.issues
         .map((issue) => `${issue.path.join(".")}: ${issue.message}`)

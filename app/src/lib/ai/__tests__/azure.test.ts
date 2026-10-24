@@ -741,6 +741,8 @@ describe("AzureProvider", () => {
     expect(body.response_format.type).toBe("json_schema");
     expect(body.response_format.json_schema.name).toBe("structured_response");
     expect(body.response_format.json_schema.strict).toBe(true);
+    expect(body.response_format.json_schema.schema).toMatchObject({ type: "object", required: ["name", "value"] });
+    expect(body.response_format.json_schema.schema.properties.items).toBeUndefined();
     expect(body.temperature).toBe(0); // Should default to 0 for structured output
     expect(mockFetch.mock.calls[0][1].signal).toBe(controller.signal);
   });
@@ -763,6 +765,7 @@ describe("AzureProvider", () => {
 
     expect(responseSchema).toMatchObject({ type: "object", required: ["items"], additionalProperties: false });
     expect(responseSchema.properties.items.type).toBe("array");
+    expect(JSON.stringify(responseSchema)).not.toMatch(/"(?:format|minLength|maxLength|pattern)"/);
     expect(result.data).toEqual([source]);
   });
 
@@ -774,6 +777,23 @@ describe("AzureProvider", () => {
         created: Date.now(),
         model: "gpt-4.1-mini",
         choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify({ items: [{ domain: "example.org" }] }) }, finish_reason: "stop" }],
+      },
+    }));
+
+    await expect(provider.structured("Find source platforms", { schema: SourcesArraySchema })).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+  });
+
+  test.each([
+    ["missing items", { other: [] }],
+    ["unexpected wrapper property", { items: [], extra: true }],
+  ])("rejects a malformed root-array wrapper (%s)", async (_caseName, malformedWrapper) => {
+    mockFetch.mockResolvedValueOnce(createMockResponse({
+      json: {
+        id: "chatcmpl_malformed_array_wrapper",
+        object: "chat.completion",
+        created: Date.now(),
+        model: "gpt-4.1-mini",
+        choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify(malformedWrapper) }, finish_reason: "stop" }],
       },
     }));
 
@@ -818,11 +838,13 @@ describe("AzureProvider", () => {
 
     expect(responseSchema).toMatchObject({ type: "object", required: ["items"], additionalProperties: false });
     expect(responseSchema.properties.items.type).toBe("array");
+    expect(JSON.stringify(responseSchema)).not.toMatch(/"(?:format|minLength|maxLength|pattern)"/);
     expect(result.data).toEqual([candidate]);
     expect(result.searchCitations).toEqual([{ url: "https://www.khanacademy.org/math/geometry" }]);
   });
 
   test("topic discovery rejects malformed wrapped candidates after required web search", async () => {
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     mockFetch
       .mockResolvedValueOnce(createMockResponsesResponse({
         json: {
@@ -842,11 +864,67 @@ describe("AzureProvider", () => {
           object: "chat.completion",
           created: Date.now(),
           model: "gpt-4.1-mini",
-          choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify({ items: [{ url: "javascript:alert(1)" }] }) }, finish_reason: "stop" }],
+          choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify({ items: [{
+            url: "not a URL",
+            title: "",
+            resource_type: "text",
+            source_domain: "example.org",
+            ai_note: "Candidate explanation",
+            license_status: "link_only",
+          }] }) }, finish_reason: "stop" }],
         },
       }));
 
     await expect(provider.structured("Find topic resources", { schema: CandidateArraySchema, useSearch: true })).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+    const validationLog = consoleWarn.mock.calls.find(([message]) => message === "[Azure] Structured discovery rejected")?.[1] as { failure_category: string; validation_issues: Array<{ path: string; message: string }> };
+    expect(validationLog.failure_category).toBe("schema_validation");
+    expect(validationLog.validation_issues.map((issue) => issue.path)).toEqual(expect.arrayContaining(["0.url", "0.title"]));
+    consoleWarn.mockRestore();
+  });
+
+  test("logs safe Azure request metadata when the structured response schema is rejected", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const privateProviderMessage = "private Azure error details";
+    mockFetch
+      .mockResolvedValueOnce(createMockResponsesResponse({
+        json: {
+          id: "resp_topic_search_schema_error",
+          object: "response",
+          created_at: Date.now(),
+          model: "gpt-4.1-mini",
+          output: [
+            { type: "web_search_call", status: "completed", action: { type: "search", query: "geometry", sources: [{ type: "url", url: "https://example.org/geometry" }] } },
+            { type: "message", role: "assistant", content: [{ type: "output_text", text: "Research result." }] },
+          ],
+        },
+      }))
+      .mockResolvedValueOnce(createMockResponse({
+        status: 400,
+        ok: false,
+        text: JSON.stringify({ error: { code: "invalid_json_schema", message: privateProviderMessage } }),
+      }));
+
+    await expect(provider.structured("Find topic resources", {
+      schema: CandidateArraySchema,
+      useSearch: true,
+      diagnostics: { curriculumId: "curr-1", jobId: "job-1", streamId: "stream-1", topicId: "topic-1", operation: "topic_discovery_ai" },
+    })).rejects.toMatchObject({ code: "INVALID_REQUEST", statusCode: 400, providerErrorCode: "invalid_json_schema" });
+
+    const requestFailureLog = consoleError.mock.calls.find(([message]) => message === "[Azure] Structured response request failed")?.[1];
+    expect(requestFailureLog).toMatchObject({
+      operation: "topic_discovery_ai",
+      curriculum_id: "curr-1",
+      job_id: "job-1",
+      stream_id: "stream-1",
+      topic_id: "topic-1",
+      failure_category: "azure_response_format_rejected",
+      status_code: 400,
+      azure_error_code: "invalid_json_schema",
+      ai_error_code: "INVALID_REQUEST",
+    });
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateProviderMessage);
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain("test-azure-key");
+    consoleError.mockRestore();
   });
 
   test("structured() validates against Zod schema", async () => {

@@ -25,11 +25,12 @@ export class AIError extends Error {
   public readonly statusCode?: number;
   public readonly retryable: boolean;
   public readonly provider?: string;
+  public readonly providerErrorCode?: string;
 
   constructor(
     code: AIErrorCode,
     message: string,
-    options: { statusCode?: number; retryable?: boolean; provider?: string } = {}
+    options: { statusCode?: number; retryable?: boolean; provider?: string; providerErrorCode?: string } = {}
   ) {
     super(message);
     this.name = "AIError";
@@ -37,6 +38,7 @@ export class AIError extends Error {
     this.statusCode = options.statusCode;
     this.retryable = options.retryable ?? false;
     this.provider = options.provider;
+    this.providerErrorCode = options.providerErrorCode;
   }
 }
 
