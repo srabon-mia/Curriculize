@@ -104,7 +104,8 @@ export type PersistenceErrorCode =
   | "RESOURCE_INSERT_FAILED"
   | "VERIFICATION_INSERT_FAILED"
   | "MAPPING_UPSERT_FAILED"
-  | "DOMAIN_SCORE_LOOKUP_FAILED";
+  | "DOMAIN_SCORE_LOOKUP_FAILED"
+  | "PERSIST_WITH_FENCE_FAILED";
 
 /** Persistence error with structured details */
 export class PersistenceError extends Error {

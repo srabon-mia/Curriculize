@@ -10,7 +10,7 @@ import {
   reserveAICall,
   persistWithFence,
   advanceCheckpoint,
-  advanceBatchCheckpoint,
+  recordResourceCoverageAttempt,
   completeJob,
   failJob,
   recoverStaleJobs,
@@ -32,11 +32,14 @@ import { getNodesWithUnderstandings, type NodeWithChildren } from '@/lib/curricu
 import { createClient } from '@supabase/supabase-js';
 import type { AICompleteResult } from '@/lib/ai/types';
 import type { JobBudgetLimits, JobClaimResult } from '@/lib/acquisition/jobTypes';
+import { mapUnderstandingCodesToIds } from '@/lib/acquisition/coverage';
+import { runBoundedCoverageAttempts } from '@/lib/acquisition/coverage';
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
 const MAX_TOPICS_PER_INVOCATION = 2;
+const MAX_COVERAGE_ATTEMPTS = 2;
 
 class ResourcePersistenceError extends Error {
   constructor(message: string) {
@@ -505,22 +508,6 @@ export async function processJob(job: JobClaimResult): Promise<void> {
       }
       topicsProcessedThisInvocation++;
 
-      // Reserve AI call for topic discovery
-      const topicReservationId = crypto.randomUUID();
-      const topicReservation = await reserveAICall(
-        job.id, job.claim_token!, job.claim_version,
-        maxAiCalls,
-        topicReservationId
-      );
-
-      if (!topicReservation.reserved) {
-        if (topicReservation.reason === 'budget_exhausted') {
-          const { failJob } = await import('@/lib/acquisition/jobService');
-          await failJob(job.id, job.claim_token!, job.claim_version, 'AI budget exhausted: budget_exhausted');
-        }
-        return;
-      }
-
       // Build topic prompt
       const topicNode: NodeWithChildren = {
         id: nodeId,
@@ -548,94 +535,94 @@ export async function processJob(job: JobClaimResult): Promise<void> {
         discoveredSources.map((s) => s.domain)
       );
 
-      const topicText = await callAIDiscover(topicPrompt);
-      const candidates = parseCandidates(topicText);
-
-      // Process candidates through acquisition pipeline
-      for (const candidate of candidates) {
-        if (!candidate.url || !candidate.title) continue;
-
-        const resourceType = normalizeResourceType(candidate.resource_type);
-        const mappedCandidate = mapToDiscoveryCandidate({ ...candidate, resource_type: resourceType }, []);
-
-        // Acquire and process through pipeline (deterministic - no AI call)
-        const acquisitionResult = await acquireCandidate(
-          { url: mappedCandidate.url, title: mappedCandidate.title, sourceDomain: mappedCandidate.sourceDomain, resourceType: mappedCandidate.resourceType, aiNote: mappedCandidate.aiNote },
-          { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000 },
-        );
-
-        if (!acquisitionResult.success || !acquisitionResult.acquiredPage || !acquisitionResult.structuredContent) {
-          continue;
-        }
-
-        const { acquiredPage, structuredContent } = acquisitionResult;
-
-        // Extract educational evidence
-        let educationalEvidence: ReturnType<typeof extractEducationalEvidence>;
-        try {
-          educationalEvidence = extractEducationalEvidence(structuredContent);
-        } catch {
-          continue;
-        }
-
-        // Verify content
-        let verificationResult: VerificationResult;
-        try {
-          verificationResult = verifyContent({
-            acquiredPage: {
-              contentHash: acquiredPage.contentHash,
-              canonicalUrl: acquiredPage.canonicalUrl.url,
-              finalUrl: acquiredPage.finalUrl,
-              statusCode: acquiredPage.statusCode,
-              contentType: acquiredPage.contentType,
-              acquiredAt: acquiredPage.acquiredAt,
-            },
-            structuredContent,
-            educationalEvidence,
+      const coverageOutcome = await runBoundedCoverageAttempts({
+        maxAttempts: MAX_COVERAGE_ATTEMPTS,
+        threshold: 3,
+        attempt: async () => {
+          const reservation = await reserveAICall(
+            job.id, job.claim_token!, job.claim_version, maxAiCalls, crypto.randomUUID()
+          );
+          if (!reservation.reserved) {
+            return reservation.reason === "budget_exhausted" ? "budget_exhausted" : "ownership_lost";
+          }
+          const candidates: ResourceCandidate[] = parseCandidates(await callAIDiscover(topicPrompt));
+          for (const candidate of candidates) {
+            if (!candidate.url || !candidate.title) continue;
+            const resourceType = normalizeResourceType(candidate.resource_type);
+            const mappedCandidate = mapToDiscoveryCandidate({ ...candidate, resource_type: resourceType }, []);
+            const acquisitionResult = await acquireCandidate(
+              { url: mappedCandidate.url, title: mappedCandidate.title, sourceDomain: mappedCandidate.sourceDomain, resourceType: mappedCandidate.resourceType, aiNote: mappedCandidate.aiNote },
+              { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000 },
+            );
+            if (!acquisitionResult.success || !acquisitionResult.acquiredPage || !acquisitionResult.structuredContent) continue;
+            const { acquiredPage, structuredContent } = acquisitionResult;
+            let educationalEvidence: ReturnType<typeof extractEducationalEvidence>;
+            let verificationResult: VerificationResult;
+            try {
+              educationalEvidence = extractEducationalEvidence(structuredContent);
+              verificationResult = verifyContent({
+                acquiredPage: {
+                  contentHash: acquiredPage.contentHash,
+                  canonicalUrl: acquiredPage.canonicalUrl.url,
+                  finalUrl: acquiredPage.finalUrl,
+                  statusCode: acquiredPage.statusCode,
+                  contentType: acquiredPage.contentType,
+                  acquiredAt: acquiredPage.acquiredAt,
+                },
+                structuredContent,
+                educationalEvidence,
+              });
+            } catch {
+              continue;
+            }
+            const persistResult = await persistWithFence(job.id, job.claim_token!, {
+              acquiredPage,
+              structuredContent,
+              educationalEvidence,
+              verificationResult,
+              target: { nodeId },
+              acquisitionJobId: job.id,
+              callerMetadata: {
+                resourceType: mappedCandidate.resourceType,
+                licenseStatus: mappedCandidate.licenseStatus,
+                aiNote: candidate.ai_note ?? null,
+              },
+            });
+            requireSuccessfulPersistence(persistResult, job.id, nodeId);
+          }
+          return "attempted";
+        },
+        measureEligibleResources: async () => {
+          const { data, error } = await supabase.from("resources").select("id")
+            .eq("node_id", nodeId).eq("status", "approved").eq("content_type_verified", true);
+          if (error) throw new Error(`Failed to measure topic resource coverage: ${error.message}`);
+          return data?.length ?? 0;
+        },
+        record: async ({ resourcesFound, sufficient, budgetExhausted, attemptId }) => {
+          const result = await recordResourceCoverageAttempt({
+            jobId: job.id, claimToken: job.claim_token!, claimVersion: job.claim_version,
+            phase: "topic", targetId: nodeId, attemptId, resourcesFound, sufficient,
+            maxAttempts: MAX_COVERAGE_ATTEMPTS, budgetExhausted,
           });
-        } catch {
-          continue;
-        }
-
-        // Persist with fencing
-        const persistResult = await persistWithFence(job.id, job.claim_token!, {
-          acquiredPage,
-          structuredContent: structuredContent,
-          educationalEvidence,
-          verificationResult,
-          target: { nodeId },
-          acquisitionJobId: job.id,
-          callerMetadata: {
-            resourceType: mappedCandidate.resourceType,
-            licenseStatus: mappedCandidate.licenseStatus,
-            aiNote: candidate.ai_note ?? null,
-          },
-        });
-
-        requireSuccessfulPersistence(persistResult, job.id, nodeId);
-      }
-
-      // Advance checkpoint for this topic.
-      // The return value MUST be checked: a false result means the claim was
-      // lost (lease expired or claim replaced). Continuing would let a stale
-      // worker keep writing under a dead claim, and would attempt to release
-      // a claim it no longer owns.
-      const checkpointOk = await advanceCheckpoint(
-        job.id, job.claim_token!, job.claim_version, nodeId, 0
-      );
-      if (!checkpointOk) {
-        console.error(
-          `[worker] advance_checkpoint returned false — ownership lost for job ${job.id}`
-        );
-        return;
-      }
+          if (result?.status === "insufficient") {
+            console.warn(`[worker] Topic ${nodeId} ended with insufficient eligible resource coverage (${resourcesFound}/3)`);
+          }
+          return result;
+        },
+      });
+      if (coverageOutcome === "ownership_lost") return;
     }
 
     // Step 6: Background per-understanding batch discovery.
     // Returns false when it yielded (quota exhausted) so we do NOT publish or
     // complete the job — the next cron invocation resumes from the batch
     // checkpoint.
-    const batchComplete = await processBatchDiscovery(job, discoveryTitle, nodeIds);
+    const batchComplete = await processBatchDiscovery(
+      job,
+      discoveryTitle,
+      nodeIds,
+      discoveredSources.map((source) => source.domain)
+    );
 
     if (!batchComplete) {
       // Yielded: claim already released inside processBatchDiscovery.
@@ -689,7 +676,8 @@ export async function processJob(job: JobClaimResult): Promise<void> {
 export async function processBatchDiscovery(
   job: JobClaimResult,
   discoveryTitle: string,
-  nodeIds: Array<{ nodeId: string; node: SkeletonNode }>
+  nodeIds: Array<{ nodeId: string; node: SkeletonNode }>,
+  prioritizedDomains: string[] = []
 ): Promise<boolean> {
   const budgetLimits = job.budget_limits;
   const maxAiCalls = budgetLimits?.max_ai_calls ?? DEFAULT_BUDGET_LIMITS.max_ai_calls;
@@ -750,26 +738,7 @@ export async function processBatchDiscovery(
     }
     batchTopicsProcessed++;
 
-    // Reserve AI call for batch
-    const batchReservationId = crypto.randomUUID();
-    const batchReservation = await reserveAICall(
-      job.id, job.claim_token, job.claim_version,
-      maxAiCalls,
-      batchReservationId
-    );
-
-    if (!batchReservation.reserved) {
-      if (batchReservation.reason === 'budget_exhausted') {
-        const { failJob } = await import('@/lib/acquisition/jobService');
-        await failJob(job.id, job.claim_token, job.claim_version, 'AI budget exhausted: budget_exhausted');
-      }
-      return false;
-    }
-
-    let batchPersistedCount = 0;
-
-    try {
-      const batchNode: NodeWithChildren = {
+    const batchNode: NodeWithChildren = {
         id: nodeId,
         curriculum_id: job.curriculum_id!,
         external_key: null,
@@ -785,28 +754,35 @@ export async function processBatchDiscovery(
           description: m.description,
           order_index: 0,
         })),
-      };
-      const prompt = buildTopicBatchPrompt(
-        batchNode,
-        bgCurriculumTitle,
-        [] // discovered sources
-      );
-
-      const text = await callAITopicBatch(prompt);
-      const batchResources = parseBatchResources(text);
-
-      for (const candidate of batchResources) {
+    };
+    const prompt = buildTopicBatchPrompt(batchNode, bgCurriculumTitle, prioritizedDomains);
+    const muIds = muRows.map((mu) => mu.id as string);
+    const coverageOutcome = await runBoundedCoverageAttempts({
+      maxAttempts: MAX_COVERAGE_ATTEMPTS,
+      threshold: 2,
+      attempt: async () => {
+        const reservation = await reserveAICall(
+          job.id, job.claim_token, job.claim_version, maxAiCalls, crypto.randomUUID()
+        );
+        if (!reservation.reserved) {
+          return reservation.reason === "budget_exhausted" ? "budget_exhausted" : "ownership_lost";
+        }
+        const batchResources = parseBatchResources(await callAITopicBatch(prompt));
+        for (const candidate of batchResources) {
         if (!candidate.url || !candidate.title) continue;
 
-        const coveredMuIds = muRows
-          .filter((mu) =>
-            candidate.understanding_codes?.some(
-              (code: string) => code === mu.code || code === mu.external_key
-            )
-          )
-          .map((mu) => mu.id as string);
-
-        const targetMuIds = coveredMuIds.length > 0 ? coveredMuIds : muRows.map((m) => m.id as string);
+        const targetMuIds = mapUnderstandingCodesToIds(
+          candidate.understanding_codes,
+          muRows.map((mu) => ({
+            id: mu.id as string,
+            code: (mu.code as string | null) ?? null,
+            external_key: (mu.external_key as string | null) ?? null,
+          }))
+        );
+        if (targetMuIds.length === 0) {
+          console.warn(`[worker] Skipping unassociated batch resource for topic ${nodeId}`);
+          continue;
+        }
 
         for (const muId of targetMuIds) {
           const discoveryCandidate = {
@@ -828,20 +804,25 @@ export async function processBatchDiscovery(
           if (!acquisitionResult.success || !acquisitionResult.acquiredPage || !acquisitionResult.structuredContent) continue;
 
           const { acquiredPage, structuredContent } = acquisitionResult;
-          const educationalEvidence = extractEducationalEvidence(structuredContent);
-          const verificationResult = verifyContent({
-            acquiredPage: {
-              contentHash: acquiredPage.contentHash,
-              canonicalUrl: acquiredPage.canonicalUrl.url,
-              finalUrl: acquiredPage.finalUrl,
-              statusCode: acquiredPage.statusCode,
-              contentType: acquiredPage.contentType,
-              acquiredAt: acquiredPage.acquiredAt,
-            },
-            structuredContent,
-            educationalEvidence,
-          });
-
+          let educationalEvidence: ReturnType<typeof extractEducationalEvidence>;
+          let verificationResult: VerificationResult;
+          try {
+            educationalEvidence = extractEducationalEvidence(structuredContent);
+            verificationResult = verifyContent({
+              acquiredPage: {
+                contentHash: acquiredPage.contentHash,
+                canonicalUrl: acquiredPage.canonicalUrl.url,
+                finalUrl: acquiredPage.finalUrl,
+                statusCode: acquiredPage.statusCode,
+                contentType: acquiredPage.contentType,
+                acquiredAt: acquiredPage.acquiredAt,
+              },
+              structuredContent,
+              educationalEvidence,
+            });
+          } catch {
+            continue;
+          }
           const persistResult = await persistWithFence(job.id, job.claim_token, {
             acquiredPage,
             structuredContent,
@@ -849,33 +830,33 @@ export async function processBatchDiscovery(
             verificationResult,
             target: { understandingId: muId },
             acquisitionJobId: job.id,
-            callerMetadata: {
-              resourceType,
-              licenseStatus,
-              aiNote: candidate.ai_note ?? null,
-            },
+            callerMetadata: { resourceType, licenseStatus, aiNote: candidate.ai_note ?? null },
           });
           requireSuccessfulPersistence(persistResult, job.id, nodeId);
-          batchPersistedCount++;
         }
-      }
-    } catch (error) {
-      console.error('Batch discovery error:', error);
-      if (error instanceof ResourcePersistenceError) throw error;
-    }
-
-    // Persist batch progress for this topic. The RPC is fenced by
-    // claim_token + claim_version + status='running', so a stale worker
-    // cannot overwrite progress recorded by a newer owner.
-    const batchCheckpointOk = await advanceBatchCheckpoint(
-      job.id, job.claim_token!, job.claim_version, nodeId, batchPersistedCount
-    );
-    if (!batchCheckpointOk) {
-      console.error(
-        `[worker] advance_batch_checkpoint returned false — ownership lost for job ${job.id}`
-      );
-      return false;
-    }
+        }
+        return "attempted";
+      },
+      measureEligibleResources: async () => {
+        const { data, error } = await supabase.from("resources").select("major_understanding_id")
+          .in("major_understanding_id", muIds).eq("status", "approved").eq("content_type_verified", true);
+        if (error) throw new Error(`Failed to measure understanding resource coverage: ${error.message}`);
+        const rows = data ?? [];
+        return Math.min(...muIds.map((muId) => rows.filter((row) => row.major_understanding_id === muId).length));
+      },
+      record: async ({ resourcesFound, sufficient, budgetExhausted, attemptId }) => {
+        const result = await recordResourceCoverageAttempt({
+          jobId: job.id, claimToken: job.claim_token, claimVersion: job.claim_version,
+          phase: "batch", targetId: nodeId, attemptId, resourcesFound, sufficient,
+          maxAttempts: MAX_COVERAGE_ATTEMPTS, budgetExhausted,
+        });
+        if (result?.status === "insufficient") {
+          console.warn(`[worker] Understanding coverage in topic ${nodeId} ended insufficient (minimum ${resourcesFound}/2 per understanding)`);
+        }
+        return result;
+      },
+    });
+    if (coverageOutcome === "ownership_lost") return false;
   }
 
   // Every topic's batch discovery has been processed.

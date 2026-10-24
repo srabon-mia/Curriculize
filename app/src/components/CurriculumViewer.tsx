@@ -77,9 +77,10 @@ export function CurriculumViewer({
     nodes[0]?.id ?? ""
   );
   const [generationFinished, setGenerationFinished] = useState(false);
+  const [coverageStatus, setCoverageStatus] = useState<"pending" | "complete" | "insufficient" | "failed">("pending");
 
   // Poll for background resource updates every 30 seconds
-  // Stops once all understandings have resources, or generation has failed
+  // Stops only after quality targets are met or generation reaches a terminal state.
   useEffect(() => {
     // Extract curriculum_id from the first node
     const curriculumId = nodes[0]?.curriculum_id;
@@ -95,16 +96,19 @@ export function CurriculumViewer({
         with_resources: number;
         complete: boolean;
         generation_finished?: boolean;
+        coverage_status?: "pending" | "complete" | "insufficient" | "failed";
       };
 
       if (data.complete) {
         stopped = true;
+        setCoverageStatus("complete");
         return;
       }
 
       if (data.generation_finished) {
         stopped = true;
         setGenerationFinished(true);
+        setCoverageStatus(data.coverage_status ?? "failed");
         return;
       }
 
@@ -180,6 +184,7 @@ export function CurriculumViewer({
   const nodeResources = selectedNode
     ? resourcesByTarget[`node:${selectedNode.id}`] ?? []
     : [];
+  const selectedTopicResourceCount = nodeResources.length;
 
   return (
     <div className="flex flex-col md:flex-row flex-1 min-h-[calc(100vh-65px)]">
@@ -298,6 +303,16 @@ export function CurriculumViewer({
               {selectedNode.claim_statement && (
                 <p className="text-sm text-text-secondary mt-2.5 leading-relaxed italic">
                   {selectedNode.claim_statement}
+                </p>
+              )}
+              {coverageStatus === "insufficient" && selectedTopicResourceCount < 3 && (
+                <p className="mt-3 text-sm text-amber-800" role="status">
+                  Resource coverage is incomplete: {selectedTopicResourceCount} verified resources are available for this topic; the quality target is at least 3.
+                </p>
+              )}
+              {coverageStatus === "failed" && (
+                <p className="mt-3 text-sm text-red-800" role="status">
+                  Resource discovery failed before coverage could be confirmed.
                 </p>
               )}
             </div>
@@ -425,6 +440,11 @@ export function CurriculumViewer({
                         </p>
                       )
                     )}
+                    {generationFinished && coverageStatus === "insufficient" && muResources.length > 0 && muResources.length < 2 && (
+                      <p className="mt-2 text-xs text-amber-800" role="status">
+                        Coverage is incomplete: {muResources.length} verified resource{muResources.length === 1 ? " is" : "s are"} available; the quality target is at least 2.
+                      </p>
+                    )}
                   </div>
                 );
               })}
@@ -438,7 +458,9 @@ export function CurriculumViewer({
                 <div className="mt-8 rounded-xl border border-dashed border-border-default bg-surface-card px-6 py-10 text-center">
                   {generationFinished ? (
                     <p className="text-sm text-text-secondary">
-                      Generation failed. No verified resources were found for this topic.
+                      {coverageStatus === "failed"
+                        ? "Resource discovery failed before verified resources could be confirmed."
+                        : "No verified resources were found for this topic. Coverage is insufficient."}
                     </p>
                   ) : (
                     <p className="text-sm text-text-secondary">

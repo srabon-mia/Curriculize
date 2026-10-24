@@ -1,6 +1,7 @@
 import { createClient } from '@/lib/supabase/server';
 import { NextResponse } from 'next/server';
 import { getJobById } from '@/lib/acquisition/jobService';
+import { getStoredCoverageStatus } from '@/lib/acquisition/coverage';
 
 export async function GET(
   request: Request,
@@ -32,6 +33,14 @@ export async function GET(
     const totalTopics = job.input_data?.totalTopics as number ?? 0;
     const resourcesFound = job.result_data?.resourcesFound as number ?? 0;
     const aiCallsUsed = job.result_data?.aiCallsUsed as number ?? 0;
+    const coverageAttempts = job.result_data?.resourceCoverage as
+      | Record<string, { status?: string }>
+      | undefined;
+    const coverageStatus = getStoredCoverageStatus({
+      jobStatus: job.status,
+      coverage: coverageAttempts,
+      expectedTargets: totalTopics * 2,
+    });
 
     let step: 'skeleton' | 'sources' | 'discovery' | 'persisting' | 'complete' = 'skeleton';
     if (job.status === 'completed') step = 'complete';
@@ -42,6 +51,7 @@ export async function GET(
     return NextResponse.json({
       id: job.id,
       status: job.status,
+      coverage_status: coverageStatus,
       progress: {
         step,
         currentTopic: job.result_data?.lastTopic as string | undefined,

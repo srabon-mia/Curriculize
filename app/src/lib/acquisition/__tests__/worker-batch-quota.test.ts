@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-  advanceBatchCheckpoint: vi.fn(),
+  recordResourceCoverageAttempt: vi.fn(),
   releaseJobClaim: vi.fn(),
   reserveAICall: vi.fn(),
   getJobById: vi.fn(),
@@ -15,7 +15,7 @@ vi.mock('@/lib/acquisition/jobService', () => ({
   reserveAICall: mocks.reserveAICall,
   persistWithFence: vi.fn(),
   advanceCheckpoint: vi.fn(),
-  advanceBatchCheckpoint: mocks.advanceBatchCheckpoint,
+  recordResourceCoverageAttempt: mocks.recordResourceCoverageAttempt,
   completeJob: vi.fn(),
   failJob: vi.fn(),
   recoverStaleJobs: vi.fn(),
@@ -59,9 +59,13 @@ describe('durable worker batch quota', () => {
     mocks.getJobById.mockImplementation(async () => ({
       result_data: { batchCheckpoint: { completedTopicIds: [...completed] } },
     }));
-    mocks.advanceBatchCheckpoint.mockImplementation(async (_jobId: string, _token: string, _version: number, topicId: string) => {
-      completed.add(topicId);
-      return true;
+    const attempts = new Map<string, number>();
+    mocks.recordResourceCoverageAttempt.mockImplementation(async (input: { targetId: string }) => {
+      const count = (attempts.get(input.targetId) ?? 0) + 1;
+      attempts.set(input.targetId, count);
+      const status = count === 2 ? 'insufficient' : 'retrying';
+      if (status === 'insufficient') completed.add(input.targetId);
+      return { status, retry: status === 'retrying' };
     });
     mocks.releaseJobClaim.mockResolvedValue(true);
     mocks.reserveAICall.mockResolvedValue({ reserved: true });
@@ -109,30 +113,30 @@ describe('durable worker batch quota', () => {
 
     const firstDone = await processBatchDiscovery(job, 'Geometry', topics);
     expect(firstDone).toBe(false);
-    expect(mocks.advanceBatchCheckpoint.mock.calls.map((call) => call[3])).toEqual(['topic-3', 'topic-4']);
+    expect(mocks.recordResourceCoverageAttempt.mock.calls.map(([call]) => call.targetId)).toEqual(['topic-3', 'topic-3', 'topic-4', 'topic-4']);
     expect(mocks.releaseJobClaim).toHaveBeenCalledTimes(1);
     expect(mocks.releaseJobClaim).toHaveBeenLastCalledWith('same-job', 'fenced-token', 7);
 
     const secondDone = await processBatchDiscovery(job, 'Geometry', topics);
     expect(secondDone).toBe(false);
-    expect(mocks.advanceBatchCheckpoint.mock.calls.map((call) => call[3])).toEqual([
-      'topic-3', 'topic-4', 'topic-5', 'topic-6',
+    expect(mocks.recordResourceCoverageAttempt.mock.calls.map(([call]) => call.targetId)).toEqual([
+      'topic-3', 'topic-3', 'topic-4', 'topic-4', 'topic-5', 'topic-5', 'topic-6', 'topic-6',
     ]);
     expect(mocks.releaseJobClaim).toHaveBeenCalledTimes(2);
     expect(mocks.releaseJobClaim).toHaveBeenLastCalledWith('same-job', 'fenced-token', 7);
 
     const thirdDone = await processBatchDiscovery(job, 'Geometry', topics);
     expect(thirdDone).toBe(false);
-    expect(mocks.advanceBatchCheckpoint.mock.calls.map((call) => call[3])).toEqual([
-      'topic-3', 'topic-4', 'topic-5', 'topic-6', 'topic-7', 'topic-8',
+    expect(mocks.recordResourceCoverageAttempt.mock.calls.map(([call]) => call.targetId)).toEqual([
+      'topic-3', 'topic-3', 'topic-4', 'topic-4', 'topic-5', 'topic-5', 'topic-6', 'topic-6', 'topic-7', 'topic-7', 'topic-8', 'topic-8',
     ]);
-    expect(mocks.advanceBatchCheckpoint.mock.calls.every((call) => call[0] === 'same-job' && call[1] === 'fenced-token' && call[2] === 7)).toBe(true);
+    expect(mocks.recordResourceCoverageAttempt.mock.calls.every(([call]) => call.jobId === 'same-job' && call.claimToken === 'fenced-token' && call.claimVersion === 7)).toBe(true);
     expect(mocks.releaseJobClaim).toHaveBeenCalledTimes(3);
 
     const fourthDone = await processBatchDiscovery(job, 'Geometry', topics);
     expect(fourthDone).toBe(true);
-    expect(mocks.advanceBatchCheckpoint.mock.calls.map((call) => call[3])).toEqual([
-      'topic-3', 'topic-4', 'topic-5', 'topic-6', 'topic-7', 'topic-8', 'topic-9',
+    expect(mocks.recordResourceCoverageAttempt.mock.calls.map(([call]) => call.targetId)).toEqual([
+      'topic-3', 'topic-3', 'topic-4', 'topic-4', 'topic-5', 'topic-5', 'topic-6', 'topic-6', 'topic-7', 'topic-7', 'topic-8', 'topic-8', 'topic-9', 'topic-9',
     ]);
     expect(mocks.releaseJobClaim).toHaveBeenCalledTimes(3);
     expect(mocks.getJobById).toHaveBeenCalledTimes(4);

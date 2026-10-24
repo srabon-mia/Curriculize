@@ -134,11 +134,8 @@ function toVerificationAcquiredPage(acquiredPage: AcquiredPage): VerificationInp
  * their lease.
  *
  * Returns null on per-candidate failure (caller skips / continues).
- * Re-throws PersistenceError only when persistence itself throws — but in
- * practice all persistence throw paths represent candidate-level failures and
- * are caught here to preserve generation-job continuity; the caller still
- * surfaces progress via SSE. If you need stricter failure propagation, call
- * persistVerifiedResource directly.
+ * Re-throws PersistenceError so a durable job cannot checkpoint a target
+ * after a failed write.
  */
 export async function discoverVerifiedResource(
   params: LearnParams,
@@ -227,15 +224,9 @@ export async function discoverVerifiedResource(
     };
   } catch (err) {
     if (err instanceof PersistenceError) {
-      // Per-candidate persistence failure — log and skip rather than abort
-      // the entire generation job. Evidence is best-effort per candidate;
-      // the resource is omitted from the curriculum.
-      console.warn(
-        `[learningEngine] persistence failed for ${result.acquiredPage.finalUrl}:`,
-        err.code,
-        err.message
-      );
-      return null;
+      // A write failure must not be mistaken for empty discovery. Let the
+      // durable job fail so no coverage checkpoint can be recorded.
+      throw err;
     }
     // Unexpected error — re-throw so it is not silently swallowed.
     throw err;

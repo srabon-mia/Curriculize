@@ -167,6 +167,14 @@ export async function persistWithFence(
   input: PersistWithFenceRequest['input']
 ): Promise<PersistWithFenceResponse> {
   const supabase = getServiceClient();
+  // Exact-retry detection is keyed by acquisition_job_id + content hash in
+  // persist_with_fence. Scope that key to the association target so reusing
+  // the same verified page for another topic/concept still writes its link.
+  const targetScope = input.target.nodeId
+    ? `node:${input.target.nodeId}`
+    : input.target.understandingId
+      ? `understanding:${input.target.understandingId}`
+      : "unscoped";
   // Send only fields consumed by persist_with_fence. Runtime AcquisitionPage
   // and StructuredContent objects also carry raw page bodies and extracted
   // blocks/links; those are not needed by this RPC and may contain characters
@@ -204,7 +212,9 @@ export async function persistWithFence(
       verifiedAt: input.verificationResult.verifiedAt,
     },
     target: { ...input.target },
-    acquisitionJobId: input.acquisitionJobId ?? null,
+    acquisitionJobId: input.acquisitionJobId
+      ? `${input.acquisitionJobId}:${targetScope}`
+      : null,
     callerMetadata: {
       resourceType: input.callerMetadata?.resourceType ?? null,
       licenseStatus: input.callerMetadata?.licenseStatus ?? null,
@@ -432,6 +442,75 @@ export async function advanceBatchCheckpoint(
   }
 
   return data as boolean;
+}
+
+export class CoverageAttemptRpcError extends Error {
+  constructor(message: string, readonly code: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "CoverageAttemptRpcError";
+  }
+}
+
+export type RecordResourceCoverageAttemptResult =
+  | { status: "retrying"; retry: true; attempts: number }
+  | { status: "complete" | "insufficient"; retry: false; attempts: number }
+  | { status: "ownership_lost"; retry: false };
+
+/** Atomically records a target's bounded coverage attempt and final checkpoint. */
+export async function recordResourceCoverageAttempt(input: {
+  jobId: string;
+  claimToken: string;
+  claimVersion: number;
+  phase: "topic" | "batch";
+  targetId: string;
+  attemptId: string;
+  resourcesFound: number;
+  sufficient: boolean;
+  maxAttempts?: number;
+  budgetExhausted?: boolean;
+}): Promise<RecordResourceCoverageAttemptResult> {
+  const supabase = getServiceClient();
+  const { data, error } = await supabase.rpc("record_resource_coverage_attempt", {
+    p_job_id: input.jobId,
+    p_claim_token: input.claimToken,
+    p_expected_claim_version: input.claimVersion,
+    p_phase: input.phase,
+    p_target_id: input.targetId,
+    p_attempt_id: input.attemptId,
+    p_resources_found: input.resourcesFound,
+    p_sufficient: input.sufficient,
+    p_max_attempts: input.maxAttempts ?? 2,
+    p_budget_exhausted: input.budgetExhausted ?? false,
+  });
+  if (error) {
+    throw new CoverageAttemptRpcError(
+      `Coverage attempt RPC failed: ${error.message ?? "database client error"}`,
+      "DATABASE_ERROR",
+      { cause: error }
+    );
+  }
+
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    throw new CoverageAttemptRpcError("Coverage attempt RPC returned an empty or malformed response", "INVALID_RESPONSE");
+  }
+
+  const response = data as Record<string, unknown>;
+  if ("error" in response) {
+    if (response.error === "ownership_lost_or_expired") {
+      return { status: "ownership_lost", retry: false };
+    }
+    const code = typeof response.error === "string" ? response.error : "UNKNOWN_RPC_ERROR";
+    throw new CoverageAttemptRpcError(`Coverage attempt RPC rejected the request: ${code}`, code);
+  }
+
+  const validStatuses = ["retrying", "complete", "insufficient"];
+  const expectedRetry = response.status === "retrying";
+  if (!validStatuses.includes(String(response.status)) ||
+      typeof response.retry !== "boolean" || response.retry !== expectedRetry ||
+      !Number.isSafeInteger(response.attempts) || (response.attempts as number) < 0) {
+    throw new CoverageAttemptRpcError("Coverage attempt RPC returned an invalid response shape", "INVALID_RESPONSE");
+  }
+  return response as RecordResourceCoverageAttemptResult;
 }
 
 export async function recoverStaleJobs(): Promise<Array<{ id: string; status: string; retry_count: number }>> {

@@ -78,6 +78,25 @@ describe('Lease fencing in persistVerifiedResourceWithFence', () => {
 
     expect(result).not.toBeNull();
     expect(result?.resource?.id).toBe('res-1');
+    expect(mockRpc.mock.calls[0][1].p_input.acquisitionJobId).toBe(
+      'test-job-1:node:550e8400-e29b-41d4-a716-446655440000'
+    );
+  });
+
+  it('uses distinct exact-retry keys for the same URL attached to different valid targets', async () => {
+    mockRpc.mockResolvedValue({
+      data: { resource_id: 'res-1', vr_id: 'vr-1', mapping_id: null, is_exact_retry: false },
+      error: null,
+    });
+    await persistVerifiedResourceWithFence('job-1', 'valid-token', validInput);
+    await persistVerifiedResourceWithFence('job-1', 'valid-token', {
+      ...validInput,
+      target: { understandingId: 'mu-2' },
+    });
+    expect(mockRpc.mock.calls[0][1].p_input.acquisitionJobId).toBe(
+      'test-job-1:node:550e8400-e29b-41d4-a716-446655440000'
+    );
+    expect(mockRpc.mock.calls[1][1].p_input.acquisitionJobId).toBe('test-job-1:understanding:mu-2');
   });
 
   it('fails when claim_token mismatch (ownership lost)', async () => {

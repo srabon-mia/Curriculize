@@ -56,6 +56,7 @@ const rpcOverrides: Record<string, { data: unknown; error: unknown }> = {};
 // Per-RPC call counts and sequenced responses (for testing retry logic).
 const rpcCallCounts: Record<string, number> = {};
 const rpcSequences: Record<string, Array<{ data: unknown; error: unknown }>> = {};
+const coverageAttemptCounts: Record<string, number> = {};
 
 // Flag-controlled INSERT error for acquisition_jobs (for testing unique
 // violation / failure paths without mockImplementationOnce interference).
@@ -92,11 +93,15 @@ async function mockDiscoverVerifiedResource(): Promise<void> {
         ai_note: params.candidate.aiNote ?? null,
         status: "draft",
       };
-      capturedInserts.push({ table: "resources", resources: [resourceRow] });
+      const existing = allResourceInserts().find((resource) =>
+        resource.url === resourceRow.url && resource.node_id === resourceRow.node_id &&
+        resource.major_understanding_id === resourceRow.major_understanding_id
+      );
+      if (!existing) capturedInserts.push({ table: "resources", resources: [resourceRow] });
       return {
-        resource: { ...resourceRow, id: "res-mock", createdAt: "2026-10-18T00:01:00Z", isNew: true },
+        resource: { ...(existing ?? resourceRow), id: "res-mock", createdAt: "2026-10-18T00:01:00Z", isNew: !existing },
         verificationStatus: "verified",
-        isNew: true,
+        isNew: !existing,
       } as unknown as LearnResult;
     }
   );
@@ -278,23 +283,30 @@ function createMockSupabaseClient() {
         return Promise.resolve({ data: null, error: null });
       }
 
-      if (resumeScenario && name === "advance_checkpoint") {
-        const completed = simulatedResumeJob.result_data.checkpoint?.completedTopicIds ?? [];
-        simulatedResumeJob.result_data.checkpoint = {
-          completedTopicIds: completed.includes(args.p_completed_topic_id)
-            ? completed
-            : [...completed, args.p_completed_topic_id],
-        };
-        return Promise.resolve({ data: true, error: null });
-      }
-      if (resumeScenario && name === "advance_batch_checkpoint") {
-        const completed = simulatedResumeJob.result_data.batchCheckpoint?.completedTopicIds ?? [];
-        simulatedResumeJob.result_data.batchCheckpoint = {
-          completedTopicIds: completed.includes(args.p_completed_topic_id)
-            ? completed
-            : [...completed, args.p_completed_topic_id],
-        };
-        return Promise.resolve({ data: true, error: null });
+      if (name === "record_resource_coverage_attempt") {
+        const key = `${args.p_phase}:${args.p_target_id}`;
+        const attemptCount = args.p_budget_exhausted
+          ? (coverageAttemptCounts[key] ?? 0)
+          : (coverageAttemptCounts[key] = (coverageAttemptCounts[key] ?? 0) + 1);
+        const status = args.p_sufficient
+          ? "complete"
+          : args.p_budget_exhausted || attemptCount >= args.p_max_attempts
+            ? "insufficient"
+            : "retrying";
+        if (resumeScenario && simulatedResumeJob) {
+          const phaseCheckpoint = args.p_phase === "topic" ? "checkpoint" : "batchCheckpoint";
+          const completed = simulatedResumeJob.result_data[phaseCheckpoint]?.completedTopicIds ?? [];
+          const resultData = simulatedResumeJob.result_data;
+          resultData.resourceCoverage ??= {};
+          resultData.resourceCoverage[key] = { attempts: attemptCount, status, resourcesFound: args.p_resources_found };
+          if (status !== "retrying") {
+            resultData[phaseCheckpoint] = {
+              ...resultData[phaseCheckpoint],
+              completedTopicIds: completed.includes(args.p_target_id) ? completed : [...completed, args.p_target_id],
+            };
+          }
+        }
+        return Promise.resolve({ data: { attempts: attemptCount, status, retry: status === "retrying" }, error: null });
       }
       if (resumeScenario && name === "release_job_claim") {
         simulatedResumeJob.status = "pending";
@@ -498,6 +510,7 @@ function resetRpcSequences() {
   for (const key of Object.keys(rpcCallCounts)) {
     delete rpcCallCounts[key];
   }
+    for (const key of Object.keys(coverageAttemptCounts)) delete coverageAttemptCounts[key];
 }
 
 function createMockRequest(id: string): Request {
@@ -1003,7 +1016,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       await runStreamAndCapture();
 
       const rpcCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls;
-      const jobLifecycleRPCs = ["advance_checkpoint", "complete_job", "renew_lease"];
+      const jobLifecycleRPCs = ["record_resource_coverage_attempt", "complete_job", "renew_lease"];
 
       for (const rpcName of jobLifecycleRPCs) {
         const calls = rpcCalls.filter((c: any) => c[0] === rpcName);
@@ -1025,24 +1038,25 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       await runStreamAndCapture();
 
       const rpcCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls;
-      const batchCheckpointCalls = rpcCalls.filter((c: any) => c[0] === "advance_batch_checkpoint");
-      // Should have called advance_batch_checkpoint for each topic
+      const batchCheckpointCalls = rpcCalls.filter((c: any) => c[0] === "record_resource_coverage_attempt" && c[1].p_phase === "batch");
+      // Each batch topic is measured twice here because the mock reports zero eligible rows.
       expect(batchCheckpointCalls.length).toBeGreaterThan(0);
     });
 
-    it("advance_batch_checkpoint called with correct parameters", async () => {
+    it("batch coverage attempts carry fencing and target data", async () => {
       await runStreamAndCapture();
 
       const rpcCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls;
-      const batchCheckpointCalls = rpcCalls.filter((c: any) => c[0] === "advance_batch_checkpoint");
+      const batchCheckpointCalls = rpcCalls.filter((c: any) => c[0] === "record_resource_coverage_attempt" && c[1].p_phase === "batch");
 
       for (const call of batchCheckpointCalls) {
         // Every lifecycle RPC must carry the job id and a non-null claim_token
         expect(call[1].p_job_id).toBeTruthy();
         expect(call[1].p_claim_token).toBeTruthy();
         expect(call[1].p_expected_claim_version).toBeTruthy();
-        expect(call[1].p_completed_topic_id).toBeTruthy();
+        expect(call[1].p_target_id).toBeTruthy();
         expect(typeof call[1].p_resources_found).toBe("number");
+        expect(call[1].p_max_attempts).toBe(2);
       }
     });
   });
@@ -1147,7 +1161,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     const baseProvider = mockAIInstance;
     const resumedDiscovery = vi.fn(async (prompt: string, options: any) => {
       const topicCalls = baseProvider.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt").length;
-      if (prompt === "discover prompt" && topicCalls === 2) {
+      if (prompt === "discover prompt" && topicCalls === 4) {
         notifyResumedDiscoveryStarted();
         await resumedDiscoveryGate;
       }
@@ -1210,7 +1224,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     expect(simulatedResumeJob.result_data.batchCheckpoint.completedTopicIds).toHaveLength(9);
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "skeleton prompt")).toHaveLength(1);
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "sources prompt")).toHaveLength(1);
-    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(9);
+    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(18);
     expect(allResourceInserts()).toHaveLength(9);
     expect(new Set(allResourceInserts().map((resource) => resource.node_id)).size).toBe(9);
 
@@ -1221,13 +1235,13 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       .map(([, options]) => options)
       .filter((options) => options?.dedupTracker);
     const topicTrackers = topicOptions.map((options) => options!.dedupTracker);
-    expect(topicTrackers).toHaveLength(9);
-    expect(new Set(topicTrackers).size).toBe(9);
+    expect(topicTrackers).toHaveLength(18); // two bounded discovery attempts for each topic
+    expect(new Set(topicTrackers).size).toBe(18);
     const topicCaches = topicOptions.map((options) => options!.cache);
     expect(new Set(topicCaches).size).toBeLessThan(topicCaches.length);
-  });
+  }, 120_000);
 
-  it("pauses an unfinished topic and resumes it without reprocessing completed topics", async () => {
+  it("records an empty topic as terminally insufficient after bounded retries", async () => {
     resumeScenario = true;
     const { discoverVerifiedResource } = await import("@/lib/learningEngine");
     const skeleton = {
@@ -1281,36 +1295,25 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     vi.mocked(discoverVerifiedResource).mockResolvedValue(null as any);
     const failedTopicEvents = await captureStream();
 
-    expect(failedTopicEvents.some((event) => event.event === "paused" && event.data.message.includes("No verified resources were saved"))).toBe(true);
+    expect(failedTopicEvents.some((event) => event.event === "yielded")).toBe(true);
     expect(failedTopicEvents.some((event) => event.event === "complete")).toBe(false);
     expect(failedTopicEvents.find((event) => event.event === "status" && event.data.step === "skeleton")?.data.message).toBe("Loading the saved curriculum structure…");
     expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual([
-      "node-topic-1", "node-topic-2",
+      "node-topic-1", "node-topic-2", "node-topic-3", "node-topic-4",
     ]);
     expect(simulatedResumeJob.status).toBe("pending");
 
-    await mockDiscoverVerifiedResource();
-    const retryEvents = await captureStream();
-    const retriedTopicStatuses = retryEvents
-      .filter((event) => event.event === "status" && event.data.step === "discovery")
-      .map((event) => event.data.message);
-    expect(retriedTopicStatuses).toEqual([
-      "Finding resources for: Geometry Topic 3",
-      "Finding resources for: Geometry Topic 4",
-    ]);
-    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual([
-      "node-topic-1", "node-topic-2", "node-topic-3", "node-topic-4",
-    ]);
+    expect(Object.values(simulatedResumeJob.result_data.resourceCoverage).some((target: any) => target.status === "insufficient")).toBe(true);
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "skeleton prompt")).toHaveLength(1);
-    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(5);
+    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(8);
 
     const releaseCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls
       .filter((call: any) => call[0] === "release_job_claim");
-    expect(releaseCalls).toHaveLength(3); // first quota yield, failed topic pause, then quota yield
+    expect(releaseCalls).toHaveLength(2); // first quota yield, then quota yield after terminal shortfall
     expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.some((call: any) => call[0] === "complete_job")).toBe(false);
-  });
+  }, 120_000);
 
-  it("keeps an unverified topic pending after citation failure without losing prior checkpoints", async () => {
+  it("records citation failures as insufficient after bounded retries without losing prior checkpoints", async () => {
     resumeScenario = true;
     const skeleton = {
       title: "High School Geometry Semester Curriculum",
@@ -1364,17 +1367,17 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     });
     const retryEvents = (await consumeSseEvents(retryResponse, 10_000, originalSetTimeout)).map(parseSseEvent);
 
-    expect(retryEvents.some((event) => event.event === "paused" && event.data.message.includes("Source citations were unavailable"))).toBe(true);
+    expect(retryEvents.some((event) => event.event === "yielded")).toBe(true);
     expect(retryEvents.find((event) => event.event === "status" && event.data.step === "skeleton")?.data.message).toBe("Loading the saved curriculum structure…");
     expect(retryEvents.some((event) => event.event === "complete")).toBe(false);
     expect(simulatedResumeJob.id).toBe("job-1");
     expect(simulatedResumeJob.status).toBe("pending");
-    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual(["node-topic-1", "node-topic-2"]);
+    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual(["node-topic-1", "node-topic-2", "node-topic-3", "node-topic-4"]);
     expect(persistedResumeNodes.map((node) => node.title)).toEqual(persistedNodeTitles);
     expect(baseProvider.getCalls((call) => call.method === "structured" && call.prompt === "skeleton prompt")).toHaveLength(1);
-    expect(baseProvider.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(2);
-    expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.filter((call: any) => call[0] === "advance_checkpoint")).toHaveLength(2);
-  });
+    expect(baseProvider.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(4);
+    expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.filter((call: any) => call[0] === "record_resource_coverage_attempt" && call[1].p_phase === "topic" && call[1].p_target_id === "node-topic-3")).toHaveLength(2);
+  }, 120_000);
 
   // ============================================================
   // Regression: Terminal state events
@@ -1434,7 +1437,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
 
     it("handles ownership lost during background batch", async () => {
       // Simulate ownership lost during background batch
-      setRpcResult("advance_batch_checkpoint", { data: false, error: null });
+      setRpcResult("record_resource_coverage_attempt", { data: false, error: null });
 
       await runStreamAndCapture();
 

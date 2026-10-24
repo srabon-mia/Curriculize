@@ -588,7 +588,9 @@ export async function persistVerifiedResourceWithFence(
       verifiedAt: input.verificationResult.verifiedAt,
     },
     target: input.target,
-    acquisitionJobId: input.acquisitionJobId ?? null,
+    acquisitionJobId: input.acquisitionJobId
+      ? `${input.acquisitionJobId}:${input.target.nodeId ? `node:${input.target.nodeId}` : `understanding:${input.target.understandingId}`}`
+      : null,
     callerMetadata: {
       resourceType: input.callerMetadata?.resourceType ?? null,
       licenseStatus: input.callerMetadata?.licenseStatus ?? null,
@@ -604,7 +606,7 @@ export async function persistVerifiedResourceWithFence(
 
   if (error) {
     console.error("persistVerifiedResourceWithFence RPC error:", error.message);
-    return null;
+    throw new PersistenceError("PERSIST_WITH_FENCE_FAILED", error.message);
   }
 
   if (data?.error) {
@@ -612,7 +614,8 @@ export async function persistVerifiedResourceWithFence(
     console.warn(
       `[persistence] persist_with_fence returned error: ${data.error}`
     );
-    return null;
+    if (data.error === "ownership_lost_or_expired") return null;
+    throw new PersistenceError("PERSIST_WITH_FENCE_FAILED", String(data.error));
   }
 
   // Convert RPC response to PersistenceResult
@@ -624,15 +627,17 @@ export async function persistVerifiedResourceWithFence(
   };
 
   // Fetch the final resource for return
-  const { data: finalResource } = await supabase
+  const { data: finalResource, error: resourceLookupError } = await supabase
     .from("resources")
     .select("*")
     .eq("id", result.resource_id)
     .single();
 
-  if (!finalResource) {
-    console.error("persistVerifiedResourceWithFence: failed to fetch created resource");
-    return null;
+  if (resourceLookupError || !finalResource) {
+    throw new PersistenceError(
+      "RESOURCE_LOOKUP_FAILED",
+      resourceLookupError?.message ?? "Failed to fetch resource after fenced persistence"
+    );
   }
 
   return {

@@ -50,6 +50,8 @@ import {
   reserveAICall,
   persistWithFence,
   advanceCheckpoint,
+  recordResourceCoverageAttempt,
+  CoverageAttemptRpcError,
   completeJob,
   failJob,
   recoverStaleJobs,
@@ -321,7 +323,7 @@ describe("Job Service Layer - RPC Contract Verification", () => {
           educationalEvidence: mockInput.educationalEvidence,
           verificationResult: mockInput.verificationResult,
           target: mockInput.target,
-          acquisitionJobId: mockInput.acquisitionJobId,
+          acquisitionJobId: "test-job-id:node:test-node-id",
           callerMetadata: mockInput.callerMetadata,
         },
       });
@@ -331,6 +333,13 @@ describe("Job Service Layer - RPC Contract Verification", () => {
       expect(rpcInput.structuredContent.metadata.title).toBe("Café and Unicode 😀");
       expect(rpcInput.callerMetadata.aiNote).toBe("literal \\u0000 remains text");
       expect(result.resource_id).toBe("test-resource");
+
+      mockInput.target = { understandingId: "test-mu-id" };
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ data: { resource_id: "test-resource", vr_id: "test-vr", is_exact_retry: false }, error: null });
+      await persistWithFence("test-job", "test-token", mockInput);
+      const secondRpcInput = (mockSupabase.rpc as ReturnType<typeof vi.fn>).mock.calls[1][1].p_input;
+      expect(secondRpcInput.acquisitionJobId).toBe("test-job-id:understanding:test-mu-id");
+      expect(secondRpcInput.target).toEqual({ understandingId: "test-mu-id" });
     });
 
     it("reports only field paths and counts for unsupported Unicode in a jsonb error", async () => {
@@ -434,6 +443,67 @@ describe("Job Service Layer - RPC Contract Verification", () => {
       const result = await advanceCheckpoint("test-job", "test-token", 1, "test-topic-id", 5);
 
       expect(result).toBe(false);
+    });
+  });
+
+  describe("recordResourceCoverageAttempt", () => {
+    it("writes a fenced target attempt with a bounded retry limit", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        data: { attempts: 1, status: "retrying", retry: true },
+        error: null,
+      });
+      const result = await recordResourceCoverageAttempt({
+        jobId: "job", claimToken: "token", claimVersion: 4,
+        phase: "topic", targetId: "topic", attemptId: "attempt-uuid", resourcesFound: 0,
+        sufficient: false, maxAttempts: 2,
+      });
+      expect(mockSupabase.rpc).toHaveBeenCalledWith("record_resource_coverage_attempt", {
+        p_job_id: "job", p_claim_token: "token", p_expected_claim_version: 4,
+        p_phase: "topic", p_target_id: "topic", p_attempt_id: "attempt-uuid", p_resources_found: 0,
+        p_sufficient: false, p_max_attempts: 2, p_budget_exhausted: false,
+      });
+      expect(result).toEqual({ attempts: 1, status: "retrying", retry: true });
+    });
+
+    it("distinguishes explicit lease loss from contract and database failures", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        data: { error: "ownership_lost_or_expired" }, error: null,
+      });
+      await expect(recordResourceCoverageAttempt({
+        jobId: "job", claimToken: "token", claimVersion: 4, phase: "topic", targetId: "topic",
+        attemptId: "attempt-uuid", resourcesFound: 0, sufficient: false,
+      })).resolves.toEqual({ status: "ownership_lost", retry: false });
+
+      for (const response of [
+        { data: { error: "invalid_coverage_request" }, error: null },
+        { data: { error: "some_unknown_error" }, error: null },
+        { data: null, error: null },
+        { data: { status: "complete", retry: false }, error: null },
+        { data: { attempts: 1, status: "complete", retry: true }, error: null },
+        { data: { attempts: 1, status: "unknown", retry: false }, error: null },
+        { data: null, error: { message: "database unavailable" } },
+      ]) {
+        (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce(response);
+        await expect(recordResourceCoverageAttempt({
+          jobId: "job", claimToken: "token", claimVersion: 4, phase: "topic", targetId: "topic",
+          attemptId: "attempt-uuid", resourcesFound: 0, sufficient: false,
+        })).rejects.toBeInstanceOf(CoverageAttemptRpcError);
+      }
+    });
+
+    it("forwards the same attempt UUID unchanged when a request is replayed", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({ data: { attempts: 1, status: "retrying", retry: true }, error: null })
+        .mockResolvedValueOnce({ data: { attempts: 1, status: "retrying", retry: true }, error: null });
+      const request = {
+        jobId: "job", claimToken: "token", claimVersion: 4, phase: "topic" as const,
+        targetId: "topic", attemptId: "stable-attempt-id", resourcesFound: 0, sufficient: false,
+      };
+      await recordResourceCoverageAttempt(request);
+      await recordResourceCoverageAttempt(request);
+      expect(mockSupabase.rpc.mock.calls.map((call) => call[1].p_attempt_id)).toEqual([
+        "stable-attempt-id", "stable-attempt-id",
+      ]);
     });
   });
 
