@@ -41,6 +41,11 @@ const capturedInserts: Array<{ table: string; resources: any[] }> = [];
 const capturedNodeInserts: Array<any> = [];
 const capturedMuInserts: Array<any> = [];
 const capturedCurriculumUpdates: Array<any> = [];
+let resumeScenario = false;
+let persistedResumeNodes: Array<any> = [];
+let persistedResumeMus: Array<any> = [];
+let simulatedResumeJob: any = null;
+let simulatedCurriculum: any = null;
 
 // ============================================================
 // Configurable RPC result overrides for lifecycle testing.
@@ -123,15 +128,16 @@ function createMockSupabaseClient() {
         tableChain.select.mockImplementation(() => {
           const selectChain: any = { ...chain };
           selectChain.single.mockImplementation(() =>
-            Promise.resolve({ data: createMockCurriculum(), error: null })
+            Promise.resolve({ data: resumeScenario && simulatedCurriculum ? simulatedCurriculum : createMockCurriculum(), error: null })
           );
           selectChain.maybeSingle.mockImplementation(() =>
-            Promise.resolve({ data: createMockCurriculum(), error: null })
+            Promise.resolve({ data: resumeScenario && simulatedCurriculum ? simulatedCurriculum : createMockCurriculum(), error: null })
           );
           return selectChain;
         });
         tableChain.update.mockImplementation((payload: any) => {
           capturedCurriculumUpdates.push(payload);
+          if (resumeScenario) simulatedCurriculum = { ...createMockCurriculum(), ...payload };
           return ({
           eq: vi.fn().mockResolvedValue({ data: null, error: null }),
           });
@@ -142,15 +148,22 @@ function createMockSupabaseClient() {
         tableChain.select.mockImplementation(() => {
           const selectChain: any = { ...chain };
           selectChain.then = vi.fn().mockImplementation((cb: any) =>
-            Promise.resolve({ data: createMockNodes(), error: null }).then(cb)
+            Promise.resolve({ data: resumeScenario ? persistedResumeNodes : [], error: null }).then(cb)
           );
           return selectChain;
         });
         const nodeInsertMock = vi.fn().mockImplementation((data: any) => {
           capturedNodeInserts.push(data);
+          const nodeId = `node-${data.external_key}`;
+          if (resumeScenario) {
+            persistedResumeNodes = [
+              ...persistedResumeNodes.filter((node) => node.external_key !== data.external_key),
+              { id: nodeId, title: data.title, order_index: data.order_index, external_key: data.external_key },
+            ].sort((a, b) => a.order_index - b.order_index);
+          }
           return {
             select: vi.fn().mockReturnThis(),
-            single: vi.fn().mockResolvedValue({ data: { id: "new-node-id" }, error: null }),
+            single: vi.fn().mockResolvedValue({ data: { id: nodeId }, error: null }),
           };
         });
         tableChain.insert = nodeInsertMock;
@@ -160,15 +173,23 @@ function createMockSupabaseClient() {
       if (table === "major_understandings") {
         const muInsertMock = vi.fn().mockImplementation((data: any) => {
           capturedMuInserts.push(data);
+          if (resumeScenario) {
+            const rows = Array.isArray(data) ? data : [data];
+            persistedResumeMus = [
+              ...persistedResumeMus.filter((mu) => !rows.some((row: any) => row.node_id === mu.node_id && row.external_key === mu.external_key)),
+              ...rows.map((mu: any) => ({ ...mu, id: `mu-${mu.node_id}-${mu.external_key}` })),
+            ];
+          }
           return Promise.resolve({ data: null, error: null });
         });
         tableChain.insert = muInsertMock;
         tableChain.upsert = muInsertMock;
         tableChain.select.mockImplementation(() => {
           const selectChain: any = { ...chain };
+          selectChain.in = vi.fn().mockReturnThis();
           selectChain.then = vi.fn().mockImplementation((cb: any) =>
             Promise.resolve({
-              data: createMockNodes()[0].major_understandings,
+              data: resumeScenario ? persistedResumeMus : createMockNodes()[0].major_understandings,
               error: null,
             }).then(cb)
           );
@@ -179,17 +200,38 @@ function createMockSupabaseClient() {
       // acquisition_jobs: claimOrRegisterJob() calls claim_next_job RPC first
       // (handled in the rpc mock below), then may INSERT a new running job.
       if (table === "acquisition_jobs") {
+        tableChain.select.mockImplementation(() => {
+          const selectChain: any = { ...chain };
+          selectChain.single = vi.fn().mockResolvedValue({
+            data: resumeScenario && simulatedResumeJob
+              ? { ...simulatedResumeJob, curricula: [{ status: "draft" }] }
+              : null,
+            error: null,
+          });
+          return selectChain;
+        });
         tableChain.insert = vi.fn().mockImplementation((data: any) => {
           capturedInserts.push({ table: "acquisition_jobs", resources: [data] });
           const insertChain: any = { ...chain };
           insertChain.select = vi.fn().mockReturnThis();
           // If jobInsertMockError is set, simulate an INSERT error (e.g. 23505)
-          if (jobInsertMockError) {
+          if (resumeScenario && simulatedResumeJob?.status === "running") {
+            insertChain.single = vi.fn().mockResolvedValue({
+              data: null,
+              error: { code: "23505", message: "active generation already exists" },
+            });
+          } else if (jobInsertMockError) {
             insertChain.single = vi.fn().mockResolvedValue({
               data: null,
               error: jobInsertMockError,
             });
           } else {
+            if (resumeScenario) {
+              simulatedResumeJob = {
+                id: "job-1", claim_token: "tok-real-uuid", claim_version: 1,
+                status: "running", result_data: {}, curriculum_id: data.curriculum_id,
+              };
+            }
             insertChain.single = vi.fn().mockResolvedValue({
               data: { id: "job-1", claim_token: "tok-real-uuid", claim_version: 1 },
               error: null,
@@ -212,7 +254,7 @@ function createMockSupabaseClient() {
 
       return tableChain;
     }),
-    rpc: vi.fn().mockImplementation((name: string) => {
+    rpc: vi.fn().mockImplementation((name: string, args?: any) => {
       const callCount = (rpcCallCounts[name] ?? 0);
       rpcCallCounts[name] = callCount + 1;
 
@@ -227,7 +269,43 @@ function createMockSupabaseClient() {
 
       // Default: claim_next_job returns null (no pending job found)
       if (name === "claim_next_job") {
+        if (resumeScenario && simulatedResumeJob?.status === "pending") {
+          simulatedResumeJob.status = "running";
+          simulatedResumeJob.claim_version += 1;
+          return Promise.resolve({ data: simulatedResumeJob, error: null });
+        }
         return Promise.resolve({ data: null, error: null });
+      }
+
+      if (resumeScenario && name === "advance_checkpoint") {
+        const completed = simulatedResumeJob.result_data.checkpoint?.completedTopicIds ?? [];
+        simulatedResumeJob.result_data.checkpoint = {
+          completedTopicIds: completed.includes(args.p_completed_topic_id)
+            ? completed
+            : [...completed, args.p_completed_topic_id],
+        };
+        return Promise.resolve({ data: true, error: null });
+      }
+      if (resumeScenario && name === "advance_batch_checkpoint") {
+        const completed = simulatedResumeJob.result_data.batchCheckpoint?.completedTopicIds ?? [];
+        simulatedResumeJob.result_data.batchCheckpoint = {
+          completedTopicIds: completed.includes(args.p_completed_topic_id)
+            ? completed
+            : [...completed, args.p_completed_topic_id],
+        };
+        return Promise.resolve({ data: true, error: null });
+      }
+      if (resumeScenario && name === "release_job_claim") {
+        simulatedResumeJob.status = "pending";
+        return Promise.resolve({ data: true, error: null });
+      }
+      if (resumeScenario && name === "save_job_sources") {
+        simulatedResumeJob.result_data.discoveredSources = args.p_sources;
+        return Promise.resolve({ data: true, error: null });
+      }
+      if (resumeScenario && name === "complete_job") {
+        simulatedResumeJob.status = "completed";
+        return Promise.resolve({ data: true, error: null });
       }
 
       // Default: reserve_ai_call returns reserved (success)
@@ -536,6 +614,11 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     capturedMuInserts.length = 0;
     capturedCurriculumUpdates.length = 0;
     resetRpcOverrides();
+    resumeScenario = false;
+    persistedResumeNodes = [];
+    persistedResumeMus = [];
+    simulatedResumeJob = null;
+    simulatedCurriculum = null;
 
     mockAIInstance = new MockProvider();
     await mockDiscoverVerifiedResource();
@@ -571,6 +654,11 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     resetRpcOverrides();
     resetRpcSequences();
     jobInsertMockError = null;
+    resumeScenario = false;
+    persistedResumeNodes = [];
+    persistedResumeMus = [];
+    simulatedResumeJob = null;
+    simulatedCurriculum = null;
     mockAIInstance = undefined as any;
   });
 
@@ -988,6 +1076,129 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       const yieldedEvents = events.filter((e) => e.includes('"yielded"'));
       expect(yieldedEvents.length).toBe(0);
     });
+  });
+
+  it("resumes the same nine-topic skeleton after the two-topic quota and skips completed topics", async () => {
+    resumeScenario = true;
+    const skeleton = {
+      title: "High School Geometry Semester Curriculum",
+      source_type: "ai_organized",
+      source_attribution: null,
+      source_url: null,
+      nodes: Array.from({ length: 9 }, (_, index) => ({
+        title: `Geometry Topic ${index + 1}`,
+        order_index: index + 1,
+        major_understandings: [{ code: `G${index + 1}.1`, description: `Geometry concept ${index + 1}` }],
+      })),
+    };
+    mockAIInstance.setResponse("skeleton prompt", {
+      structuredData: skeleton,
+      completeText: JSON.stringify(skeleton),
+    });
+    mockAIInstance.setResponse("sources prompt", { structuredData: [], completeText: "[]" });
+    mockAIInstance.setResponse("discover prompt", {
+      structuredData: [{
+        url: "https://example.org/geometry/topic",
+        title: "Geometry lesson",
+        resource_type: "text",
+        source_domain: "example.org",
+        ai_note: "Introductory geometry lesson",
+        license_status: "link_only",
+      }],
+      completeText: "[]",
+    });
+    mockAIInstance.setResponse("batch prompt", {
+      structuredData: { topic_resources: [] },
+      completeText: '{"topic_resources":[]}',
+    });
+
+    const firstResponse = await GET(createMockRequest("test-curriculum-id"), {
+      params: Promise.resolve({ id: "test-curriculum-id" }),
+    });
+    const firstEvents = (await consumeSseEvents(firstResponse, 10_000, originalSetTimeout)).map(parseSseEvent);
+    const firstYield = firstEvents.find((event) => event.event === "yielded");
+    expect(firstYield?.data).toEqual({
+      message: "Processing quota reached. Resuming…",
+      topicsCompleted: 2,
+      totalTopics: 9,
+    });
+    expect(simulatedResumeJob.status).toBe("pending");
+    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual(["node-topic-1", "node-topic-2"]);
+    expect(persistedResumeNodes).toHaveLength(9);
+
+    // Reconnecting claims the existing pending row; it does not insert a new job.
+    let releaseResumedDiscovery!: () => void;
+    let notifyResumedDiscoveryStarted!: () => void;
+    const resumedDiscoveryGate = new Promise<void>((resolve) => { releaseResumedDiscovery = resolve; });
+    const resumedDiscoveryStarted = new Promise<void>((resolve) => { notifyResumedDiscoveryStarted = resolve; });
+    const baseProvider = mockAIInstance;
+    const resumedDiscovery = vi.fn(async (prompt: string, options: any) => {
+      const topicCalls = baseProvider.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt").length;
+      if (prompt === "discover prompt" && topicCalls === 2) {
+        notifyResumedDiscoveryStarted();
+        await resumedDiscoveryGate;
+      }
+      return baseProvider.structured(prompt, options);
+    });
+    vi.mocked((await import("@/lib/ai")).getAIProvider).mockReturnValue({
+      structured: resumedDiscovery,
+      complete: baseProvider.complete.bind(baseProvider),
+      name: "mock",
+      capabilities: baseProvider.capabilities,
+    } as any);
+
+    const secondResponse = await GET(createMockRequest("test-curriculum-id"), {
+      params: Promise.resolve({ id: "test-curriculum-id" }),
+    });
+    const secondEventsPromise = consumeSseEvents(secondResponse, 10_000, originalSetTimeout);
+    await resumedDiscoveryStarted;
+
+    // A duplicate stream sees the running lease, fails its unique insert, then attaches as an observer.
+    const duplicateResponse = await GET(createMockRequest("test-curriculum-id"), {
+      params: Promise.resolve({ id: "test-curriculum-id" }),
+    });
+    const duplicateEvents = (await consumeSseEvents(duplicateResponse, 10_000, originalSetTimeout)).map(parseSseEvent);
+    expect(duplicateEvents.some((event) => event.data?.step === "waiting")).toBe(true);
+    expect(capturedInserts.filter((entry) => entry.table === "acquisition_jobs")).toHaveLength(2); // second insert rejected by the active-job unique constraint mock
+    expect(simulatedResumeJob.status).toBe("running");
+
+    releaseResumedDiscovery();
+    const secondEvents = (await secondEventsPromise).map(parseSseEvent);
+    expect(simulatedResumeJob.id).toBe("job-1");
+    expect(simulatedResumeJob.status).toBe("pending");
+    expect(capturedInserts.filter((entry) => entry.table === "acquisition_jobs")).toHaveLength(2);
+    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "skeleton prompt")).toHaveLength(1);
+    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "sources prompt")).toHaveLength(1);
+    expect(persistedResumeNodes.map((node) => node.title)).toEqual(skeleton.nodes.map((node) => node.title));
+
+    const resumedDiscoveryStatuses = secondEvents
+      .filter((event) => event.event === "status" && event.data.step === "discovery")
+      .map((event) => event.data);
+    expect(resumedDiscoveryStatuses.map((status) => status.message)).toEqual([
+      "Finding resources for: Geometry Topic 3",
+      "Finding resources for: Geometry Topic 4",
+    ]);
+    expect(resumedDiscoveryStatuses[0].current).toBe(3);
+    expect(secondEvents.filter((event) => event.event === "yielded")[0]?.data.topicsCompleted).toBe(2);
+    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual([
+      "node-topic-1", "node-topic-2", "node-topic-3", "node-topic-4",
+    ]);
+
+    // Continue every later two-topic window (including the independent batch phase)
+    // until the same persisted job reaches its terminal state.
+    for (let continuation = 0; continuation < 10 && simulatedResumeJob.status !== "completed"; continuation++) {
+      const continuationResponse = await GET(createMockRequest("test-curriculum-id"), {
+        params: Promise.resolve({ id: "test-curriculum-id" }),
+      });
+      await consumeSseEvents(continuationResponse, 10_000, originalSetTimeout);
+    }
+    expect(simulatedResumeJob.status).toBe("completed");
+    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toHaveLength(9);
+    expect(simulatedResumeJob.result_data.batchCheckpoint.completedTopicIds).toHaveLength(9);
+    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "skeleton prompt")).toHaveLength(1);
+    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "sources prompt")).toHaveLength(1);
+    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(9);
+    expect(allResourceInserts()).toHaveLength(9);
   });
 
   // ============================================================

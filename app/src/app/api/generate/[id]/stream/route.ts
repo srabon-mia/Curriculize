@@ -792,7 +792,7 @@ export async function GET(
         }, 60_000);
 
         send(controller, "status", {
-          message: "Generation job registered.",
+          message: "Generation job active.",
           step: "init",
           job_id: ownerJobRecord.id,
         });
@@ -821,46 +821,82 @@ export async function GET(
           message: "Finding the best curriculum structure…",
           step: "skeleton",
         });
+        let skeletonParsed: Skeleton | null = null;
+        let updatedCurriculumTitle = curriculum.title;
+        const nodeIds: Array<{ nodeId: string; node: SkeletonNode }> = [];
+        const { data: existingNodes } = await supabase
+          .from("nodes")
+          .select("id, title, order_index")
+          .eq("curriculum_id", id)
+          .order("order_index", { ascending: true });
 
-        const skeletonPrompt = buildSkeletonPrompt(
-          curriculum.title,
-          notes.grade_level ?? "high school",
-          notes.difficulty ?? "standard",
-          notes.existing_knowledge ?? "",
-          notes.learning_goal ?? "understand the subject",
-          notes.time_available ?? "no time pressure",
-          notes.added_context ?? ""
-        );
+        if (existingNodes && existingNodes.length > 0) {
+          const existingNodeIds = existingNodes.map((node: { id: string }) => node.id);
+          const { data: existingMus } = await supabase
+            .from("major_understandings")
+            .select("id, node_id, code, description, order_index")
+            .in("node_id", existingNodeIds);
 
-        // Reserve AI call for skeleton generation
-        const skeletonReservation = await reserveAICall(
-          ownerJobRecord.id,
-          ownerJobRecord.claim_token,
-          ownerJobRecord.claim_version,
-          DEFAULT_BUDGET_LIMITS.max_ai_calls,
-          crypto.randomUUID()
-        );
-        if (!skeletonReservation.reserved) {
-          console.error(
-            `[stream] AI budget exhausted for skeleton: ${skeletonReservation.reason}`
+          const persistedNodes: SkeletonNode[] = existingNodes.map((node: { id: string; title: string; order_index: number }) => ({
+            title: node.title,
+            order_index: node.order_index,
+            major_understandings: (existingMus ?? [])
+              .filter((mu: { node_id: string }) => mu.node_id === node.id)
+              .sort((a: { order_index: number }, b: { order_index: number }) => a.order_index - b.order_index)
+              .map((mu: { code: string | null; description: string }) => ({
+                code: mu.code,
+                description: mu.description,
+              })),
+          }));
+          skeletonParsed = {
+            title: curriculum.title,
+            source_type: curriculum.source_type === "adapted" ? "adapted" : "ai_organized",
+            source_attribution: curriculum.source_attribution ?? null,
+            source_url: curriculum.source_url ?? null,
+            nodes: persistedNodes,
+          };
+          existingNodes.forEach((node: { id: string }, index: number) => {
+            nodeIds.push({ nodeId: node.id, node: persistedNodes[index] });
+          });
+          console.info(`[stream] Resuming persisted skeleton: stream_id=${streamId}, job_id=${ownerJobRecord.id}, topic_count=${nodeIds.length}, operation=skeleton_resume`);
+        } else {
+          const skeletonPrompt = buildSkeletonPrompt(
+            curriculum.title,
+            notes.grade_level ?? "high school",
+            notes.difficulty ?? "standard",
+            notes.existing_knowledge ?? "",
+            notes.learning_goal ?? "understand the subject",
+            notes.time_available ?? "no time pressure",
+            notes.added_context ?? ""
           );
-          clearHeartbeat();
-          await failJob(
+
+          // Reserve AI call for skeleton generation
+          const skeletonReservation = await reserveAICall(
             ownerJobRecord.id,
             ownerJobRecord.claim_token,
             ownerJobRecord.claim_version,
-            `AI budget exhausted: ${skeletonReservation.reason}`
+            DEFAULT_BUDGET_LIMITS.max_ai_calls,
+            crypto.randomUUID()
           );
-          send(controller, "error", {
-            message: "AI generation budget exhausted. Please try again later.",
-          });
-          controller.close();
-          return;
-        }
+          if (!skeletonReservation.reserved) {
+            console.error(
+              `[stream] AI budget exhausted for skeleton: ${skeletonReservation.reason}`
+            );
+            clearHeartbeat();
+            await failJob(
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version,
+              `AI budget exhausted: ${skeletonReservation.reason}`
+            );
+            send(controller, "error", {
+              message: "AI generation budget exhausted. Please try again later.",
+            });
+            controller.close();
+            return;
+          }
 
-        let skeletonParsed: Skeleton | null = null;
-
-        try {
+          try {
           // Use structured output for guaranteed valid JSON (Priority 1 fix)
           console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=skeleton_ai`);
           skeletonParsed = await callAIStructured(skeletonPrompt, SkeletonSchema, true, "skeleton_ai");
@@ -1006,7 +1042,7 @@ export async function GET(
         } else {
           parseDurationMs = Date.now() - skeletonParseStartTime;
         }
-        }
+          }
 
         // Update curriculum with real title and attribution
         if (!skeletonParsed) {
@@ -1015,19 +1051,21 @@ export async function GET(
           controller.close();
           return;
         }
-        console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=curriculum_skeleton_update`);
-        await supabase
-          .from("curricula")
-          .update({
-            title: skeletonParsed.title,
-            source_type: skeletonParsed.source_type,
-            source_attribution: skeletonParsed.source_attribution,
-            source_url: skeletonParsed.source_url,
-          })
-          .eq("id", id);
-        console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=curriculum_skeleton_update`);
+        if (!existingNodes || existingNodes.length === 0) {
+          console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=curriculum_skeleton_update`);
+          await supabase
+            .from("curricula")
+            .update({
+              title: skeletonParsed.title,
+              source_type: skeletonParsed.source_type,
+              source_attribution: skeletonParsed.source_attribution,
+              source_url: skeletonParsed.source_url,
+            })
+            .eq("id", id);
+          console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=curriculum_skeleton_update`);
+        }
 
-        const updatedCurriculumTitle = skeletonParsed.title;
+        updatedCurriculumTitle = skeletonParsed.title;
 
         send(controller, "skeleton", {
           title: skeletonParsed.title,
@@ -1054,14 +1092,9 @@ export async function GET(
           return;
         }
 
-        // Step 2: Insert nodes and major understandings
-        // Use stable external_key for idempotent retries: "topic-N" from skeleton order_index
-        const nodeIds: Array<{
-          nodeId: string;
-          node: SkeletonNode;
-        }> = [];
-
-        for (const node of skeletonParsed.nodes) {
+        // Step 2: Insert nodes and major understandings only for a fresh skeleton.
+        // Existing nodes are the persisted source of truth on a resumed job.
+        if (!existingNodes || existingNodes.length === 0) for (const node of skeletonParsed.nodes) {
           const topicExternalKey = `topic-${node.order_index}`;
           console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=node_upsert, external_key=${topicExternalKey}`);
           const { data: nodeRow } = await supabase
@@ -1094,13 +1127,9 @@ export async function GET(
           nodeIds.push({ nodeId: nodeRow.id, node });
         }
         console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=skeleton_persist, topic_count=${nodeIds.length}`);
+        }
 
         // Step 3: Discover best sources for this subject/difficulty
-        send(controller, "status", {
-          message: "Finding the best sources for this subject…",
-          step: "sources",
-        });
-
         type DiscoveredSource = {
           domain: string;
           name: string;
@@ -1108,7 +1137,23 @@ export async function GET(
           best_for: string;
         };
 
-        let discoveredSources: DiscoveredSource[] = [];
+        const { getJobById } = await import("@/lib/acquisition/jobService");
+        const resumeJobData = await getJobById(ownerJobRecord.id);
+        const rawPersistedSources = (resumeJobData?.result_data as { discoveredSources?: unknown })?.discoveredSources;
+        const hasPersistedSources = Array.isArray(rawPersistedSources);
+        let discoveredSources: DiscoveredSource[] = Array.isArray(rawPersistedSources)
+          ? rawPersistedSources.filter(
+              (source): source is DiscoveredSource =>
+                typeof source === "object" && source !== null && typeof (source as DiscoveredSource).domain === "string"
+            )
+          : [];
+
+        if (!hasPersistedSources) {
+          send(controller, "status", {
+            message: "Finding the best sources for this subject…",
+            step: "sources",
+          });
+        }
 
         // Check ownership before source discovery (AI call)
         if (ownershipLost) {
@@ -1130,7 +1175,9 @@ export async function GET(
           return;
         }
 
-        try {
+        if (hasPersistedSources) {
+          console.info(`[stream] Reusing persisted sources: stream_id=${streamId}, job_id=${ownerJobRecord.id}, source_count=${discoveredSources.length}, operation=source_resume`);
+        } else try {
           const sourcesPrompt = buildSourceDiscoveryPrompt(
             updatedCurriculumTitle,
             notes.difficulty ?? "standard",
@@ -1223,8 +1270,7 @@ export async function GET(
 
         // Resume detection: read checkpoint to skip already-completed topics.
         // This allows the SSE route to yield and resume like the durable worker.
-        const { getJobById } = await import("@/lib/acquisition/jobService");
-        const jobData = await getJobById(ownerJobRecord.id);
+        const jobData = resumeJobData ?? await getJobById(ownerJobRecord.id);
         const rawCompletedTopics =
           (jobData?.result_data as { checkpoint?: { completedTopicIds: unknown } })?.checkpoint
             ?.completedTopicIds;
@@ -1291,6 +1337,7 @@ export async function GET(
               }
               // If still pending but release failed (yield cap), we can try again on reconnect
             }
+            clearHeartbeat();
             // Send yielded event so client knows to reconnect
             send(controller, "yielded", {
               message: "Processing quota reached. Resuming…",
@@ -1525,6 +1572,7 @@ export async function GET(
         // Background per-understanding discovery — one batch call per topic.
         // Runs after topic-level resources are done. We keep the stream open
         // so the student receives the final `complete` event with phase="background".
+        let backgroundYielded = false;
         async function runBackgroundBatch() {
           const { data: curriculumRow } = await supabase
             .from("curricula")
@@ -1598,12 +1646,14 @@ export async function GET(
                 }
                 // If still pending but release failed (yield cap), we can try again on reconnect
               }
+              clearHeartbeat();
               // Send yielded event so client knows to reconnect
               send(controller, "yielded", {
                 message: "Background batch quota reached. Resuming…",
                 topicsCompleted: batchTopicsProcessedThisInvocation,
                 totalTopics: nodeIds.length,
               });
+              backgroundYielded = true;
               controller.close();
               return;
             }
@@ -1774,6 +1824,7 @@ export async function GET(
         // Wait for background batch to complete, then emit final event and close stream.
         try {
           await backgroundBatch;
+          if (backgroundYielded) return;
           if (ownershipLost) {
             console.error(
               `[stream] Ownership lost before job completion — failing job ${ownerJobRecord.id}`
