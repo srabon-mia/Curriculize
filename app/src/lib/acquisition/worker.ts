@@ -686,7 +686,7 @@ export async function processJob(job: JobClaimResult): Promise<void> {
  *
  * Returns true when every topic's batch discovery has completed.
  */
-async function processBatchDiscovery(
+export async function processBatchDiscovery(
   job: JobClaimResult,
   discoveryTitle: string,
   nodeIds: Array<{ nodeId: string; node: SkeletonNode }>
@@ -726,9 +726,16 @@ async function processBatchDiscovery(
       continue;
     }
 
-    // Bounded work: release the claim and yield to the next cron invocation
-    // once this invocation's batch quota is exhausted. release_job_claim sets
-    // status='pending' without consuming a retry.
+    const { data: muRows } = await supabase
+      .from('major_understandings')
+      .select('id, code, description, external_key')
+      .eq('node_id', nodeId);
+
+    if (!muRows || muRows.length === 0) continue;
+
+    // Empty topics have no per-understanding discovery work, so do not let
+    // them consume the bounded batch quota. Match the stream route's ordering:
+    // count only topics that can actually enter batch discovery.
     if (batchTopicsProcessed >= MAX_TOPICS_PER_INVOCATION) {
       console.log(
         `[worker] Batch quota (${MAX_TOPICS_PER_INVOCATION}) reached, releasing claim for next cron run`
@@ -742,13 +749,6 @@ async function processBatchDiscovery(
       return false;
     }
     batchTopicsProcessed++;
-
-    const { data: muRows } = await supabase
-      .from('major_understandings')
-      .select('id, code, description, external_key')
-      .eq('node_id', nodeId);
-
-    if (!muRows || muRows.length === 0) continue;
 
     // Reserve AI call for batch
     const batchReservationId = crypto.randomUUID();
