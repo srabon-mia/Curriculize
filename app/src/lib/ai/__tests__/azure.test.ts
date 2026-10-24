@@ -548,6 +548,45 @@ describe("AzureProvider", () => {
     consoleWarn.mockRestore();
   });
 
+  test("does not log raw Responses API output when search text is empty", async () => {
+    const debugProvider = new AzureProvider({
+      apiKey: "test-azure-key",
+      endpoint: "https://test-resource.openai.azure.com",
+      deployment: "gpt-4.1-mini",
+      debug: true,
+      retryDelayMs: 10,
+    });
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const privateResponseText = "private provider response payload";
+    mockFetch.mockResolvedValue(createMockResponsesResponse({
+      json: {
+        id: "resp_test",
+        object: "response",
+        created_at: Date.now(),
+        model: "gpt-4.1-mini",
+        output: [
+          { type: "web_search_call", status: "completed", action: { type: "search", query: "private query" } },
+          { type: "message", role: "assistant", content: [{
+            type: "output_text",
+            text: "",
+            annotations: [{ type: "url_citation", url: "https://example.org", title: privateResponseText, start_index: 0, end_index: 0 }],
+          }] },
+        ],
+        usage: { input_tokens: 10, output_tokens: 0 },
+      },
+    }));
+
+    await debugProvider.complete("private prompt", { useSearch: true });
+
+    expect(consoleWarn).toHaveBeenCalledWith("[Azure] Empty response content received", {
+      response_item_types: ["web_search_call", "message"],
+      search_call_statuses: ["completed"],
+    });
+    expect(JSON.stringify(consoleWarn.mock.calls)).not.toContain(privateResponseText);
+    expect(JSON.stringify(consoleWarn.mock.calls)).not.toContain("private prompt");
+    consoleWarn.mockRestore();
+  });
+
   test("handles rate limiting with retry and Retry-After header", async () => {
     const rateLimitResponse: Response = {
       status: 429,
@@ -894,13 +933,16 @@ describe("AzureProvider", () => {
     expect(structuredBody.response_format.type).toBe("json_schema");
     expect(structuredBody.messages[0].content).toContain("completed web research");
     expect(structuredBody.messages[0].content).toContain("https://www.khanacademy.org/math/arithmetic/fraction-arithmetic");
-    expect(consoleInfo).toHaveBeenCalledWith("[Azure] Responses API web search summary", {
+    expect(consoleInfo).toHaveBeenCalledWith("[Azure] Responses API web search summary", expect.objectContaining({
+      provider: "azure",
+      attempt_number: 1,
       response_item_types: ["web_search_call", "message"],
       search_call_statuses: ["completed"],
+      returned_source_count: 0,
       annotation_count: 1,
       annotation_locations: ["response[1].content[0].annotations=1"],
       extracted_url_count: 1,
-    });
+    }));
     consoleInfo.mockRestore();
   });
 
@@ -942,6 +984,7 @@ describe("AzureProvider", () => {
 
   test("structured() retries a citation-free search once and grounds output in real citation annotations", async () => {
     const schema = z.object({ result: z.string() });
+    const searchLogs = vi.spyOn(console, "info").mockImplementation(() => {});
     mockFetch
       .mockResolvedValueOnce(createMockResponsesResponse({
         json: {
@@ -985,7 +1028,11 @@ describe("AzureProvider", () => {
         },
       }));
 
-    const result = await provider.structured("Find a geometry resource", { schema, useSearch: true });
+    const result = await provider.structured("Find a geometry resource", {
+      schema,
+      useSearch: true,
+      diagnostics: { curriculumId: "curr-1", jobId: "job-1", streamId: "stream-1", topicId: "topic-1", operation: "topic_discovery_ai" },
+    });
 
     expect(result.data).toEqual({ result: "grounded" });
     expect(result.searchCitations).toEqual([{ url: "https://example.org/geometry", title: "Geometry resource" }]);
@@ -995,10 +1042,18 @@ describe("AzureProvider", () => {
     expect(mockFetch.mock.calls[2][0]).toContain("/chat/completions");
     const structuredRequest = JSON.parse(mockFetch.mock.calls[2][1].body as string);
     expect(structuredRequest.messages[0].content).toContain("https://example.org/geometry");
+    const attemptLogs = searchLogs.mock.calls
+      .filter(([message]) => message === "[Azure] Responses API web search summary")
+      .map(([, details]) => details);
+    expect(attemptLogs).toHaveLength(2);
+    expect(attemptLogs.map((details: any) => details.attempt_number)).toEqual([1, 2]);
+    expect(attemptLogs.every((details: any) => details.job_id === "job-1" && details.curriculum_id === "curr-1" && details.stream_id === "stream-1")).toBe(true);
+    searchLogs.mockRestore();
   });
 
   test("structured() extracts consulted URLs from Azure web_search_call.action.sources", async () => {
     const schema = z.object({ result: z.string() });
+    const searchLogs = vi.spyOn(console, "info").mockImplementation(() => {});
     mockFetch
       .mockResolvedValueOnce(createMockResponsesResponse({
         json: {
@@ -1011,7 +1066,11 @@ describe("AzureProvider", () => {
               type: "web_search_call",
               status: "completed",
               id: "search_with_sources",
-              action: { type: "search", query: "geometry resource", sources: [{ type: "url", url: "https://example.org/consulted-geometry" }] },
+              action: { type: "search", query: "geometry resource", sources: [
+                { type: "url", url: "https://example.org/consulted-geometry" },
+                { type: "url", url: "not a valid URL" },
+                { type: "url" },
+              ] },
             },
             { type: "message", role: "assistant", content: [{ type: "output_text", text: "Grounded research without inline annotations." }] },
           ],
@@ -1036,6 +1095,9 @@ describe("AzureProvider", () => {
     expect(searchRequest.include).toEqual(["web_search_call.action.sources"]);
     const groundedRequest = JSON.parse(mockFetch.mock.calls[1][1].body as string);
     expect(groundedRequest.messages[0].content).toContain("https://example.org/consulted-geometry");
+    const summary = searchLogs.mock.calls.find(([message]) => message === "[Azure] Responses API web search summary")?.[1] as Record<string, unknown>;
+    expect(summary).toMatchObject({ returned_source_count: 3, source_entries_without_url_count: 1, invalid_source_url_count: 1, extracted_url_count: 1 });
+    searchLogs.mockRestore();
   });
 
   test("structured() with useSearch=true fails clearly and skips structured generation when web search fails", async () => {

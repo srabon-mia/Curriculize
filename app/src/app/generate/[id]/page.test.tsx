@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, waitFor, act } from "@testing-library/react";
+import { render, waitFor, act, fireEvent } from "@testing-library/react";
 import { useRouter } from "next/navigation";
 import GeneratePage from "./page";
 
@@ -163,5 +163,43 @@ describe("GeneratePage - EventSource connection", () => {
     expect(eventSourceInstances).toHaveLength(2);
     unmount();
     vi.useRealTimers();
+  });
+
+  it("does not reset the retry limit when the same unfinished topic reports discovery again", async () => {
+    vi.useFakeTimers();
+    const { getByText, unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const current = eventSourceInstances[eventSourceInstances.length - 1];
+      act(() => current.listeners.get("status")?.({
+        data: JSON.stringify({ message: "Finding resources", step: "discovery", current: 3, total: 9 }),
+      } as MessageEvent));
+      act(() => current.listeners.get("yielded")?.({
+        data: JSON.stringify({ message: "Retrying topic", topicsCompleted: 0, totalTopics: 9 }),
+      } as MessageEvent));
+      if (attempt < 4) await act(async () => vi.advanceTimersByTimeAsync(2000));
+    }
+
+    expect(eventSourceInstances).toHaveLength(5);
+    expect(getByText(/retry limit was reached/i)).toBeTruthy();
+    unmount();
+    vi.useRealTimers();
+  });
+
+  it("pauses a failed discovery without reconnecting until the user retries", async () => {
+    const { getByText, unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+    act(() => eventSourceInstances[0].listeners.get("paused")?.({
+      data: JSON.stringify({ message: "Resource discovery paused with progress saved." }),
+    } as MessageEvent));
+
+    expect(getByText(/progress saved/i)).toBeTruthy();
+    expect(eventSourceInstances).toHaveLength(1);
+    fireEvent.click(getByText("Retry saved generation"));
+    await waitFor(() => expect(eventSourceInstances).toHaveLength(2));
+    unmount();
   });
 });

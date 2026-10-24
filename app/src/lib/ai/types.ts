@@ -58,6 +58,15 @@ export interface AICompleteOptions {
   signal?: AbortSignal;
   /** Optional timeout in milliseconds (alternative to signal) */
   timeoutMs?: number;
+  /** Safe identifiers for correlating provider diagnostics without logging prompts. */
+  diagnostics?: {
+    curriculumId?: string;
+    jobId?: string;
+    streamId?: string;
+    operation?: string;
+    topicId?: string;
+    attemptNumber?: number;
+  };
 }
 
 /**

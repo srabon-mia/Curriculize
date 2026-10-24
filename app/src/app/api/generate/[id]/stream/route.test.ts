@@ -1256,7 +1256,8 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     });
     const retryEvents = (await consumeSseEvents(retryResponse, 10_000, originalSetTimeout)).map(parseSseEvent);
 
-    expect(retryEvents.some((event) => event.event === "yielded" && event.data.message.includes("Source citations were unavailable"))).toBe(true);
+    expect(retryEvents.some((event) => event.event === "paused" && event.data.message.includes("Source citations were unavailable"))).toBe(true);
+    expect(retryEvents.find((event) => event.event === "status" && event.data.step === "skeleton")?.data.message).toBe("Loading the saved curriculum structure…");
     expect(retryEvents.some((event) => event.event === "complete")).toBe(false);
     expect(simulatedResumeJob.id).toBe("job-1");
     expect(simulatedResumeJob.status).toBe("pending");

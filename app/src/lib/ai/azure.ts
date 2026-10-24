@@ -558,15 +558,20 @@ export class AzureProvider implements AIProvider {
 
   /**
    * Extract text and citations from Responses API response.
-   * Citations come from message content annotations (url_citation type).
-   * The web_search_call output indicates search status but doesn't contain results directly.
+   * Citations come from message annotations and, when requested, consulted
+   * source URLs in web_search_call.action.sources.
    */
-  private extractResponsesResult(response: AzureResponsesResponse): { text: string; citations: AISearchCitation[]; searchCompleted: boolean } {
+  private extractResponsesResult(
+    response: AzureResponsesResponse,
+    diagnostics?: AICompleteOptions["diagnostics"]
+  ): { text: string; citations: AISearchCitation[]; searchCompleted: boolean } {
     let text = "";
     const citations: AISearchCitation[] = [];
     let sawSearchCall = false;
     let allSearchCallsCompleted = true;
     const searchCallStatuses: string[] = [];
+    let sourceEntriesWithoutUrlCount = 0;
+    let invalidSourceUrlCount = 0;
 
     for (const output of response.output) {
       if (output.type === "message" && output.content) {
@@ -599,14 +604,20 @@ export class AzureProvider implements AIProvider {
           console.warn("[Azure] Web search call failed", { query: output.query, id: output.id });
         }
         for (const source of output.action?.sources ?? []) {
-          if (!source.url) continue;
+          if (!source.url) {
+            sourceEntriesWithoutUrlCount++;
+            continue;
+          }
           try {
             const parsedUrl = new URL(source.url);
             if (parsedUrl.protocol === "http:" || parsedUrl.protocol === "https:") {
               citations.push({ url: source.url });
+            } else {
+              invalidSourceUrlCount++;
             }
           } catch {
             // Ignore malformed source entries; they cannot ground a resource.
+            invalidSourceUrlCount++;
           }
         }
       }
@@ -622,16 +633,34 @@ export class AzureProvider implements AIProvider {
       const count = Number(location.slice(location.lastIndexOf("=") + 1));
       return total + (Number.isFinite(count) ? count : 0);
     }, 0);
+    const returnedSourceCount = response.output.reduce(
+      (total, item) => total + (item.type === "web_search_call" ? (item.action?.sources?.length ?? 0) : 0),
+      0
+    );
     console.info("[Azure] Responses API web search summary", {
+      provider: "azure",
+      attempt_number: diagnostics?.attemptNumber ?? 1,
+      curriculum_id: diagnostics?.curriculumId,
+      job_id: diagnostics?.jobId,
+      stream_id: diagnostics?.streamId,
+      operation: diagnostics?.operation,
+      topic_id: diagnostics?.topicId,
       response_item_types: response.output.map((item) => item.type),
       search_call_statuses: searchCallStatuses,
+      returned_source_count: returnedSourceCount,
+      source_entries_without_url_count: sourceEntriesWithoutUrlCount,
+      invalid_source_url_count: invalidSourceUrlCount,
       annotation_count: annotationCount,
       annotation_locations: annotationLocations,
       extracted_url_count: uniqueCitations.length,
     });
 
     if (text === "" && this.debug) {
-      console.warn("[Azure] Empty response content received", { output: response.output });
+      // Keep provider output private; diagnostics should describe shape only.
+      console.warn("[Azure] Empty response content received", {
+        response_item_types: response.output.map((item) => item.type),
+        search_call_statuses: searchCallStatuses,
+      });
     }
 
     return { text, citations: uniqueCitations, searchCompleted: sawSearchCall && allSearchCallsCompleted };
@@ -680,7 +709,7 @@ export class AzureProvider implements AIProvider {
       const url = this.buildResponsesUrl();
       const response = await this.requestWithRetry<AzureResponsesResponse>(url, request, 4, options.signal);
 
-      const { text, citations, searchCompleted } = this.extractResponsesResult(response);
+      const { text, citations, searchCompleted } = this.extractResponsesResult(response, options.diagnostics);
 
       // Treat missing successful search as a failure - we need actual web search
       if (!searchCompleted) {
@@ -727,11 +756,42 @@ export class AzureProvider implements AIProvider {
    */
   async structured<T>(prompt: string, options: AIStructuredOptions<T>): Promise<AIStructuredResult<T>> {
     const { schema, useSearch = false, ...completeOptions } = options;
-    let searchResult = useSearch
-      ? await this.complete(prompt, { ...completeOptions, useSearch: true })
-      : undefined;
+    const diagnosticContext = completeOptions.diagnostics;
+    let searchAttempt = 1;
+    const runSearchAttempt = async (attemptNumber: number) => {
+      try {
+        return await this.complete(prompt, {
+          ...completeOptions,
+          useSearch: true,
+          diagnostics: { ...diagnosticContext, attemptNumber },
+        });
+      } catch (error) {
+        console.warn("[Azure] Web search attempt failed", {
+          provider: "azure",
+          attempt_number: attemptNumber,
+          curriculum_id: diagnosticContext?.curriculumId,
+          job_id: diagnosticContext?.jobId,
+          stream_id: diagnosticContext?.streamId,
+          operation: diagnosticContext?.operation,
+          topic_id: diagnosticContext?.topicId,
+          failure_category: error instanceof AIError ? error.code.toLowerCase() : "search_request_failed",
+        });
+        throw error;
+      }
+    };
+    let searchResult = useSearch ? await runSearchAttempt(searchAttempt) : undefined;
 
     if (searchResult && searchResult.searchCompleted !== true) {
+      console.warn("[Azure] Structured discovery rejected", {
+        provider: "azure",
+        curriculum_id: diagnosticContext?.curriculumId,
+        job_id: diagnosticContext?.jobId,
+        stream_id: diagnosticContext?.streamId,
+        operation: diagnosticContext?.operation,
+        topic_id: diagnosticContext?.topicId,
+        attempt_number: searchAttempt,
+        failure_category: "search_incomplete",
+      });
       throw new AIError("MODEL_ERROR", "Azure web search did not complete; structured discovery was not generated.", {
         retryable: false,
         provider: "azure",
@@ -743,8 +803,19 @@ export class AzureProvider implements AIProvider {
     // search call or fabricate citation metadata.
     let searchCitations = searchResult?.searchCitations ?? [];
     if (searchResult && searchCitations.length === 0) {
-      searchResult = await this.complete(prompt, { ...completeOptions, useSearch: true });
+      searchAttempt++;
+      searchResult = await runSearchAttempt(searchAttempt);
       if (searchResult.searchCompleted !== true) {
+        console.warn("[Azure] Structured discovery rejected", {
+          provider: "azure",
+          curriculum_id: diagnosticContext?.curriculumId,
+          job_id: diagnosticContext?.jobId,
+          stream_id: diagnosticContext?.streamId,
+          operation: diagnosticContext?.operation,
+          topic_id: diagnosticContext?.topicId,
+          attempt_number: searchAttempt,
+          failure_category: "search_incomplete",
+        });
         throw new AIError("MODEL_ERROR", "Azure web search did not complete; structured discovery was not generated.", {
           retryable: false,
           provider: "azure",
@@ -753,6 +824,16 @@ export class AzureProvider implements AIProvider {
       searchCitations = searchResult.searchCitations ?? [];
     }
     if (searchResult && searchCitations.length === 0) {
+      console.warn("[Azure] Structured discovery rejected", {
+        provider: "azure",
+        curriculum_id: diagnosticContext?.curriculumId,
+        job_id: diagnosticContext?.jobId,
+        stream_id: diagnosticContext?.streamId,
+        operation: diagnosticContext?.operation,
+        topic_id: diagnosticContext?.topicId,
+        attempt_number: searchAttempt,
+        failure_category: "missing_citations",
+      });
       throw new AIError("MODEL_ERROR", "Azure web search completed without source citations; structured discovery was not generated.", {
         retryable: true,
         provider: "azure",
@@ -780,6 +861,16 @@ export class AzureProvider implements AIProvider {
     try {
       parsedJson = this.extractStructuredJson<T>(response);
     } catch (err) {
+      console.warn("[Azure] Structured discovery rejected", {
+        provider: "azure",
+        curriculum_id: diagnosticContext?.curriculumId,
+        job_id: diagnosticContext?.jobId,
+        stream_id: diagnosticContext?.streamId,
+        operation: diagnosticContext?.operation,
+        topic_id: diagnosticContext?.topicId,
+        attempt_number: searchAttempt || 1,
+        failure_category: "malformed_json",
+      });
       throw new AIError("INVALID_REQUEST", `Failed to parse structured response: ${err instanceof Error ? err.message : String(err)}`, {
         provider: "azure",
       });
@@ -787,6 +878,16 @@ export class AzureProvider implements AIProvider {
 
     const result = schema.safeParse(parsedJson);
     if (!result.success) {
+      console.warn("[Azure] Structured discovery rejected", {
+        provider: "azure",
+        curriculum_id: diagnosticContext?.curriculumId,
+        job_id: diagnosticContext?.jobId,
+        stream_id: diagnosticContext?.streamId,
+        operation: diagnosticContext?.operation,
+        topic_id: diagnosticContext?.topicId,
+        attempt_number: searchAttempt || 1,
+        failure_category: "schema_validation",
+      });
       const errorMessages = result.error.issues
         .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
         .join("; ");

@@ -26,6 +26,8 @@ type YieldedEvent = {
   totalTopics: number;
 };
 
+type PausedEvent = { message: string };
+
 type LogEntry = {
   message: string;
   done: boolean;
@@ -44,6 +46,7 @@ export default function GeneratePage({
   });
   const [log, setLog] = useState<LogEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [canRetryPaused, setCanRetryPaused] = useState(false);
   const [skeletonTitle, setSkeletonTitle] = useState<string | null>(null);
   const [terminalState, setTerminalState] = useState<"none" | "complete" | "failed">("none");
   const terminalStateRef = useRef(terminalState);
@@ -51,6 +54,7 @@ export default function GeneratePage({
   const yieldedHandledRef = useRef(false);
   const connectRef = useRef<() => void>(() => {});
   const reconnectAttemptsRef = useRef(0);
+  const lastDiscoveryCurrentRef = useRef(0);
   const MAX_RECONNECT_ATTEMPTS = 5;
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -82,7 +86,12 @@ export default function GeneratePage({
       setStatus(data);
       setLog((prev) => [...prev, { message: data.message, done: false }]);
 
-      if (data.step === "discovery" && data.current !== undefined) {
+      if (
+        data.step === "discovery" &&
+        data.current !== undefined &&
+        data.current > lastDiscoveryCurrentRef.current
+      ) {
+        lastDiscoveryCurrentRef.current = data.current;
         reconnectAttemptsRef.current = 0;
       }
 
@@ -106,12 +115,13 @@ export default function GeneratePage({
       const data = JSON.parse(e.data) as {
         title: string;
         topic_count: number;
+        resumed?: boolean;
       };
       setSkeletonTitle(data.title);
       setLog((prev) => [
         ...prev.slice(0, -1),
         {
-          message: `Found structure: ${data.title} (${data.topic_count} topics)`,
+          message: `${data.resumed ? "Reused saved structure" : "Found structure"}: ${data.title} (${data.topic_count} topics)`,
           done: true,
         },
       ]);
@@ -158,6 +168,18 @@ export default function GeneratePage({
           connectRef.current?.();
         }, 2000);
       }
+    });
+
+    // A discovery failure leaves the durable job pending but does not trigger
+    // an automatic retry loop. The user can explicitly retry the saved job.
+    es.addEventListener("paused", (e) => {
+      const data = JSON.parse(e.data) as PausedEvent;
+      setError(data.message);
+      setCanRetryPaused(true);
+      terminalStateRef.current = "failed";
+      setTerminalState("failed");
+      es.close();
+      esRef.current = null;
     });
 
     // Handle explicit "error" events from server (event type = "error", has data)
@@ -212,6 +234,16 @@ export default function GeneratePage({
     connectImpl();
   }, [connectImpl]);
 
+  const retryPausedGeneration = useCallback(() => {
+    terminalStateRef.current = "none";
+    setTerminalState("none");
+    setError(null);
+    setCanRetryPaused(false);
+    reconnectAttemptsRef.current = 0;
+    lastDiscoveryCurrentRef.current = 0;
+    connectRef.current();
+  }, []);
+
   // Initial connection on mount
   useEffect(() => {
     console.info('[GeneratePage] Initial effect running, calling connect()');
@@ -246,6 +278,15 @@ export default function GeneratePage({
             <p className="text-sm text-text-secondary mb-6 leading-relaxed">
               {error}
             </p>
+            {canRetryPaused && (
+              <button
+                type="button"
+                onClick={retryPausedGeneration}
+                className="inline-flex items-center justify-center px-4 py-2 mr-2 rounded-lg bg-brand-forest text-white text-sm font-medium hover:bg-brand-navy transition"
+              >
+                Retry saved generation
+              </button>
+            )}
             <Link
               href="/"
               className="inline-flex items-center justify-center px-4 py-2 rounded-lg bg-surface-card border border-border-default text-text-primary text-sm font-medium hover:border-brand-forest transition shadow-xs"

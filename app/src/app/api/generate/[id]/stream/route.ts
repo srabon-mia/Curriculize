@@ -177,7 +177,13 @@ async function callAIStructured<T>(
   prompt: string,
   schema: z.ZodSchema<T>,
   useSearch = true,
-  operation = "structured_completion"
+  operation = "structured_completion",
+  diagnostics?: {
+    curriculumId?: string;
+    jobId?: string;
+    streamId?: string;
+    topicId?: string;
+  }
 ): Promise<T> {
   const startTime = Date.now();
   const provider = getAI(operation);
@@ -190,6 +196,7 @@ async function callAIStructured<T>(
       useSearch,
       maxTokens: 4000,
       signal: controller.signal,
+      diagnostics: { ...diagnostics, operation, attemptNumber: 1 },
     });
   } catch (error) {
     if (controller.signal.aborted) {
@@ -816,11 +823,7 @@ export async function GET(
           return;
         }
 
-        // Step 1: Generate skeleton
-        send(controller, "status", {
-          message: "Finding the best curriculum structure…",
-          step: "skeleton",
-        });
+        // Step 1: Load the persisted skeleton or generate it once.
         let skeletonParsed: Skeleton | null = null;
         let updatedCurriculumTitle = curriculum.title;
         const nodeIds: Array<{ nodeId: string; node: SkeletonNode }> = [];
@@ -829,6 +832,12 @@ export async function GET(
           .select("id, title, order_index")
           .eq("curriculum_id", id)
           .order("order_index", { ascending: true });
+
+        const resumingSkeleton = Boolean(existingNodes && existingNodes.length > 0);
+        send(controller, "status", {
+          message: resumingSkeleton ? "Loading the saved curriculum structure…" : "Finding the best curriculum structure…",
+          step: "skeleton",
+        });
 
         if (existingNodes && existingNodes.length > 0) {
           const existingNodeIds = existingNodes.map((node: { id: string }) => node.id);
@@ -1070,6 +1079,7 @@ export async function GET(
         send(controller, "skeleton", {
           title: skeletonParsed.title,
           topic_count: skeletonParsed.nodes.length,
+          resumed: resumingSkeleton,
         });
 
         // Check ownership before node insertion (no AI calls here, but safe to check)
@@ -1401,7 +1411,12 @@ export async function GET(
               return;
             }
 
-            const candidates = await callAIStructured(topicPrompt, CandidateArraySchema, true, "topic_discovery_ai");
+            const candidates = await callAIStructured(topicPrompt, CandidateArraySchema, true, "topic_discovery_ai", {
+              curriculumId: id,
+              jobId: ownerJobRecord.id,
+              streamId,
+              topicId: nodeId,
+            });
             console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=topic_discovery_ai, topic_id=${nodeId}, candidate_count=${candidates.length}`);
 
             // Check ownership after AI call — if lost mid-call, fail the job
@@ -1512,10 +1527,27 @@ export async function GET(
             lastProgressTime = Date.now();
           } catch (err) {
             if (err instanceof AITimeoutError) throw err;
-            console.log(
-              `Resource discovery failed for topic "${node.title}":`,
-              err instanceof Error ? err.message : err
-            );
+            const errorCode = err && typeof err === "object" && "code" in err
+              ? String((err as { code: unknown }).code)
+              : undefined;
+            const errorProvider = err && typeof err === "object" && "provider" in err
+              ? String((err as { provider: unknown }).provider)
+              : "unknown";
+            const errorCategory = errorCode === "MODEL_ERROR"
+              ? (err instanceof Error && err.message.includes("without source citations") ? "missing_citations" : "model_error")
+              : errorCode === "INVALID_REQUEST"
+                ? "invalid_structured_output"
+                : errorCode?.toLowerCase() ?? "unexpected_error";
+            console.error("[stream] Topic discovery failed", {
+              provider: errorProvider,
+              curriculum_id: id,
+              job_id: ownerJobRecord.id,
+              stream_id: streamId,
+              operation: "topic_discovery_ai",
+              topic_id: nodeId,
+              error_category: errorCategory,
+              retryable: true,
+            });
             // A failed discovery is not a successful empty result. Keep this
             // topic uncheckpointed and release the claim so a later invocation
             // retries from the persisted skeleton and prior topic checkpoints.
@@ -1528,17 +1560,15 @@ export async function GET(
             if (!released) {
               console.error(`[stream] Could not release job after topic discovery failure: job_id=${ownerJobRecord.id}`);
               send(controller, "error", {
-                message: "Resource discovery could not verify sources. Please retry this generation later.",
+                message: "Resource discovery failed, and the job could not be safely paused. Return to the curriculum and check its status before retrying.",
               });
             } else {
               const citationFailure = err instanceof Error &&
                 err.message.includes("Azure web search completed without source citations");
-              send(controller, "yielded", {
+              send(controller, "paused", {
                 message: citationFailure
-                  ? `Source citations were unavailable for ${node.title}. This topic remains pending and will be retried.`
-                  : `Resource discovery could not be completed for ${node.title}. This topic remains pending and will be retried.`,
-                topicsCompleted: completedTopics.size,
-                totalTopics: nodeIds.length,
+                  ? `Source citations were unavailable for ${node.title}. Progress is saved and this topic can be retried.`
+                  : `Resource discovery could not be completed for ${node.title}. Progress is saved and this topic can be retried.`,
               });
             }
             controller.close();
