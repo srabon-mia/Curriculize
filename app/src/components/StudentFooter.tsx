@@ -1,4 +1,6 @@
 import Link from "next/link";
+import Image from "next/image";
+import logo from "../../public/logo-cropped.png";
 
 export function StudentFooter() {
   return (
@@ -10,14 +12,15 @@ export function StudentFooter() {
           <div className="flex flex-col gap-5">
             <Link
               href="/"
-              className="flex items-center gap-2.5 text-white hover:text-brand-aqua transition group w-fit"
+              className="flex w-fit items-center"
+              aria-label="Curriculize home"
             >
-              <span className="flex h-8 w-8 shrink-0 rounded-lg bg-brand-forest text-white font-display font-bold text-sm shadow-sm transition group-hover:bg-brand-forest-hover">
-                C
-              </span>
-              <span className="font-display font-semibold text-base sm:text-lg tracking-tight text-white">
-                Curriculize
-              </span>
+              <Image
+                src={logo}
+                alt="Curriculize home"
+                className="h-auto w-[168px] sm:w-[180px]"
+                sizes="(max-width: 639px) 168px, 180px"
+              />
             </Link>
             <p className="text-sm leading-relaxed text-white/75 max-w-xs">
               Structured study guides compiled with AI from verified, human-curated educational resources.

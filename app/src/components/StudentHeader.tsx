@@ -1,7 +1,9 @@
 "use client";
 
 import Link from "next/link";
+import Image from "next/image";
 import { usePathname } from "next/navigation";
+import logo from "../../public/logo-cropped.png";
 
 export function StudentHeader() {
   const pathname = usePathname();
@@ -12,14 +14,16 @@ export function StudentHeader() {
         {/* Brand */}
         <Link
           href="/"
-          className="flex items-center gap-2.5 text-text-primary hover:text-brand-forest transition group"
+          className="flex shrink-0 items-center"
+          aria-label="Curriculize home"
         >
-          <span className="w-8 h-8 rounded-lg bg-brand-forest flex items-center justify-center text-white font-display font-bold text-sm shadow-sm group-hover:bg-brand-forest-hover transition">
-            C
-          </span>
-          <span className="hidden font-display font-semibold text-base tracking-tight text-brand-navy sm:inline sm:text-lg">
-            Curriculize
-          </span>
+          <Image
+            src={logo}
+            alt="Curriculize home"
+            priority
+            className="h-auto w-[96px] sm:w-[150px]"
+            sizes="(max-width: 639px) 96px, 150px"
+          />
         </Link>
 
         {/* Navigation Links */}
