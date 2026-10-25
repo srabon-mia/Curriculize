@@ -9,6 +9,7 @@ type Status = {
   step: string;
   current?: number;
   total?: number;
+  checkpoint_version?: number;
   phase?: string;
   topicsCompleted?: number;
   job_id?: string;
@@ -55,6 +56,7 @@ export default function GeneratePage({
   const connectRef = useRef<() => void>(() => {});
   const reconnectAttemptsRef = useRef(0);
   const lastDiscoveryCurrentRef = useRef(0);
+  const lastDurableProgressRef = useRef<string | null>(null);
   const MAX_RECONNECT_ATTEMPTS = 5;
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -95,10 +97,15 @@ export default function GeneratePage({
         reconnectAttemptsRef.current = 0;
       }
 
-      // A durable status response proves the job can still be observed. Do not
-      // let earlier network errors exhaust the client retry budget.
-      if (["pending", "running", "waiting", "status_unavailable"].includes(data.step)) {
-        reconnectAttemptsRef.current = 0;
+      // Reset transport retries only when durable lifecycle/checkpoint state
+      // actually advances. Repeated waiting/running snapshots must not keep an
+      // observer reconnect loop alive forever.
+      if (data.step === "pending" || data.step === "running") {
+        const progressKey = `${data.job_id ?? ""}:${data.step}:${data.checkpoint_version ?? data.current ?? ""}`;
+        if (lastDurableProgressRef.current !== progressKey) {
+          lastDurableProgressRef.current = progressKey;
+          reconnectAttemptsRef.current = 0;
+        }
       }
 
       if (data.step === "already_claimed") {
@@ -153,6 +160,10 @@ export default function GeneratePage({
 
     es.addEventListener("yielded", (e) => {
       const data = JSON.parse(e.data) as YieldedEvent;
+      // A quota yield after processing targets is a durable continuation, not
+      // a failed connection retry. Each such yield follows fenced coverage
+      // checkpoint writes, so it can safely start a fresh transport window.
+      if (data.topicsCompleted > 0) reconnectAttemptsRef.current = 0;
       setLog((prev) => [
         ...prev.slice(0, -1),
         {
@@ -260,6 +271,7 @@ export default function GeneratePage({
     setCanRetryPaused(false);
     reconnectAttemptsRef.current = 0;
     lastDiscoveryCurrentRef.current = 0;
+    lastDurableProgressRef.current = null;
     connectRef.current();
   }, []);
 
@@ -292,7 +304,7 @@ export default function GeneratePage({
               ✕
             </div>
             <h1 className="font-display text-2xl font-bold mb-2 text-status-error">
-              Something went wrong
+              {canRetryPaused ? "Generation paused" : "Something went wrong"}
             </h1>
             <p className="text-sm text-text-secondary mb-6 leading-relaxed">
               {error}
