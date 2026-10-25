@@ -49,6 +49,8 @@ let simulatedCurriculum: any = null;
 let observerRunningJob: any = null;
 let durableJobRow: any = null;
 let observerReadSequence: any[] = [];
+let acquisitionMaybeSingleSequence: Array<{ data: any; error: any }> = [];
+let claimStateAfterAttempt: string | null = null;
 
 // ============================================================
 // Configurable RPC result overrides for lifecycle testing.
@@ -59,6 +61,12 @@ const rpcOverrides: Record<string, { data: unknown; error: unknown }> = {};
 const rpcCallCounts: Record<string, number> = {};
 const rpcSequences: Record<string, Array<{ data: unknown; error: unknown }>> = {};
 const coverageAttemptCounts: Record<string, number> = {};
+
+function abortableRpcResult(result: { data: unknown; error: unknown }) {
+  const pending: any = Promise.resolve(result);
+  pending.abortSignal = () => pending;
+  return pending;
+}
 
 // Flag-controlled INSERT error for acquisition_jobs (for testing unique
 // violation / failure paths without mockImplementationOnce interference).
@@ -122,6 +130,7 @@ function createMockSupabaseClient() {
     order: vi.fn().mockReturnThis(),
     limit: vi.fn().mockReturnThis(),
     in: vi.fn().mockReturnThis(),
+    abortSignal: vi.fn().mockReturnThis(),
     update: vi.fn().mockReturnThis(),
     then: vi.fn().mockImplementation((cb: any) =>
       Promise.resolve({ data: [], error: null }).then(cb)
@@ -222,7 +231,11 @@ function createMockSupabaseClient() {
                 : durableJobRow ?? observerRunningJob,
             error: null,
           }));
-          selectChain.maybeSingle = vi.fn().mockResolvedValue({ data: durableJobRow, error: null });
+          selectChain.maybeSingle = vi.fn().mockImplementation(() => Promise.resolve(
+            acquisitionMaybeSingleSequence.length > 0
+              ? acquisitionMaybeSingleSequence.shift()
+              : { data: durableJobRow, error: null }
+          ));
           return selectChain;
         });
         tableChain.insert = vi.fn().mockImplementation((data: any) => {
@@ -284,27 +297,44 @@ function createMockSupabaseClient() {
 
       // Sequenced responses (for testing retry / call-order logic)
       if (rpcSequences[name] && rpcSequences[name][callCount]) {
-        return Promise.resolve(rpcSequences[name][callCount]);
+        return abortableRpcResult(rpcSequences[name][callCount]);
       }
 
       if (rpcOverrides[name]) {
-        return Promise.resolve(rpcOverrides[name]);
+        if (name === "claim_next_job" && claimStateAfterAttempt !== null && durableJobRow) {
+          durableJobRow.status = claimStateAfterAttempt;
+          if (claimStateAfterAttempt === "failed") durableJobRow.error = "simulated terminal failure";
+          if (claimStateAfterAttempt === "running") {
+            durableJobRow.claim_token = "other-processor-token";
+            durableJobRow.claim_version = (durableJobRow.claim_version ?? 0) + 1;
+          }
+        }
+        return abortableRpcResult(rpcOverrides[name]);
       }
 
       // Default: claim_next_job returns null (no pending job found)
       if (name === "claim_next_job") {
+        if (claimStateAfterAttempt !== null && durableJobRow) {
+          durableJobRow.status = claimStateAfterAttempt;
+          if (claimStateAfterAttempt === "failed") durableJobRow.error = "simulated terminal failure";
+          if (claimStateAfterAttempt === "running") {
+            durableJobRow.claim_token = "other-processor-token";
+            durableJobRow.claim_version = (durableJobRow.claim_version ?? 0) + 1;
+          }
+          return abortableRpcResult({ data: null, error: null });
+        }
         if (!resumeScenario && durableJobRow?.status === "pending") {
           durableJobRow.status = "running";
           durableJobRow.claim_token = "tok-reclaimed";
           durableJobRow.claim_version += 1;
-          return Promise.resolve({ data: durableJobRow, error: null });
+          return abortableRpcResult({ data: durableJobRow, error: null });
         }
         if (resumeScenario && simulatedResumeJob?.status === "pending") {
           simulatedResumeJob.status = "running";
           simulatedResumeJob.claim_version += 1;
-          return Promise.resolve({ data: simulatedResumeJob, error: null });
+          return abortableRpcResult({ data: simulatedResumeJob, error: null });
         }
-        return Promise.resolve({ data: null, error: null });
+        return abortableRpcResult({ data: null, error: null });
       }
 
       if (name === "recover_stale_jobs") {
@@ -385,6 +415,10 @@ vi.mock("@supabase/supabase-js", () => ({
   createClient: vi.fn(() => mockSupabaseClient),
 }));
 
+vi.mock("@/lib/acquisition/worker", () => ({
+  processJob: vi.fn().mockResolvedValue("yielded"),
+}));
+
 // ============================================================
 // Mock AI provider factory
 // ============================================================
@@ -425,6 +459,7 @@ vi.mock("@/lib/acquisition/jobTypes", () => ({
 // Existing detailed pipeline tests exercise the retained legacy helper. The
 // exported GET is tested separately as the production read-only observer.
 const { GET: routeGET, legacyGenerationGet, observeGeneration, claimOrRegisterJob, monitorObservedJob } = await import("./route");
+const { processJob } = await import("@/lib/acquisition/worker");
 const GET = legacyGenerationGet;
 
 // ============================================================
@@ -684,6 +719,8 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     observerRunningJob = null;
     durableJobRow = null;
     observerReadSequence = [];
+    acquisitionMaybeSingleSequence = [];
+    claimStateAfterAttempt = null;
 
     mockAIInstance = new MockProvider();
     vi.mocked((await import("@/lib/ai")).getAIProvider).mockImplementation(() => mockAIInstance);
@@ -2055,6 +2092,7 @@ describe("Skeleton retry with budget/ownership checks", () => {
 describe("Durable generation stream observer", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(processJob).mockResolvedValue("yielded");
     resetRpcOverrides();
     resetRpcSequences();
     jobInsertMockError = null;
@@ -2107,6 +2145,7 @@ describe("Durable generation stream observer", () => {
     expect(events.join("\n")).toContain('event: complete');
     expect(vi.mocked(getAIProvider)).not.toHaveBeenCalled();
     expect(vi.mocked(discoverVerifiedResource)).not.toHaveBeenCalled();
+    expect(processJob).not.toHaveBeenCalled();
     expect(mockSupabaseClient.rpc).not.toHaveBeenCalled();
     expect(capturedInserts.filter((entry) => entry.table === "resources")).toHaveLength(0);
   });
@@ -2143,7 +2182,8 @@ describe("Durable generation stream observer", () => {
     clearTimeoutSpy.mockRestore();
   });
 
-  it("creates one pending job and reuses it on reconnect without taking a processing claim", async () => {
+  it("reuses an existing pending job on reconnect without taking a processing claim", async () => {
+    durableJobRow = { id: "job-1", status: "pending", error: null, result_data: {}, checkpoint_version: 0 };
     const first = await observeGeneration(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
     const firstEvents = await readEvents(first, 2);
     expect(firstEvents.join("\n")).toContain('"step":"pending"');
@@ -2153,9 +2193,126 @@ describe("Durable generation stream observer", () => {
     const reconnectEvents = await readEvents(reconnect, 2);
 
     expect(reconnectEvents.join("\n")).toContain('"step":"pending"');
-    expect(capturedJobInserts()).toHaveLength(1);
+    expect(capturedJobInserts()).toHaveLength(0);
     expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("claim_next_job", expect.anything());
     expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("reserve_ai_call", expect.anything());
+    expect(processJob).not.toHaveBeenCalled();
+  });
+
+  it("starts only a newly inserted job through the durable worker and shows first-generation progress", async () => {
+    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const events = await readEvents(response, 2);
+    const joined = events.join("\n");
+
+    expect(processJob).toHaveBeenCalledTimes(1);
+    expect(joined).toContain("Generation job created.");
+    expect(joined).toContain("Finding the best curriculum structure…");
+    expect(joined).not.toContain("Connected to saved generation progress.");
+    expect(capturedJobInserts()).toHaveLength(1);
+    expect(mockSupabaseClient.rpc).toHaveBeenCalledWith("claim_next_job", {
+      p_job_type: "curriculum_generation",
+      p_curriculum_id: "test-curriculum-id",
+    });
+    expect(processJob).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(processJob).mock.calls[0][0]).toMatchObject({ id: "job-1", curriculum_id: "test-curriculum-id" });
+  });
+
+  it.each(["pending", "running"] as const)("does not dispatch an existing %s job when the browser reconnects", async (status) => {
+    durableJobRow = {
+      id: "job-existing", status, error: null,
+      result_data: { checkpoint: { completedTopicIds: [] } }, checkpoint_version: 1,
+    };
+
+    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const events = await readEvents(response, 2);
+
+    expect(events.join("\n")).toContain("Connected to saved generation progress.");
+    expect(capturedJobInserts()).toHaveLength(0);
+    expect(processJob).not.toHaveBeenCalled();
+  });
+
+  it("observes a running job after a null claim without dispatching another worker", async () => {
+    claimStateAfterAttempt = "running";
+    rpcOverrides["claim_next_job"] = { data: null, error: null };
+
+    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const joined = (await readEvents(response, 2)).join("\n");
+
+    expect(joined).toContain("Another processor owns this generation.");
+    expect(joined).not.toContain("Finding the best curriculum structure…");
+    expect(processJob).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["completed", "event: complete"],
+    ["failed", "simulated terminal failure"],
+  ] as const)("handles a null claim followed by terminal status %s without startup messaging", async (status, expected) => {
+    claimStateAfterAttempt = status;
+    rpcOverrides["claim_next_job"] = { data: null, error: null };
+
+    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const joined = (await readEvents(response)).join("\n");
+
+    expect(joined).toContain("Generation job created.");
+    expect(joined).toContain(expected);
+    expect(joined).not.toContain("Finding the best curriculum structure…");
+    expect(processJob).not.toHaveBeenCalled();
+  });
+
+  it("reports a null claim that leaves the new job pending", async () => {
+    claimStateAfterAttempt = "pending";
+    rpcOverrides["claim_next_job"] = { data: null, error: null };
+
+    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const joined = (await readEvents(response)).join("\n");
+
+    expect(joined).toContain("remains pending");
+    expect(joined).not.toContain("Finding the best curriculum structure…");
+    expect(processJob).not.toHaveBeenCalled();
+  });
+
+  it("observes but does not dispatch when the claim errors and the reread is running", async () => {
+    claimStateAfterAttempt = "running";
+    rpcOverrides["claim_next_job"] = { data: null, error: { message: "claim response lost" } };
+
+    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const joined = (await readEvents(response, 2)).join("\n");
+
+    expect(joined).toContain("could not confirm its claim owner");
+    expect(joined).toContain("stale-lease recovery may be needed");
+    expect(joined).not.toContain("Finding the best curriculum structure…");
+    expect(processJob).not.toHaveBeenCalled();
+  });
+
+  it("reports a claim error when the reread confirms the job remains pending", async () => {
+    claimStateAfterAttempt = "pending";
+    rpcOverrides["claim_next_job"] = { data: null, error: { message: "claim failed" } };
+
+    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const joined = (await readEvents(response)).join("\n");
+
+    expect(joined).toContain("remains pending");
+    expect(joined).not.toContain("Finding the best curriculum structure…");
+    expect(processJob).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["reread failure", { data: null, error: { message: "read unavailable" } }],
+    ["unknown status", { data: { status: "unexpected", error: null }, error: null }],
+    ["missing row", { data: null, error: null }],
+  ] as const)("reports indeterminate startup on %s", async (_label, rereadResult) => {
+    rpcOverrides["claim_next_job"] = { data: null, error: null };
+    acquisitionMaybeSingleSequence = [
+      { data: null, error: null }, // no job before this request inserts one
+      rereadResult,
+    ];
+
+    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const joined = (await readEvents(response)).join("\n");
+
+    expect(joined).toContain("Could not confirm whether generation started.");
+    expect(joined).not.toContain("Finding the best curriculum structure…");
+    expect(processJob).not.toHaveBeenCalled();
   });
 
   it("emits a terminal complete event when the durable job is completed", async () => {

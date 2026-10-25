@@ -13,11 +13,14 @@ import { AcquisitionDedupTracker } from "@/lib/acquisition";
 import { DEFAULT_BUDGET_LIMITS } from "@/lib/acquisition/jobTypes";
 import { CandidateArraySchema, SourcesArraySchema } from "@/lib/acquisition/discoverySchemas";
 import {
+  claimNextJob,
   reserveAICall,
   releaseJobClaim,
   recordResourceCoverageAttempt,
   recoverStaleJobs,
 } from "@/lib/acquisition/jobService";
+import { processJob } from "@/lib/acquisition/worker";
+import { createWorkerDeadline } from "@/lib/acquisition/workerDeadline";
 import { runBoundedCoverageAttempts, mapUnderstandingCodesToIds } from "@/lib/acquisition/coverage";
 import { PersistenceError } from "@/lib/persistence";
 import { z } from "zod";
@@ -825,10 +828,88 @@ export async function monitorObservedJob(
   close();
 }
 
+type HandoffState =
+  | { kind: "running"; ownershipUncertain: boolean }
+  | { kind: "terminal"; status: "completed" | "failed"; error: string | null }
+  | { kind: "pending" };
+
+class NewJobHandoffError extends Error {
+  constructor(readonly reason: "pending" | "indeterminate") {
+    super(reason);
+  }
+}
+
+function sendTerminalJobStatus(
+  status: "completed" | "failed",
+  error: string | null,
+  curriculumId: string,
+  send: ObserverSend,
+  close: () => void
+): void {
+  if (status === "completed") {
+    send("complete", { curriculum_id: curriculumId, phase: "background" });
+  } else {
+    send("error", { message: error || "Generation failed." });
+  }
+  close();
+}
+
+async function readHandoffState(jobId: string): Promise<HandoffState> {
+  const { data: current, error } = await supabase
+    .from("acquisition_jobs")
+    .select("status, error")
+    .eq("id", jobId)
+    .maybeSingle();
+  if (error || !current || typeof current.status !== "string") {
+    throw new NewJobHandoffError("indeterminate");
+  }
+  if (current.status === "pending") return { kind: "pending" };
+  if (current.status === "running") return { kind: "running", ownershipUncertain: false };
+  if (current.status === "completed" || current.status === "failed") {
+    return { kind: "terminal", status: current.status, error: current.error ?? null };
+  }
+  throw new NewJobHandoffError("indeterminate");
+}
+
+/** Claim and start only the job just inserted by this first-generation request. */
+async function handoffNewJob(
+  curriculumId: string,
+  jobId: string,
+  onStarted: () => void
+): Promise<HandoffState | { kind: "claimed" }> {
+  const deadline = createWorkerDeadline();
+  try {
+    let job;
+    try {
+      job = await claimNextJob("curriculum_generation", curriculumId, deadline.signal);
+    } catch {
+      // The RPC may have committed before its response was lost. A status read
+      // cannot recover the claim token, so a running row is observed only.
+      const state = await readHandoffState(jobId);
+      if (state.kind === "running") return { ...state, ownershipUncertain: true };
+      if (state.kind === "terminal") return state;
+      throw new NewJobHandoffError("pending");
+    }
+
+    if (!job) {
+      const state = await readHandoffState(jobId);
+      if (state.kind === "running" || state.kind === "terminal") return state;
+      throw new NewJobHandoffError("pending");
+    }
+    if (job.id !== jobId) {
+      throw new NewJobHandoffError("indeterminate");
+    }
+    onStarted();
+    await processJob(job, deadline);
+    return { kind: "claimed" };
+  } finally {
+    deadline.dispose();
+  }
+}
+
 /**
- * Run generation in the request that the student opens. The durable processor
- * remains available for stale-job recovery, but must not be required to start
- * every newly created curriculum.
+ * Observe progress and start only a job newly registered by this request using
+ * the durable worker. Reconnects to saved jobs remain observer-only.
  */
 export async function GET(
   request: Request,
@@ -837,7 +918,7 @@ export async function GET(
   return observeGeneration(request, context);
 }
 
-/** Read-only observer retained for status checks and focused regression tests. */
+/** Observe a job; newly registered work gets one targeted durable-worker handoff. */
 export async function observeGeneration(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -911,18 +992,13 @@ export async function observeGeneration(
           return;
         }
 
-        if (latestJob?.status === "completed") {
-          send("complete", { curriculum_id: id, phase: "background" });
-          close();
-          return;
-        }
-        if (latestJob?.status === "failed") {
-          send("error", { message: latestJob.error || "Generation failed." });
-          close();
+        if (latestJob?.status === "completed" || latestJob?.status === "failed") {
+          sendTerminalJobStatus(latestJob.status, latestJob.error ?? null, id, send, close);
           return;
         }
 
         let jobId = latestJob?.id as string | undefined;
+        let createdNewJob = false;
         if (!jobId) {
           const { data: inserted, error: insertError } = await supabase
             .from("acquisition_jobs")
@@ -949,14 +1025,8 @@ export async function observeGeneration(
               .limit(1)
               .maybeSingle();
             if (activeError) throw new Error(`Could not observe active generation job: ${activeError.message}`);
-            if (activeJob?.status === "completed") {
-              send("complete", { curriculum_id: id, phase: "background" });
-              close();
-              return;
-            }
-            if (activeJob?.status === "failed") {
-              send("error", { message: activeJob.error || "Generation failed." });
-              close();
+            if (activeJob?.status === "completed" || activeJob?.status === "failed") {
+              sendTerminalJobStatus(activeJob.status, activeJob.error ?? null, id, send, close);
               return;
             }
             jobId = activeJob?.id;
@@ -964,11 +1034,46 @@ export async function observeGeneration(
             throw new Error(`Could not create durable generation job: ${insertError.message}`);
           } else {
             jobId = inserted?.id;
+            createdNewJob = Boolean(jobId);
           }
         }
         if (!jobId) throw new Error("Could not register or observe the durable generation job.");
 
-        send("status", { message: "Connected to saved generation progress.", step: "reconnect", job_id: jobId, is_reconnect: true });
+        if (createdNewJob) {
+          send("status", { message: "Generation job created.", step: "init", job_id: jobId });
+          try {
+            const handoff = await handoffNewJob(id, jobId, () => {
+              send("status", { message: "Finding the best curriculum structure…", step: "skeleton", job_id: jobId });
+            });
+            if (handoff.kind === "terminal") {
+              sendTerminalJobStatus(handoff.status, handoff.error, id, send, close);
+              return;
+            }
+            if (handoff.kind === "running") {
+              send("status", {
+                message: handoff.ownershipUncertain
+                  ? "The job is marked running, but this request could not confirm its claim owner. Observing saved progress; stale-lease recovery may be needed if it does not advance."
+                  : "Another processor owns this generation. Observing its progress…",
+                step: "running",
+                job_id: jobId,
+              });
+            }
+          } catch (error) {
+            console.error("[stream] New-job processor handoff failed", {
+              job_id: jobId,
+              error_name: error instanceof Error ? error.name : "UnknownError",
+            });
+            send("error", {
+              message: error instanceof NewJobHandoffError && error.reason === "pending"
+                ? "Generation was created but remains pending because this request could not claim it. Please check processor availability."
+                : "Could not confirm whether generation started. The job may have an active lease; check saved progress and allow stale-lease recovery before retrying.",
+            });
+            close();
+            return;
+          }
+        } else {
+          send("status", { message: "Connected to saved generation progress.", step: "reconnect", job_id: jobId, is_reconnect: true });
+        }
         await monitorObservedJob(
           jobId,
           id,
