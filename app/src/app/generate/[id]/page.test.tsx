@@ -187,47 +187,6 @@ describe("GeneratePage - EventSource connection", () => {
     vi.useRealTimers();
   });
 
-  it("does not let repeated waiting snapshots reset the finite connection retry limit", async () => {
-    vi.useFakeTimers();
-    const { getByText, unmount } = render(
-      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
-    );
-
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const current = eventSourceInstances[eventSourceInstances.length - 1];
-      act(() => current.listeners.get("status")?.({
-        data: JSON.stringify({ message: "Another generation is in progress", step: "waiting", job_id: "job-1" }),
-      } as MessageEvent));
-      act(() => current.listeners.get("error")?.({ data: undefined } as MessageEvent));
-      if (attempt < 4) await act(async () => vi.advanceTimersByTimeAsync(2000));
-    }
-
-    expect(eventSourceInstances).toHaveLength(5);
-    expect(getByText(/could not make progress after several attempts/i)).toBeTruthy();
-    unmount();
-    vi.useRealTimers();
-  });
-
-  it("allows more than five quota continuations when each invocation reports saved progress", async () => {
-    vi.useFakeTimers();
-    const { queryByText, unmount } = render(
-      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
-    );
-
-    for (let continuation = 0; continuation < 7; continuation++) {
-      const current = eventSourceInstances[eventSourceInstances.length - 1];
-      act(() => current.listeners.get("yielded")?.({
-        data: JSON.stringify({ message: "Resuming…", topicsCompleted: 2, totalTopics: 12 }),
-      } as MessageEvent));
-      if (continuation < 6) await act(async () => vi.advanceTimersByTimeAsync(2000));
-    }
-
-    expect(eventSourceInstances).toHaveLength(7);
-    expect(queryByText(/retry limit was reached/i)).toBeNull();
-    unmount();
-    vi.useRealTimers();
-  });
-
   it("does not reset the retry limit when the same unfinished topic reports discovery again", async () => {
     vi.useFakeTimers();
     const { getByText, unmount } = render(
@@ -260,7 +219,6 @@ describe("GeneratePage - EventSource connection", () => {
     } as MessageEvent));
 
     expect(getByText(/progress saved/i)).toBeTruthy();
-    expect(getByText("Generation paused")).toBeTruthy();
     expect(eventSourceInstances).toHaveLength(1);
     fireEvent.click(getByText("Retry saved generation"));
     await waitFor(() => expect(eventSourceInstances).toHaveLength(2));

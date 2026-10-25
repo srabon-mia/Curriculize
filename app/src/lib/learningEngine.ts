@@ -14,8 +14,8 @@
  *                      └──────────┬──────────┘
  *                                ▼
  *                    Persistence (6D) persistVerifiedResource
- *                      → resources row: status from the persistence approval
- *                        policy; content_type_verified = verification status
+ *                      → resources row: status='draft',
+ *                        content_type_verified = verification status
  *                      → verification_records row (evidence)
  *
  * The Learning Engine itself performs NO network fetches and NO AI calls:
@@ -24,9 +24,10 @@
  * (skeleton + resource discovery), and that AI call surface is unchanged.
  *
  * Contract (Phase 12):
- *  - Acquisition never directly approves a resource. Persistence can approve
- *    only after verification and its explicit educational-evidence or
- *    authoritative-domain policy; otherwise the resource remains draft.
+ *  - A successfully persisted resource is ALWAYS status='draft'; only an admin
+ *    can promote it to 'approved' for student visibility. This is the
+ *    "approved / content_type_verified bug" fix: resources do not become
+ *    student-eligible merely because AI returned a URL or acquisition succeeded.
  *  - content_type_verified is derived solely from the deterministic verification
  *    status (wordCount > 0), never hardcoded.
  *  - A single candidate failure (bad URL, SSRF block, 4xx/5xx, empty page,
@@ -43,7 +44,6 @@ import {
 } from "@/lib/acquisition";
 import { normalizeResourceType } from "@/lib/acquisition/resourceTypes";
 import { extractEducationalEvidence } from "@/lib/evidence";
-import type { EvidenceTargetContext } from "@/lib/evidence/types";
 import { verifyContent, type VerificationResult } from "@/lib/verification";
 import {
   persistVerifiedResource,
@@ -78,14 +78,12 @@ export interface LearnParams {
   candidate: DiscoveryCandidateInput;
   /** Where the persisted resource should attach */
   target: ResourceTarget;
-  /** Fetched-page relevance context from the curriculum target, not AI metadata. */
-  targetContext?: EvidenceTargetContext;
   /** Optional acquisition job id for idempotent retry dedup in verification_records */
   acquisitionJobId?: string;
 }
 
 export interface LearnResult {
-  /** The persisted resource and its persistence-layer approval decision. */
+  /** The persisted resource (always status='draft' unless pre-existing) */
   resource: PersistenceResult["resource"];
   /** Outcome of deterministic verification */
   verificationStatus: "verified" | "failed";
@@ -127,7 +125,7 @@ function toVerificationAcquiredPage(acquiredPage: AcquiredPage): VerificationInp
  *     (honors the Phase 11 resource-extraction cache when `cache` is provided).
  *  2. extractEducationalEvidence (6B).
  *  3. verifyContent (6C) — hard gate: cleaned word count > 0.
- *  4. persistVerifiedResource (6D) — inserts resource under the approval policy,
+ *  4. persistVerifiedResource (6D) — inserts resource (status='draft',
  *     content_type_verified from verification) + verification_records evidence.
  *
  * When `jobId` and `claimToken` are provided, uses the lease-fenced
@@ -175,10 +173,7 @@ export async function discoverVerifiedResource(
   }
 
   // 6B — deterministic educational evidence from the structured content.
-  const educationalEvidence = extractEducationalEvidence(
-    result.structuredContent,
-    params.targetContext
-  );
+  const educationalEvidence = extractEducationalEvidence(result.structuredContent);
 
   // 6C — deterministic verification gate (pure, no AI).
   const verificationResult: VerificationResult = verifyContent({
@@ -187,8 +182,9 @@ export async function discoverVerifiedResource(
     educationalEvidence,
   });
 
-  // 6D — persist with evidence. Approval is decided by the persistence gate;
-  // content_type_verified is derived from verification, never hardcoded.
+  // 6D — persist with evidence. Always writes status='draft'; the
+  // content_type_verified column is derived from the verification result,
+  // never hardcoded. Admin approval is required for public visibility.
   //
   // Note: PersistenceInput requires acquiredPage + structuredContent +
   // educationalEvidence + verificationResult (cleanedPage is consumed only
@@ -228,11 +224,9 @@ export async function discoverVerifiedResource(
     };
   } catch (err) {
     if (err instanceof PersistenceError) {
-      // A write failure must not be mistaken for empty discovery in a durable
-      // job. Non-durable callers isolate this candidate and continue.
-      if (options?.jobId && options.claimToken) throw err;
-      console.warn(`[learningEngine] skipping candidate after persistence failure: ${err.message}`);
-      return null;
+      // A write failure must not be mistaken for empty discovery. Let the
+      // durable job fail so no coverage checkpoint can be recorded.
+      throw err;
     }
     // Unexpected error — re-throw so it is not silently swallowed.
     throw err;

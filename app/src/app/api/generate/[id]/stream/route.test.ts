@@ -48,7 +48,6 @@ let simulatedResumeJob: any = null;
 let simulatedCurriculum: any = null;
 let observerRunningJob: any = null;
 let durableJobRow: any = null;
-let observerReadSequence: any[] = [];
 
 // ============================================================
 // Configurable RPC result overrides for lifecycle testing.
@@ -211,17 +210,11 @@ function createMockSupabaseClient() {
         tableChain.select.mockImplementation(() => {
           const selectChain: any = { ...chain };
           selectChain.single = vi.fn().mockResolvedValue({
-            data: undefined,
+            data: resumeScenario && simulatedResumeJob
+              ? { ...simulatedResumeJob, curricula: { status: "draft" } }
+              : durableJobRow ?? observerRunningJob,
             error: null,
           });
-          selectChain.single.mockImplementation(() => Promise.resolve({
-            data: observerReadSequence.length > 0
-              ? observerReadSequence.shift()
-              : resumeScenario && simulatedResumeJob
-                ? { ...simulatedResumeJob, curricula: { status: "draft" } }
-                : durableJobRow ?? observerRunningJob,
-            error: null,
-          }));
           selectChain.maybeSingle = vi.fn().mockResolvedValue({ data: durableJobRow, error: null });
           return selectChain;
         });
@@ -305,22 +298,6 @@ function createMockSupabaseClient() {
           return Promise.resolve({ data: simulatedResumeJob, error: null });
         }
         return Promise.resolve({ data: null, error: null });
-      }
-
-      if (name === "recover_stale_jobs") {
-        if (durableJobRow?.status === "running" && durableJobRow.claim_expires_at &&
-            Date.parse(durableJobRow.claim_expires_at) <= Date.now()) {
-          const retryCount = durableJobRow.retry_count ?? 0;
-          const maxRetries = durableJobRow.budget_limits?.max_retries ?? 3;
-          durableJobRow.status = retryCount < maxRetries ? "pending" : "failed";
-          durableJobRow.retry_count = retryCount < maxRetries ? retryCount + 1 : retryCount;
-          durableJobRow.claim_token = null;
-          durableJobRow.claim_expires_at = null;
-          durableJobRow.claim_version = (durableJobRow.claim_version ?? 0) + 1;
-          durableJobRow.error = "recovered: lease expired";
-          return Promise.resolve({ data: [{ id: durableJobRow.id, status: durableJobRow.status, retry_count: durableJobRow.retry_count }], error: null });
-        }
-        return Promise.resolve({ data: [], error: null });
       }
 
       if (name === "record_resource_coverage_attempt") {
@@ -424,7 +401,7 @@ vi.mock("@/lib/acquisition/jobTypes", () => ({
 // Import the route AFTER all mocks are registered
 // Exercise the production inline generation path and retain direct coverage of
 // the read-only observer used to inspect durable job state.
-const { GET, observeGeneration, claimOrRegisterJob, monitorObservedJob } = await import("./route");
+const { GET, observeGeneration } = await import("./route");
 
 // ============================================================
 // Test data factories
@@ -682,7 +659,6 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     simulatedCurriculum = null;
     observerRunningJob = null;
     durableJobRow = null;
-    observerReadSequence = [];
 
     mockAIInstance = new MockProvider();
     vi.mocked((await import("@/lib/ai")).getAIProvider).mockImplementation(() => mockAIInstance);
@@ -880,129 +856,6 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       // Service-role client bypasses RLS (acquisition_jobs INSERT policy requires
       // is_admin, but the service role bypasses RLS per migration 0006:562-567).
       expect(jobInserts[0].created_by).toBe(null);
-    });
-
-    it("request-triggered recovery reclaims this curriculum's expired lease before creating a job", async () => {
-      durableJobRow = {
-        id: "expired-job",
-        curriculum_id: "test-curriculum-id",
-        job_type: "curriculum_generation",
-        status: "running",
-        claim_token: "expired-token",
-        claim_version: 4,
-        claim_expires_at: new Date(Date.now() - 60_000).toISOString(),
-        retry_count: 0,
-        budget_limits: { max_retries: 3 },
-        result_data: { checkpoint: { completedTopicIds: ["topic-1"] } },
-      };
-
-      const result = await claimOrRegisterJob("test-curriculum-id", { topic: "Test" });
-
-      expect(result).toMatchObject({ mode: "owner", id: "expired-job" });
-      expect(durableJobRow.status).toBe("running");
-      expect(durableJobRow.claim_token).toBe("tok-reclaimed");
-      expect(capturedJobInserts()).toHaveLength(0);
-      const rpcNames = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.map(([name]) => name);
-      expect(rpcNames.indexOf("recover_stale_jobs")).toBeLessThan(rpcNames.indexOf("claim_next_job"));
-    });
-
-    it("does not reclaim or duplicate a job with a valid lease", async () => {
-      durableJobRow = {
-        id: "active-job",
-        curriculum_id: "test-curriculum-id",
-        job_type: "curriculum_generation",
-        status: "running",
-        claim_token: "valid-token",
-        claim_version: 4,
-        claim_expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
-        retry_count: 0,
-        budget_limits: { max_retries: 3 },
-        result_data: { checkpoint: { completedTopicIds: ["topic-1"] } },
-      };
-
-      const result = await claimOrRegisterJob("test-curriculum-id", { topic: "Test" });
-
-      expect(result).toMatchObject({ mode: "observer", jobId: "active-job" });
-      expect(durableJobRow.status).toBe("running");
-      expect(durableJobRow.claim_token).toBe("valid-token");
-      expect(capturedJobInserts()).toHaveLength(1); // the unique-conflict attempt; no replacement row
-      expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.some(([name]) => name === "recover_stale_jobs")).toBe(true);
-    });
-
-    it("does not create a replacement job when stale recovery exhausts the retry limit", async () => {
-      durableJobRow = {
-        id: "expired-job",
-        curriculum_id: "test-curriculum-id",
-        job_type: "curriculum_generation",
-        status: "running",
-        claim_token: "expired-token",
-        claim_version: 4,
-        claim_expires_at: new Date(Date.now() - 60_000).toISOString(),
-        retry_count: 3,
-        budget_limits: { max_retries: 3 },
-        result_data: { checkpoint: { completedTopicIds: ["topic-1"] } },
-      };
-
-      await expect(claimOrRegisterJob("test-curriculum-id", { topic: "Test" }))
-        .rejects.toThrow(/reached its retry limit/i);
-      expect(durableJobRow.status).toBe("failed");
-      expect(capturedJobInserts()).toHaveLength(0);
-    });
-  });
-
-  describe("read-only active-job observation", () => {
-    it("forwards terminal completion after topic and batch checkpoints progress", async () => {
-      observerReadSequence = [
-        { status: "running", error: null, checkpoint_version: 5, result_data: { checkpoint: { completedTopicIds: ["t1"] }, batchCheckpoint: { completedTopicIds: [] } } },
-        { status: "running", error: null, checkpoint_version: 6, result_data: { checkpoint: { completedTopicIds: ["t1"] }, batchCheckpoint: { completedTopicIds: ["t1"] } } },
-        { status: "completed", error: null, checkpoint_version: 6, result_data: {} },
-      ];
-      const events: Array<{ event: string; data: any }> = [];
-      let closed = false;
-      const controller = new AbortController();
-
-      await monitorObservedJob("job-1", "test-curriculum-id", controller.signal,
-        (event, data) => events.push({ event, data }), () => { closed = true; }, 4);
-
-      expect(events.filter(({ event }) => event === "status").map(({ data }) => data.current)).toEqual([1, 2]);
-      expect(events.at(-1)).toEqual({ event: "complete", data: { curriculum_id: "test-curriculum-id", phase: "background" } });
-      expect(closed).toBe(true);
-      expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("complete_job", expect.anything());
-      expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("fail_job", expect.anything());
-    });
-
-    it("hands a released pending job to the normal claim path", async () => {
-      observerReadSequence = [{ status: "pending", error: null, checkpoint_version: 7, result_data: { checkpoint: { completedTopicIds: ["t1"] }, batchCheckpoint: { completedTopicIds: ["t1"] } } }];
-      const events: string[] = [];
-      const controller = new AbortController();
-      let closed = false;
-
-      await monitorObservedJob("job-1", "test-curriculum-id", controller.signal,
-        (event) => events.push(event), () => { closed = true; }, 6);
-
-      expect(events).toEqual(["status", "continue"]);
-      expect(closed).toBe(true);
-      expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("release_job_claim", expect.anything());
-    });
-
-    it("stops polling a non-progressing running job with a recoverable pause, without failing it", async () => {
-      observerReadSequence = Array.from({ length: 30 }, () => ({
-        status: "running", error: null, checkpoint_version: 9,
-        result_data: { checkpoint: { completedTopicIds: ["t1"] }, batchCheckpoint: { completedTopicIds: [] } },
-      }));
-      const events: Array<{ event: string; data: any }> = [];
-      let closed = false;
-      const controller = new AbortController();
-
-      await monitorObservedJob("job-1", "test-curriculum-id", controller.signal,
-        (event, data) => events.push({ event, data }), () => { closed = true; }, 9);
-
-      expect(events.filter(({ event }) => event === "status").length).toBeGreaterThan(0);
-      expect(events.at(-1)?.event).toBe("paused");
-      expect(events.at(-1)?.data.message).toMatch(/still saved.*not been marked failed/i);
-      expect(closed).toBe(true);
-      expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("fail_job", expect.anything());
-      expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("release_job_claim", expect.anything());
     });
   });
 
@@ -2041,7 +1894,6 @@ describe("Durable generation stream observer", () => {
     simulatedCurriculum = null;
     observerRunningJob = null;
     durableJobRow = null;
-    observerReadSequence = [];
     capturedInserts.length = 0;
   });
 
