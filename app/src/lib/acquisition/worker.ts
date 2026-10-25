@@ -487,9 +487,11 @@ type TopicCandidateCheckpoint = TopicCandidateCheckpointEntry['__topic_candidate
 
 export function serializeDiscoveryCache(
   sources: DiscoveredSource[],
-  checkpoint: TopicCandidateCheckpoint
+  checkpoint: TopicCandidateCheckpoint | null = null
 ): PersistedDiscoveryCacheEntry[] {
-  return [...sources, { __topic_candidate_checkpoint: checkpoint }];
+  return checkpoint
+    ? [...sources, { __topic_candidate_checkpoint: checkpoint }]
+    : sources;
 }
 
 export function readDiscoveryCache(value: unknown): {
@@ -1027,8 +1029,11 @@ export async function processJob(
         discoveredSources = parseSources(sourcesText);
         // Persist so a resumed invocation does not re-spend this AI call.
         deadline.check();
+        // A source refresh updates the source entries while retaining any
+        // structurally valid topic response checkpoint already loaded above.
+        const sourceCache = serializeDiscoveryCache(discoveredSources, topicCandidateCheckpoint);
         const savedSources = await saveJobSources(
-          job.id, job.claim_token!, job.claim_version, discoveredSources, deadline.signal
+          job.id, job.claim_token!, job.claim_version, sourceCache, deadline.signal
         );
         if (!savedSources) throw new Error('Failed to persist discovered source checkpoint');
       }

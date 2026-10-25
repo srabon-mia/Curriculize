@@ -129,16 +129,25 @@ describe('topic discovery diagnostics', () => {
     expect(firstCache.topicCheckpoint?.responseText).toBe(responseText);
 
     const processed: string[] = [];
+    let candidateChecks = 0;
     await expect(processCandidatesFromCheckpoint({
       candidates: JSON.parse(firstCache.topicCheckpoint!.responseText) as Array<{ title: string }>,
       startAt: firstCache.topicCheckpoint!.nextCandidateIndex,
-      checkBeforeCandidate: () => { throw new Error('Processor work budget reached'); },
+      checkBeforeCandidate: () => {
+        candidateChecks++;
+        if (candidateChecks > 1) throw new Error('Processor work budget reached');
+      },
       processCandidate: async (candidate) => { processed.push(candidate.title); },
       saveNextCandidateIndex: async (nextCandidateIndex) => {
-      savedCache = serializeDiscoveryCache(sources, { ...firstCache.topicCheckpoint!, nextCandidateIndex });
+        savedCache = serializeDiscoveryCache(sources, { ...firstCache.topicCheckpoint!, nextCandidateIndex });
       },
     })).rejects.toThrow('Processor work budget reached');
-    expect(processed).toEqual([]);
+    expect(processed).toEqual(['A']);
+    expect(readDiscoveryCache(savedCache).topicCheckpoint?.nextCandidateIndex).toBe(1);
+
+    // A source discovery that returns no usable sources must still preserve
+    // the candidate response checkpoint in the shared cache.
+    savedCache = serializeDiscoveryCache([], readDiscoveryCache(savedCache).topicCheckpoint);
 
     // The subsequent invocation resumes the saved response; it does not call
     // Azure again and advances a durable cursor after each candidate.
@@ -170,6 +179,56 @@ describe('topic discovery diagnostics', () => {
       responseText: 'not valid JSON',
       nextCandidateIndex: 0,
     })).topicCheckpoint).toBeNull();
+  });
+
+  it('preserves a valid candidate checkpoint when updating an empty source cache', () => {
+    const checkpoint = {
+      topicId: 'topic-1', attemptIndex: 0, promptHash: 'a'.repeat(64),
+      responseText: '[]', nextCandidateIndex: 0,
+    };
+    const existingCache = serializeDiscoveryCache([], checkpoint);
+
+    const updatedCache = serializeDiscoveryCache([], readDiscoveryCache(existingCache).topicCheckpoint);
+
+    expect(readDiscoveryCache(updatedCache).topicCheckpoint).toEqual(checkpoint);
+  });
+
+  it('updates source entries while retaining a valid candidate checkpoint', () => {
+    const checkpoint = {
+      topicId: 'topic-1', attemptIndex: 0, promptHash: 'a'.repeat(64),
+      responseText: '[]', nextCandidateIndex: 0,
+    };
+    const existingCache = serializeDiscoveryCache([
+      { domain: 'old.example', name: 'Old', why: 'old', best_for: 'old' },
+    ], checkpoint);
+    const updatedSources = [
+      { domain: 'new.example', name: 'New', why: 'new', best_for: 'new' },
+    ];
+
+    const updatedCache = serializeDiscoveryCache(updatedSources, readDiscoveryCache(existingCache).topicCheckpoint);
+    const decoded = readDiscoveryCache(updatedCache);
+
+    expect(decoded.sources).toEqual(updatedSources);
+    expect(decoded.topicCheckpoint).toEqual(checkpoint);
+  });
+
+  it('drops invalid checkpoints and rejects stale checkpoint keys after a source update', () => {
+    const valid = {
+      topicId: 'topic-1', attemptIndex: 0, promptHash: 'a'.repeat(64),
+      responseText: '[]', nextCandidateIndex: 0,
+    };
+    const invalidCache = serializeDiscoveryCache([], { ...valid, nextCandidateIndex: 1 });
+
+    const updatedInvalidCache = serializeDiscoveryCache([], readDiscoveryCache(invalidCache).topicCheckpoint);
+    const invalidRead = readDiscoveryCache(updatedInvalidCache);
+    expect(invalidRead.topicCheckpoint).toBeNull();
+    expect(getResumableTopicDiscovery(invalidRead.topicCheckpoint, 'topic-1', 0, 'a'.repeat(64))).toBeNull();
+
+    const updatedValidCache = serializeDiscoveryCache([], valid);
+    const staleRead = readDiscoveryCache(updatedValidCache);
+    expect(getResumableTopicDiscovery(staleRead.topicCheckpoint, 'other-topic', 0, 'a'.repeat(64))).toBeNull();
+    expect(getResumableTopicDiscovery(staleRead.topicCheckpoint, 'topic-1', 1, 'a'.repeat(64))).toBeNull();
+    expect(getResumableTopicDiscovery(staleRead.topicCheckpoint, 'topic-1', 0, 'b'.repeat(64))).toBeNull();
   });
 
   it('does not advance the candidate cursor after a persistence failure', async () => {
