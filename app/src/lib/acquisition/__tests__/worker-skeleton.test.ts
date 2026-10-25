@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { classifySkeletonCheckpoint, materializeSkeletonRows, releaseDeadlineYield, saveSkeletonBeforeMaterialization, stableAttemptUuid } from '@/lib/acquisition/worker';
+import { classifySkeletonCheckpoint, getUncheckpointedTopicIds, materializeSkeletonRows, reconstructCheckpointedLegacySkeleton, releaseDeadlineYield, saveSkeletonBeforeMaterialization, stableAttemptUuid } from '@/lib/acquisition/worker';
 import type { JobClaimResult } from '@/lib/acquisition/jobTypes';
 
 const skeleton = {
@@ -103,6 +103,46 @@ describe('durable skeleton materialization', () => {
     expect(classifySkeletonCheckpoint(skeleton, 0).status).toBe('persisted');
     expect(classifySkeletonCheckpoint(undefined, 2)).toEqual({ status: 'legacy_ambiguous' });
     expect(classifySkeletonCheckpoint({ nodes: [] }, 0)).toEqual({ status: 'invalid_checkpoint' });
+  });
+
+  it('reconstructs a legacy skeleton only when saved topics and checkpoints match exactly', () => {
+    const legacy = {
+      curriculum: { title: 'Algebra', source_type: 'adapted', source_attribution: 'Guide', source_url: null },
+      topics: [
+        { id: 'topic-1', title: 'Expressions', order_index: 1, external_key: 'topic-1' },
+        { id: 'topic-2', title: 'Equations', order_index: 2, external_key: 'topic-2' },
+      ],
+      understandings: [
+        { node_id: 'topic-1', code: 'A.1', description: 'Evaluate expressions', external_key: 'A.1', order_index: 0 },
+        { node_id: 'topic-2', code: 'A.2', description: 'Solve equations', external_key: 'A.2', order_index: 0 },
+      ],
+      completedTopicIds: ['topic-1', 'topic-2'],
+    };
+
+    const recovered = {
+      ...skeleton,
+      nodes: skeleton.nodes.map((node, index) => ({ ...node, order_index: index + 1 })),
+    };
+    expect(reconstructCheckpointedLegacySkeleton(legacy)).toEqual(recovered);
+    expect(reconstructCheckpointedLegacySkeleton({ ...legacy, completedTopicIds: ['topic-1'] })).toEqual(recovered);
+    expect(getUncheckpointedTopicIds(['topic-1', 'topic-2'], legacy.completedTopicIds)).toEqual([]);
+    expect(getUncheckpointedTopicIds(['topic-1', 'topic-2'], ['topic-1'])).toEqual(['topic-2']);
+    expect(reconstructCheckpointedLegacySkeleton({ ...legacy, completedTopicIds: [] })).toBeNull();
+    expect(reconstructCheckpointedLegacySkeleton({ ...legacy, completedTopicIds: ['topic-1', 'topic-1'] })).toBeNull();
+    expect(reconstructCheckpointedLegacySkeleton({ ...legacy, completedTopicIds: ['unknown-topic'] })).toBeNull();
+    expect(reconstructCheckpointedLegacySkeleton({ ...legacy, completedTopicIds: [1] })).toBeNull();
+    expect(reconstructCheckpointedLegacySkeleton({
+      ...legacy,
+      topics: legacy.topics.map((topic) => ({ ...topic, order_index: 0, external_key: 'topic-0' })),
+    })).toBeNull();
+    expect(reconstructCheckpointedLegacySkeleton({
+      ...legacy,
+      understandings: legacy.understandings.map((row) => ({ ...row, external_key: 'mismatched-key' })),
+    })).toBeNull();
+    expect(reconstructCheckpointedLegacySkeleton({
+      ...legacy,
+      understandings: [...legacy.understandings, { ...legacy.understandings[0], code: 'A.1' }],
+    })).toBeNull();
   });
 
   it.each([1, 2, 3])('repairs after interruption at metadata/node/understanding write %i', async (writeBoundary) => {

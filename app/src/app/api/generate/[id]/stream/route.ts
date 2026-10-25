@@ -723,6 +723,7 @@ export async function monitorObservedJob(
   let lastCheckpointVersion = initialCheckpointVersion;
   let pollsWithoutProgress = 0;
   let progressDuringWindow = false;
+  let pendingDuringWindow = false;
 
   const waitForNextPoll = () => new Promise<void>((resolve) => {
     let settled = false;
@@ -761,15 +762,14 @@ export async function monitorObservedJob(
       close();
       return;
     } else if (current.status === "pending") {
+      pendingDuringWindow = true;
       send("status", {
         message: "Generation is queued and will resume from its saved checkpoints.",
         step: "pending",
         job_id: jobId,
       });
-      // The next GET uses claim_next_job and resumes this same durable job.
-      send("continue", { job_id: jobId });
-      close();
-      return;
+      // GET is a read-only observer. Leave claiming to /api/jobs/process and
+      // keep this connection open until the processor claims or completes it.
     } else {
       const checkpointVersion = typeof current.checkpoint_version === "number"
         ? current.checkpoint_version
@@ -814,7 +814,7 @@ export async function monitorObservedJob(
     close();
     return;
   }
-  if (progressDuringWindow) {
+  if (progressDuringWindow || pendingDuringWindow) {
     send("continue", { job_id: jobId });
   } else {
     send("paused", {
@@ -834,7 +834,7 @@ export async function GET(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
-  return legacyGenerationGet(request, context);
+  return observeGeneration(request, context);
 }
 
 /** Read-only observer retained for status checks and focused regression tests. */
@@ -844,20 +844,29 @@ export async function observeGeneration(
 ) {
   const { id } = await params;
   const encoder = new TextEncoder();
+  const observerController = new AbortController();
+  const abortObserver = () => observerController.abort();
   let closed = false;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      request.signal.addEventListener("abort", abortObserver, { once: true });
+      if (request.signal.aborted) observerController.abort();
       const send = (event: string, data: unknown) => {
-        if (closed || request.signal.aborted) return;
+        if (closed || observerController.signal.aborted) return;
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       };
       const close = () => {
         if (closed) return;
         closed = true;
+        request.signal.removeEventListener("abort", abortObserver);
         try { controller.close(); } catch { /* client disconnected */ }
       };
 
       try {
+        if (observerController.signal.aborted) {
+          close();
+          return;
+        }
         const { data: curriculum, error: curriculumError } = await supabase
           .from("curricula")
           .select("title, notes")
@@ -963,7 +972,7 @@ export async function observeGeneration(
         await monitorObservedJob(
           jobId,
           id,
-          request.signal,
+          observerController.signal,
           send,
           close,
           typeof latestJob?.checkpoint_version === "number" ? latestJob.checkpoint_version : 0
@@ -975,8 +984,10 @@ export async function observeGeneration(
       }
     },
     cancel() {
-      // Closing the browser stream stops observation only; it never fails the job.
+      // Closing the browser stream stops polling only; it never fails the job.
       closed = true;
+      request.signal.removeEventListener("abort", abortObserver);
+      observerController.abort();
     },
   });
 

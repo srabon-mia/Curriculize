@@ -287,6 +287,99 @@ interface Skeleton {
   nodes: SkeletonNode[];
 }
 
+/**
+ * Recover the pre-worker stream's structure only when at least one completed
+ * topic proves the legacy writer passed its full structure-materialization
+ * loop, and every saved row and checkpoint ID is internally consistent.
+ */
+export function reconstructCheckpointedLegacySkeleton(input: {
+  curriculum: {
+    title: unknown;
+    source_type: unknown;
+    source_attribution: unknown;
+    source_url: unknown;
+  };
+  topics: Array<{
+    id: string;
+    title: string;
+    order_index: number;
+    external_key: string | null;
+  }>;
+  understandings: Array<{
+    node_id: string;
+    code: string | null;
+    description: string;
+    external_key: string | null;
+    order_index: number;
+  }>;
+  completedTopicIds: unknown;
+}): Skeleton | null {
+  const { curriculum, topics, understandings, completedTopicIds } = input;
+  if (
+    typeof curriculum.title !== 'string' || !curriculum.title.trim() ||
+    (curriculum.source_type !== 'adapted' && curriculum.source_type !== 'ai_organized') ||
+    !(curriculum.source_attribution === null || typeof curriculum.source_attribution === 'string') ||
+    !(curriculum.source_url === null || typeof curriculum.source_url === 'string') ||
+    !Array.isArray(completedTopicIds) || completedTopicIds.length === 0 ||
+    topics.length === 0 || topics.length > 12
+  ) return null;
+
+  const completedIds = new Set(completedTopicIds.filter((id): id is string => typeof id === 'string'));
+  if (completedIds.size !== completedTopicIds.length || completedIds.size > topics.length) return null;
+
+  const topicIds = new Set<string>();
+  const orders = new Set<number>();
+  const orderedTopics = [...topics].sort((a, b) => a.order_index - b.order_index);
+  for (const topic of orderedTopics) {
+    if (
+      !topic.id || topicIds.has(topic.id) ||
+      typeof topic.title !== 'string' || !topic.title.trim() ||
+      !Number.isSafeInteger(topic.order_index) || topic.order_index <= 0 || orders.has(topic.order_index) ||
+      topic.external_key !== `topic-${topic.order_index}`
+    ) return null;
+    topicIds.add(topic.id);
+    orders.add(topic.order_index);
+  }
+  if ([...completedIds].some((id) => !topicIds.has(id))) return null;
+  if (understandings.some((row) => !topicIds.has(row.node_id))) return null;
+
+  const nodes: SkeletonNode[] = [];
+  for (const topic of orderedTopics) {
+    const rows = understandings
+      .filter((row) => row.node_id === topic.id)
+      .sort((a, b) => a.order_index - b.order_index);
+    if (rows.length === 0) return null;
+    const majorUnderstandings: SkeletonNode['major_understandings'] = [];
+    const understandingKeys = new Set<string>();
+    for (let index = 0; index < rows.length; index++) {
+      const row = rows[index];
+      const expectedExternalKey = row.code ?? `${topic.order_index}.${index + 1}`;
+      if (
+        row.order_index !== index || typeof row.description !== 'string' || !row.description.trim() ||
+        !(row.code === null || (typeof row.code === 'string' && row.code.trim())) ||
+        row.external_key !== expectedExternalKey || understandingKeys.has(expectedExternalKey)
+      ) return null;
+      understandingKeys.add(expectedExternalKey);
+      majorUnderstandings.push({ code: row.code, description: row.description });
+    }
+    nodes.push({ title: topic.title, order_index: topic.order_index, major_understandings: majorUnderstandings });
+  }
+
+  return {
+    title: curriculum.title,
+    source_type: curriculum.source_type,
+    source_attribution: curriculum.source_attribution,
+    source_url: curriculum.source_url,
+    nodes,
+  };
+}
+
+/** Preserve the worker's existing checkpoint-resume rule in a testable form. */
+export function getUncheckpointedTopicIds(topicIds: string[], completedTopicIds: Iterable<string>): string[] {
+  const completed = new Set(completedTopicIds);
+  return topicIds.filter((topicId) => !completed.has(topicId));
+}
+
 function parseSkeleton(text: string): Skeleton | null {
   try {
     const match = text.match(/\{[\s\S]*\}/);
@@ -648,7 +741,7 @@ export async function processJob(
     if (!jobState) throw new Error('Unable to read acquisition job checkpoint');
     const storedSkeletonValue = (jobState.result_data as { skeleton?: unknown } | null)?.skeleton;
     const { data: existingTopics, error: existingTopicsError } = await withAbortSignal(supabase
-      .from('nodes').select('id').eq('curriculum_id', curriculumId), deadline.signal);
+      .from('nodes').select('id, title, order_index, external_key').eq('curriculum_id', curriculumId), deadline.signal);
     deadline.check();
     if (existingTopicsError) throw new Error(`Failed to inspect existing topic rows: ${existingTopicsError.message}`);
     const skeletonState = classifySkeletonCheckpoint(storedSkeletonValue, existingTopics?.length ?? 0);
@@ -657,9 +750,44 @@ export async function processJob(
       throw new Error('Persisted skeleton checkpoint is malformed; manual recovery required');
     }
     if (skeletonState.status === 'legacy_ambiguous') {
-      return await failJob(job.id, job.claim_token!, job.claim_version,
-        'legacy_structure_without_skeleton: existing topic rows cannot prove full structure; operator recovery required', deadline.signal)
-        ? 'failed' : 'ownership_lost';
+      const rawCompletedTopicIds = (jobState.result_data as { checkpoint?: { completedTopicIds?: unknown } } | null)
+        ?.checkpoint?.completedTopicIds;
+      let recoveredSkeleton: Skeleton | null = null;
+      if (Array.isArray(rawCompletedTopicIds) && existingTopics?.length) {
+        const topicIds = existingTopics.map((topic) => topic.id as string);
+        const { data: existingUnderstandings, error: understandingsError } = await withAbortSignal(supabase
+          .from('major_understandings')
+          .select('node_id, code, description, external_key, order_index')
+          .in('node_id', topicIds), deadline.signal);
+        deadline.check();
+        if (understandingsError) throw new Error(`Failed to inspect legacy understanding rows: ${understandingsError.message}`);
+        recoveredSkeleton = reconstructCheckpointedLegacySkeleton({
+          curriculum,
+          topics: existingTopics as Array<{ id: string; title: string; order_index: number; external_key: string | null }>,
+          understandings: (existingUnderstandings ?? []) as Array<{
+            node_id: string; code: string | null; description: string; external_key: string | null; order_index: number;
+          }>,
+          completedTopicIds: rawCompletedTopicIds,
+        });
+      }
+      if (!recoveredSkeleton) {
+        return await failJob(job.id, job.claim_token!, job.claim_version,
+          'legacy_structure_without_skeleton: saved rows and topic checkpoints do not prove a complete, consistent structure; operator recovery required', deadline.signal)
+          ? 'failed' : 'ownership_lost';
+      }
+      console.warn('[worker] Reconstructing legacy skeleton from fully checkpointed rows', {
+        job_id: job.id,
+        topic_count: recoveredSkeleton.nodes.length,
+      });
+      const saveStatus = await saveJobSkeleton({
+        jobId: job.id, claimToken: job.claim_token!, claimVersion: job.claim_version,
+        skeleton: recoveredSkeleton, signal: deadline.signal,
+      });
+      if (saveStatus === 'ownership_lost') return 'ownership_lost';
+      if (saveStatus !== 'saved' && saveStatus !== 'already_saved') {
+        throw new Error(`Could not persist reconstructed legacy skeleton: ${saveStatus}`);
+      }
+      skeleton = recoveredSkeleton;
     }
 
     // Source discovery cache remains independent of the structural checkpoint.
@@ -748,6 +876,9 @@ export async function processJob(
         ? rawCompletedTopics.filter((id): id is string => typeof id === "string")
         : []
     );
+    const remainingTopicIds = new Set(getUncheckpointedTopicIds(
+      nodeIds.map(({ nodeId }) => nodeId), completedTopics
+    ));
 
     // Step 4: Source discovery (one-time; cached in result_data for resume)
     let discoveredSources: DiscoveredSource[] = cachedSources;
@@ -794,7 +925,7 @@ export async function processJob(
       const { nodeId, node } = nodeIds[i];
 
       // Skip already-completed topics (resume from checkpoint)
-      if (completedTopics.has(nodeId)) {
+      if (!remainingTopicIds.has(nodeId)) {
         console.log(`[worker] Skipping topic ${nodeId} - already completed (checkpoint)`);
         continue;
       }

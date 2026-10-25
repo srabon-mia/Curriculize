@@ -422,9 +422,10 @@ vi.mock("@/lib/acquisition/jobTypes", () => ({
 }));
 
 // Import the route AFTER all mocks are registered
-// Exercise the production inline generation path and retain direct coverage of
-// the read-only observer used to inspect durable job state.
-const { GET, observeGeneration, claimOrRegisterJob, monitorObservedJob } = await import("./route");
+// Existing detailed pipeline tests exercise the retained legacy helper. The
+// exported GET is tested separately as the production read-only observer.
+const { GET: routeGET, legacyGenerationGet, observeGeneration, claimOrRegisterJob, monitorObservedJob } = await import("./route");
+const GET = legacyGenerationGet;
 
 // ============================================================
 // Test data factories
@@ -971,8 +972,12 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("fail_job", expect.anything());
     });
 
-    it("hands a released pending job to the normal claim path", async () => {
-      observerReadSequence = [{ status: "pending", error: null, checkpoint_version: 7, result_data: { checkpoint: { completedTopicIds: ["t1"] }, batchCheckpoint: { completedTopicIds: ["t1"] } } }];
+    it("keeps observing a pending job until the durable processor claims it", async () => {
+      observerReadSequence = [
+        { status: "pending", error: null, checkpoint_version: 7, result_data: { checkpoint: { completedTopicIds: ["t1"] }, batchCheckpoint: { completedTopicIds: ["t1"] } } },
+        { status: "running", error: null, checkpoint_version: 8, result_data: { checkpoint: { completedTopicIds: ["t1"] }, batchCheckpoint: { completedTopicIds: ["t1"] } } },
+        { status: "completed", error: null, checkpoint_version: 8, result_data: {} },
+      ];
       const events: string[] = [];
       const controller = new AbortController();
       let closed = false;
@@ -980,9 +985,26 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       await monitorObservedJob("job-1", "test-curriculum-id", controller.signal,
         (event) => events.push(event), () => { closed = true; }, 6);
 
-      expect(events).toEqual(["status", "continue"]);
+      expect(events).toEqual(["status", "status", "complete"]);
       expect(closed).toBe(true);
       expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("release_job_claim", expect.anything());
+    });
+
+    it("reconnects after the observer window when a job is still pending", async () => {
+      observerReadSequence = Array.from({ length: 21 }, () => ({
+        status: "pending", error: null, checkpoint_version: 7,
+        result_data: { checkpoint: { completedTopicIds: ["t1"] } },
+      }));
+      const events: string[] = [];
+      let closed = false;
+
+      await monitorObservedJob("job-1", "test-curriculum-id", new AbortController().signal,
+        (event) => events.push(event), () => { closed = true; }, 7);
+
+      expect(events.at(-1)).toBe("continue");
+      expect(events).not.toContain("paused");
+      expect(closed).toBe(true);
+      expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("claim_next_job", expect.anything());
     });
 
     it("stops polling a non-progressing running job with a recoverable pause, without failing it", async () => {
@@ -2064,6 +2086,31 @@ describe("Durable generation stream observer", () => {
     });
   }
 
+  it("routes production GET to the read-only observer, not inline AI or resource discovery", async () => {
+    durableJobRow = {
+      id: "job-complete",
+      status: "completed",
+      error: null,
+      result_data: { checkpoint: { completedTopicIds: ["topic-1"] } },
+      checkpoint_version: 1,
+    };
+    const { getAIProvider } = await import("@/lib/ai");
+    const { discoverVerifiedResource } = await import("@/lib/learningEngine");
+    vi.mocked(getAIProvider).mockClear();
+    vi.mocked(discoverVerifiedResource).mockClear();
+
+    const response = await routeGET(request(), {
+      params: Promise.resolve({ id: "test-curriculum-id" }),
+    });
+    const events = await readEvents(response, 1);
+
+    expect(events.join("\n")).toContain('event: complete');
+    expect(vi.mocked(getAIProvider)).not.toHaveBeenCalled();
+    expect(vi.mocked(discoverVerifiedResource)).not.toHaveBeenCalled();
+    expect(mockSupabaseClient.rpc).not.toHaveBeenCalled();
+    expect(capturedInserts.filter((entry) => entry.table === "resources")).toHaveLength(0);
+  });
+
   it("observes a running job after the prior stream owner disappeared, without doing discovery", async () => {
     durableJobRow = {
       id: "job-1", status: "running", error: null, claim_token: "prior-owner",
@@ -2077,6 +2124,23 @@ describe("Durable generation stream observer", () => {
     expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("reserve_ai_call", expect.anything());
     expect(durableJobRow.status).toBe("running");
     expect(durableJobRow.result_data.checkpoint.completedTopicIds).toEqual(["topic-1"]);
+  });
+
+  it("stops the observer poll timer when the response stream is cancelled", async () => {
+    durableJobRow = {
+      id: "job-running", status: "running", error: null,
+      result_data: { checkpoint: { completedTopicIds: [] } }, checkpoint_version: 1,
+    };
+    const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
+    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+    const reader = response.body!.getReader();
+
+    await reader.read(); // Connected status
+    await reader.read(); // Running status; monitor has entered its poll wait
+    await reader.cancel();
+
+    expect(clearTimeoutSpy).toHaveBeenCalled();
+    clearTimeoutSpy.mockRestore();
   });
 
   it("creates one pending job and reuses it on reconnect without taking a processing claim", async () => {

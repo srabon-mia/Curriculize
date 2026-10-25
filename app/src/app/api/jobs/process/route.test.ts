@@ -154,6 +154,29 @@ describe("POST /api/jobs/process", () => {
     await expect(response.json()).resolves.toMatchObject({ status: "yielded", jobId: "job-yield" });
   });
 
+  it("passes a claimed checkpointed job to the durable worker so it can resume", async () => {
+    const resumableJob = {
+      id: "hydroponics-job",
+      curriculum_id: "hydroponics-curriculum",
+      status: "running",
+      claim_token: "fresh-claim-token",
+      claim_version: 1,
+      result_data: {
+        checkpoint: { completedTopicIds: Array.from({ length: 8 }, (_, i) => `topic-${i + 1}`) },
+        batchCheckpoint: { completedTopicIds: ["topic-1"] },
+      },
+      checkpoint_version: 18,
+    };
+    (claimNextJob as ReturnType<typeof vi.fn>).mockResolvedValue(resumableJob);
+    (processJob as ReturnType<typeof vi.fn>).mockResolvedValue("yielded");
+
+    const response = await POST(createRequest(`Bearer ${TEST_CRON_SECRET}`));
+
+    expect(response.status).toBe(202);
+    expect(await response.json()).toMatchObject({ status: "yielded", jobId: "hydroponics-job" });
+    expect(processJob).toHaveBeenCalledWith(resumableJob, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
   it("does not report a failed fenced release as a successful job completion", async () => {
     (claimNextJob as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "job-lost", claim_token: "token" });
     (processJob as ReturnType<typeof vi.fn>).mockResolvedValue("ownership_lost");
