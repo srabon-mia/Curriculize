@@ -55,14 +55,11 @@ export async function POST(request: Request) {
 
   // Cold path: create a draft curriculum (no acquisition_jobs row here).
   // The curriculum is created with created_by=NULL to support unauthenticated
-  // (guest) generation. The SSE stream (opened next by the frontend at
-  // /generate/{id}) claims or registers the acquisition job via
-  // claimOrRegisterJob() — this atomically claims an existing pending job
-  // via the claim_next_job RPC, or inserts a new 'running' job with a real
-  // claim_token. This ensures a single exclusive owner per curriculum and
-  // prevents double-processing with the cron worker (which only claims
-  // 'pending' jobs). No job_id is returned — the SSE stream owns the job
-  // lifecycle end-to-end and reports progress via SSE events.
+  // (guest) generation. The SSE stream registers or observes one durable job,
+  // then releases any claim it acquired. /api/jobs/process is the only path
+  // that performs generation work, with lease fencing and checkpoint recovery.
+  // No job_id is returned because the stream resolves the durable job by
+  // curriculum id and reports its saved state via SSE.
   const { data: draft, error: insertError } = await supabase
     .from("curricula")
     .insert({

@@ -46,6 +46,17 @@ export interface JobResultData {
   totalCandidatesProcessed?: number;
   topicsCompleted?: string[];
   resourcesFound?: number;
+  skeleton?: {
+    title: string;
+    source_type: string;
+    source_attribution: string | null;
+    source_url: string | null;
+    nodes: Array<{
+      title: string;
+      order_index: number;
+      major_understandings: Array<{ code: string | null; description: string }>;
+    }>;
+  };
   checkpoint?: {
     completedTopicIds: string[];
     updatedAt: string;
