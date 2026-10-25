@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { classifySkeletonCheckpoint, getUncheckpointedTopicIds, materializeSkeletonRows, reconstructCheckpointedLegacySkeleton, releaseDeadlineYield, saveSkeletonBeforeMaterialization, stableAttemptUuid } from '@/lib/acquisition/worker';
+import { classifySkeletonCheckpoint, getUncheckpointedTopicIds, materializeSkeletonRows, reconstructCheckpointedLegacySkeleton, releaseDeadlineYield, runBoundedStructureCall, saveSkeletonBeforeMaterialization, stableAttemptUuid } from '@/lib/acquisition/worker';
 import type { JobClaimResult } from '@/lib/acquisition/jobTypes';
 
 const skeleton = {
@@ -74,6 +74,29 @@ function inMemorySupabase(failAtWrite?: number) {
 }
 
 describe('durable skeleton materialization', () => {
+  it('allows structure generation to finish beyond 18s but enforces its own hard timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      let callSignal: AbortSignal | undefined;
+      const pending = runBoundedStructureCall((signal) => {
+        callSignal = signal;
+        return new Promise<string>((resolve) => setTimeout(() => resolve('structure'), 20_000));
+      }, 120_000);
+      await vi.advanceTimersByTimeAsync(20_000);
+      await expect(pending).resolves.toBe('structure');
+      expect(callSignal?.aborted).toBe(false);
+
+      const timeoutCall = runBoundedStructureCall((signal) => new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+      }), 120_000);
+      const timeoutAssertion = expect(timeoutCall).rejects.toThrow('Aborted');
+      await vi.advanceTimersByTimeAsync(120_000);
+      await timeoutAssertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('creates stable per-job reservation UUIDs for interrupted-call replay', () => {
     const first = stableAttemptUuid('job-1', 'topic', 'topic-1', '0');
     expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
@@ -89,6 +112,25 @@ describe('durable skeleton materialization', () => {
     );
     expect(order).toEqual(['checkpoint', 'insert']);
     expect(result).toEqual({ status: 'materialized', result: ['topic'] });
+  });
+
+  it('keeps a slow structure result durable before the ordinary worker budget yields', async () => {
+    const calls: string[] = [];
+    let checkpoint: typeof skeleton | null = null;
+    // Models a structure call finishing after the 18s work budget: the fenced
+    // checkpoint write succeeds, then materialization notices the yield.
+    await expect(saveSkeletonBeforeMaterialization(
+      async () => { calls.push('save'); checkpoint = skeleton; return 'saved'; },
+      async () => { calls.push('materialize'); throw new Error('worker budget reached'); },
+    )).rejects.toThrow('worker budget reached');
+    expect(checkpoint).toEqual(skeleton);
+    expect(calls).toEqual(['save', 'materialize']);
+
+    // On the next invocation the persisted structure is reused, so no second
+    // expensive structure-generation call is needed.
+    const resumed = classifySkeletonCheckpoint(checkpoint, 0);
+    expect(resumed.status).toBe('persisted');
+    expect(calls.filter((call) => call === 'save')).toHaveLength(1);
   });
 
   it('does not insert when the fenced checkpoint RPC reports ownership loss', async () => {

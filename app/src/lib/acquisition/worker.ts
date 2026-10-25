@@ -45,6 +45,10 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
 const MAX_TOPICS_PER_INVOCATION = 2;
 const MAX_COVERAGE_ATTEMPTS = 2;
+// Azure structure generation can exceed the ordinary 18s processor work
+// budget. Give this one call a bounded window, then checkpoint its result
+// using the still-fenced claim before honoring the invocation yield.
+const SKELETON_CALL_TIMEOUT_MS = 120_000;
 
 class ResourcePersistenceError extends Error {
   constructor(message: string) {
@@ -195,6 +199,23 @@ function getAI(operation: string) {
 async function callAISkeleton(prompt: string, signal: AbortSignal): Promise<string> {
   const textResult: AICompleteResult = await getAI("worker_initial_discovery").complete(prompt, { useSearch: true, maxTokens: 4000, signal });
   return textResult.text;
+}
+
+export async function runBoundedStructureCall<T>(
+  call: (signal: AbortSignal) => Promise<T>,
+  timeoutMs = SKELETON_CALL_TIMEOUT_MS
+): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await call(controller.signal);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function callAISkeletonWithinBound(prompt: string): Promise<string> {
+  return runBoundedStructureCall((signal) => callAISkeleton(prompt, signal));
 }
 
 /**
@@ -835,7 +856,20 @@ export async function processJob(
       }
 
       deadline.checkBeforeExpensiveOperation();
-      const skeletonText = await callAISkeleton(skeletonPrompt, deadline.signal);
+      // This call may outlive the ordinary invocation budget. Its own hard
+      // timeout keeps it bounded; once it returns, persist the valuable result
+      // with the claim fence before yielding the rest of the worker pipeline.
+      let skeletonText: string;
+      try {
+        skeletonText = await callAISkeletonWithinBound(skeletonPrompt);
+      } catch (error) {
+        if (deadline.signal.aborted) {
+          const failed = await failJob(job.id, job.claim_token!, job.claim_version,
+            'Curriculum structure generation exceeded its bounded 120 second limit', deadline.cleanupSignal());
+          return failed ? 'failed' : 'ownership_lost';
+        }
+        throw error;
+      }
       const generatedSkeleton = parseSkeleton(skeletonText);
       if (!generatedSkeleton) {
         const { failJob } = await import('@/lib/acquisition/jobService');
@@ -843,15 +877,15 @@ export async function processJob(
           ? 'failed' : 'ownership_lost';
       }
 
-      deadline.check();
       const saveResult = await saveSkeletonBeforeMaterialization(
         () => saveJobSkeleton({
           jobId: job.id, claimToken: job.claim_token!, claimVersion: job.claim_version, skeleton: generatedSkeleton,
-          signal: deadline.signal,
+          signal: deadline.signal.aborted ? deadline.cleanupSignal() : deadline.signal,
         }),
         () => materializeSkeletonRows(supabase, curriculumId, generatedSkeleton, () => deadline.check(), deadline.signal)
       );
       if (saveResult.status === 'ownership_lost') return 'ownership_lost';
+      deadline.check();
       nodeIds.push(...saveResult.result);
       structureMaterialized = true;
       skeleton = generatedSkeleton;

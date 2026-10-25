@@ -877,34 +877,50 @@ async function handoffNewJob(
   jobId: string,
   onStarted: () => void
 ): Promise<HandoffState | { kind: "claimed" }> {
-  const deadline = createWorkerDeadline();
-  try {
-    let job;
+  // A single SSE request owns this dispatch loop. Every continuation obtains a
+  // fresh atomic claim; if another processor owns it, this observer never
+  // starts duplicate work. The loop is bounded below the route's 300s limit.
+  const dispatchDeadline = Date.now() + 270_000;
+  let started = false;
+  while (Date.now() < dispatchDeadline) {
+    const deadline = createWorkerDeadline();
     try {
-      job = await claimNextJob("curriculum_generation", curriculumId, deadline.signal);
-    } catch {
-      // The RPC may have committed before its response was lost. A status read
-      // cannot recover the claim token, so a running row is observed only.
-      const state = await readHandoffState(jobId);
-      if (state.kind === "running") return { ...state, ownershipUncertain: true };
-      if (state.kind === "terminal") return state;
-      throw new NewJobHandoffError("pending");
+      let job;
+      try {
+        job = await claimNextJob("curriculum_generation", curriculumId, deadline.signal);
+      } catch {
+        // The RPC may have committed before its response was lost. A status read
+        // cannot recover the claim token, so a running row is observed only.
+        const state = await readHandoffState(jobId);
+        if (state.kind === "running") return { ...state, ownershipUncertain: true };
+        if (state.kind === "terminal") return state;
+        throw new NewJobHandoffError("pending");
+      }
+
+      if (!job) {
+        const state = await readHandoffState(jobId);
+        if (state.kind === "running" || state.kind === "terminal") return state;
+        throw new NewJobHandoffError("pending");
+      }
+      if (job.id !== jobId) throw new NewJobHandoffError("indeterminate");
+      if (!started) {
+        started = true;
+        onStarted();
+      }
+      const outcome = await processJob(job, deadline);
+      if (outcome !== 'yielded') return { kind: "claimed" };
+    } finally {
+      deadline.dispose();
     }
 
-    if (!job) {
-      const state = await readHandoffState(jobId);
-      if (state.kind === "running" || state.kind === "terminal") return state;
-      throw new NewJobHandoffError("pending");
-    }
-    if (job.id !== jobId) {
-      throw new NewJobHandoffError("indeterminate");
-    }
-    onStarted();
-    await processJob(job, deadline);
-    return { kind: "claimed" };
-  } finally {
-    deadline.dispose();
+    const state = await readHandoffState(jobId);
+    if (state.kind !== 'pending') return state.kind === 'running'
+      ? { ...state, ownershipUncertain: true }
+      : state;
   }
+  // The route's bounded dispatch window ended. The last fenced yield leaves
+  // the durable job pending and eligible for the configured processor.
+  return { kind: "claimed" };
 }
 
 /**
