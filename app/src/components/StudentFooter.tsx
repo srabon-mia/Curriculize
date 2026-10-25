@@ -1,6 +1,6 @@
 import Link from "next/link";
 import Image from "next/image";
-import logo from "../../public/logo-cropped.png";
+import logo from "../../public/logo-footer.png";
 
 export function StudentFooter() {
   return (
