@@ -107,44 +107,52 @@ export async function materializeSkeletonRows(
   }).eq('id', curriculumId), signal);
   if (curriculumUpdateError) throw new Error(`Failed to save curriculum skeleton metadata: ${curriculumUpdateError.message}`);
 
-  const nodeIds: Array<{ nodeId: string; node: SkeletonNode }> = [];
-  for (const node of skeleton.nodes) {
-    checkDeadline();
-    const topicExternalKey = `topic-${node.order_index}`;
-    const { data: nodeRow, error: nodeError } = await withAbortSignal(supabase.from('nodes').upsert({
-      curriculum_id: curriculumId,
-      title: node.title,
-      order_index: node.order_index,
-      external_key: topicExternalKey,
-    }, { onConflict: 'curriculum_id,external_key' }).select('id').single(), signal);
-    if (nodeError || !nodeRow) throw new Error(`Failed to materialize ${topicExternalKey}: ${nodeError?.message ?? 'row missing'}`);
+  // Re-materialize in two bulk writes. The immutable skeleton is already fenced
+  // and durable, so a yield between these statements is repaired on resume. A
+  // per-node/per-understanding request loop consumed most of the 18s invocation
+  // budget before the independently persisted source-discovery step could start.
+  checkDeadline();
+  const expectedNodes = skeleton.nodes.map((node) => ({
+    curriculum_id: curriculumId,
+    title: node.title,
+    order_index: node.order_index,
+    external_key: `topic-${node.order_index}`,
+  }));
+  const { data: savedNodes, error: nodesError } = await withAbortSignal(supabase.from('nodes')
+    .upsert(expectedNodes, { onConflict: 'curriculum_id,external_key' })
+    .select('id, external_key'), signal);
+  if (nodesError || !savedNodes) throw new Error(`Failed to materialize topics: ${nodesError?.message ?? 'rows missing'}`);
+  const nodeByKey = new Map(savedNodes.map((row) => [row.external_key, row]));
+  if (nodeByKey.size !== skeleton.nodes.length) throw new Error('Skeleton materialization incomplete: topic rows missing');
 
-    const mus = node.major_understandings.map((mu, i) => ({
+  const mus = skeleton.nodes.flatMap((node) => {
+    const nodeRow = nodeByKey.get(`topic-${node.order_index}`);
+    if (!nodeRow) throw new Error(`Failed to materialize topic-${node.order_index}: row missing`);
+    return node.major_understandings.map((mu, i) => ({
       node_id: nodeRow.id,
       external_key: mu.code ?? `${node.order_index}.${i + 1}`,
       code: mu.code,
       description: mu.description,
       order_index: i,
     }));
-    checkDeadline();
-    const { error: musError } = await withAbortSignal(supabase.from('major_understandings')
-      .upsert(mus, { onConflict: 'node_id,external_key' }), signal);
-    if (musError) throw new Error(`Failed to materialize understandings for ${topicExternalKey}: ${musError.message}`);
-    nodeIds.push({ nodeId: nodeRow.id, node });
-  }
+  });
+  checkDeadline();
+  const { error: musError } = await withAbortSignal(supabase.from('major_understandings')
+    .upsert(mus, { onConflict: 'node_id,external_key' }), signal);
+  if (musError) throw new Error(`Failed to materialize understandings: ${musError.message}`);
 
   checkDeadline();
   const { data: materializedNodes, error: verifyNodesError } = await withAbortSignal(supabase.from('nodes')
     .select('id, external_key, title, order_index').eq('curriculum_id', curriculumId), signal);
   if (verifyNodesError) throw new Error(`Failed to verify topics: ${verifyNodesError.message}`);
   if ((materializedNodes ?? []).length !== skeleton.nodes.length) throw new Error('Skeleton materialization incomplete: topic rows missing');
-  const nodeByKey = new Map((materializedNodes ?? []).map((row) => [row.external_key, row]));
+  const verifiedNodeByKey = new Map((materializedNodes ?? []).map((row) => [row.external_key, row]));
   const nodeIdsForQuery = (materializedNodes ?? []).map((row) => row.id);
   const { data: materializedMus, error: verifyMusError } = await withAbortSignal(supabase.from('major_understandings')
     .select('id, node_id, external_key, code, description, order_index').in('node_id', nodeIdsForQuery), signal);
   if (verifyMusError) throw new Error(`Failed to verify understandings: ${verifyMusError.message}`);
   for (const expectedNode of skeleton.nodes) {
-    const row = nodeByKey.get(`topic-${expectedNode.order_index}`);
+    const row = verifiedNodeByKey.get(`topic-${expectedNode.order_index}`);
     if (!row || row.title !== expectedNode.title || row.order_index !== expectedNode.order_index) {
       throw new Error(`Skeleton materialization mismatch for topic-${expectedNode.order_index}`);
     }
@@ -162,7 +170,7 @@ export async function materializeSkeletonRows(
     }
   }
   return skeleton.nodes.map((node) => ({
-    nodeId: nodeByKey.get(`topic-${node.order_index}`)!.id,
+    nodeId: verifiedNodeByKey.get(`topic-${node.order_index}`)!.id,
     node,
   }));
 }

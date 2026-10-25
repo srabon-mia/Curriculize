@@ -14,6 +14,7 @@ function inMemorySupabase(failAtWrite?: number) {
   const nodes = new Map<string, Record<string, unknown>>();
   const understandings = new Map<string, Record<string, unknown>>();
   let write = 0;
+  let upsertCalls = 0;
   const makeSelect = (table: string) => {
     const filters: Array<[string, unknown]> = [];
     let inFilter: [string, unknown[]] | null = null;
@@ -35,34 +36,39 @@ function inMemorySupabase(failAtWrite?: number) {
   const client = {
     from(table: string) {
       return {
-        update: () => ({ eq: async () => ({ error: null }) }),
-        upsert(value: unknown) {
-          if (table === 'nodes') {
-            const row = value as Record<string, unknown>;
-            const key = `${row.curriculum_id}:${row.external_key}`;
-            return {
-              select() { return this; },
-              single: async () => {
-                write++;
-                if (write === failAtWrite) return { data: null, error: { message: 'injected interruption' } };
-                const saved = { ...(nodes.get(key) ?? {}), ...row, id: nodes.get(key)?.id ?? `node-${row.external_key}` };
-                nodes.set(key, saved);
-                return { data: { id: saved.id }, error: null };
-              },
-            };
-          }
+        update: () => ({ eq: async () => {
           write++;
-          if (write === failAtWrite) return Promise.resolve({ error: { message: 'injected interruption' } });
-          for (const row of value as Array<Record<string, unknown>>) {
-            const key = `${row.node_id}:${row.external_key}`;
-            understandings.set(key, { ...(understandings.get(key) ?? {}), ...row, id: understandings.get(key)?.id ?? `mu-${row.external_key}` });
-          }
-          return Promise.resolve({ error: null });
+          return write === failAtWrite ? { error: { message: 'injected interruption' } } : { error: null };
+        } }),
+        upsert(value: unknown) {
+          const rows = Array.isArray(value) ? value as Array<Record<string, unknown>> : [value as Record<string, unknown>];
+          const query = {
+            select() { return query; },
+            then(resolve: (result: unknown) => unknown, reject: (reason?: unknown) => unknown) {
+              write++;
+              upsertCalls++;
+              if (write === failAtWrite) return Promise.resolve({ data: null, error: { message: 'injected interruption' } }).then(resolve, reject);
+              const savedRows: Array<Record<string, unknown>> = rows.map((row) => {
+                if (table === 'nodes') {
+                  const key = `${row.curriculum_id}:${row.external_key}`;
+                  const saved = { ...(nodes.get(key) ?? {}), ...row, id: nodes.get(key)?.id ?? `node-${row.external_key}` };
+                  nodes.set(key, saved);
+                  return saved;
+                }
+                const key = `${row.node_id}:${row.external_key}`;
+                const saved = { ...(understandings.get(key) ?? {}), ...row, id: understandings.get(key)?.id ?? `mu-${row.external_key}` };
+                understandings.set(key, saved);
+                return saved;
+              });
+              return Promise.resolve({ data: table === 'nodes' ? savedRows.map((row) => ({ id: row.id, external_key: row.external_key })) : null, error: null }).then(resolve, reject);
+            },
+          };
+          return query;
         },
         select: () => makeSelect(table),
       };
     },
-    counts: () => ({ nodes: nodes.size, understandings: understandings.size }),
+    counts: () => ({ nodes: nodes.size, understandings: understandings.size, upsertCalls }),
   };
   return client;
 }
@@ -99,14 +105,24 @@ describe('durable skeleton materialization', () => {
     expect(classifySkeletonCheckpoint({ nodes: [] }, 0)).toEqual({ status: 'invalid_checkpoint' });
   });
 
-  it.each([1, 2, 3, 4])('repairs after interruption at node/understanding insert %i', async (writeBoundary) => {
+  it.each([1, 2, 3])('repairs after interruption at metadata/node/understanding write %i', async (writeBoundary) => {
     const client = inMemorySupabase(writeBoundary);
     await expect(materializeSkeletonRows(client as never, 'curriculum-1', skeleton)).rejects.toThrow('injected interruption');
     await materializeSkeletonRows(client as never, 'curriculum-1', skeleton);
-    expect(client.counts()).toEqual({ nodes: 2, understandings: 2 });
+    expect(client.counts()).toMatchObject({ nodes: 2, understandings: 2 });
     const completed = await materializeSkeletonRows(client as never, 'curriculum-1', skeleton);
     expect(completed.map((item) => item.nodeId)).toEqual(['node-topic-0', 'node-topic-1']);
-    expect(client.counts()).toEqual({ nodes: 2, understandings: 2 });
+    expect(client.counts()).toMatchObject({ nodes: 2, understandings: 2 });
+    expect(client.counts().upsertCalls).toBe(4 + writeBoundary - 1);
+  });
+
+  it('re-materializes a saved skeleton with two bounded upsert requests per resume', async () => {
+    const client = inMemorySupabase();
+    await materializeSkeletonRows(client as never, 'curriculum-1', skeleton);
+    const beforeResume = client.counts().upsertCalls;
+    await materializeSkeletonRows(client as never, 'curriculum-1', skeleton);
+    expect(client.counts().upsertCalls - beforeResume).toBe(2);
+    expect(client.counts()).toMatchObject({ nodes: 2, understandings: 2 });
   });
 
   it('checks deadline between durable insert operations', async () => {
@@ -114,12 +130,12 @@ describe('durable skeleton materialization', () => {
     const client = inMemorySupabase();
     await expect(materializeSkeletonRows(client as never, 'curriculum-1', skeleton, () => {
       checks++;
-      if (checks === 4) throw new Error('yield');
+      if (checks === 3) throw new Error('yield');
     })).rejects.toThrow('yield');
-    expect(client.counts().nodes).toBe(1);
-    expect(client.counts().understandings).toBe(1);
+    expect(client.counts().nodes).toBe(2);
+    expect(client.counts().understandings).toBe(0);
     await materializeSkeletonRows(client as never, 'curriculum-1', skeleton);
-    expect(client.counts()).toEqual({ nodes: 2, understandings: 2 });
+    expect(client.counts()).toMatchObject({ nodes: 2, understandings: 2 });
   });
 });
 
