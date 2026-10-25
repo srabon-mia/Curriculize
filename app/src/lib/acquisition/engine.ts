@@ -272,6 +272,39 @@ export async function acquireCandidate(
   if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const structuredContent = extractStructuredContentFromDoc(doc);
 
+  // The whole cleaned tree can contain heading or link text while exposing no
+  // instructional text blocks. Do not treat that shell/index text as usable
+  // fetched content; let the existing bounded candidate/coverage flow try the
+  // next result instead.
+  const extractedBlockWordCount = structuredContent.blocks.reduce(
+    (count, block) => count + (block.text.match(/[\p{L}\p{N}]+/gu)?.length ?? 0),
+    0
+  );
+  if (extractedBlockWordCount < 2) {
+    const reason = structuredContent.blocks.length === 0
+      ? "no_structured_text_blocks"
+      : "too_little_structured_text";
+    return {
+      candidate,
+      success: false,
+      error: {
+        code: "EMPTY_CONTENT",
+        message: "Page contains too little structured text to be a usable lesson resource",
+        details: {
+          finalUrl: acquired.finalUrl,
+          statusCode: acquired.statusCode,
+          contentType: acquired.contentType,
+          title: cleaned.title,
+          reason,
+          structuredBlockCount: structuredContent.blocks.length,
+          extractedBlockWordCount,
+          headingCount: structuredContent.statistics.headingCount,
+          linkCount: structuredContent.statistics.linkCount,
+        },
+      },
+    };
+  }
+
   const result: AcquisitionResult = {
     candidate,
     success: true,

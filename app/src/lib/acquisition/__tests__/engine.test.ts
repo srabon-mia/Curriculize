@@ -139,6 +139,72 @@ describe("HTTP 200 interstitial detection", () => {
       "This differential equations lesson derives the solution to a first-order system."
     )).toBe(false);
   });
+
+  test("rejects a successful course index response with headings and links but no lesson text", async () => {
+    const url = "https://ocw.example.edu/course/differential-equations";
+    const canonical = canonicalizeUrl(url);
+    if (!canonical) throw new Error("Test URL did not canonicalize");
+    const index = Array.from({ length: 26 }, (_, index) =>
+      `<h2>Lecture ${index + 1}</h2><a href="/lecture-${index + 1}">Slides and notes</a>`
+    ).join("");
+    vi.mocked(acquireUrl).mockResolvedValue({
+      finalUrl: url,
+      canonicalUrl: canonical,
+      statusCode: 200,
+      headers: { "content-type": "text/html" },
+      body: `<html><head><title>Differential Equations Course</title></head><body><main><h1>Differential Equations</h1>${index}</main></body></html>`,
+      contentType: "text/html",
+      charset: "utf-8",
+      contentHash: "course-index-content",
+      acquiredAt: new Date(0).toISOString(),
+      redirectChain: [],
+      resolvedIps: { ipv4: ["93.184.216.34"], ipv6: [] },
+    });
+
+    const result = await acquireCandidate({ url });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatchObject({
+      code: "EMPTY_CONTENT",
+      details: {
+        reason: "no_structured_text_blocks",
+        structuredBlockCount: 0,
+        headingCount: 27,
+        linkCount: 26,
+      },
+    });
+  });
+
+  test("rejects a technically successful challenge shell with unusably little text", async () => {
+    const url = "https://edx.example.org/course/differential-equations";
+    const canonical = canonicalizeUrl(url);
+    if (!canonical) throw new Error("Test URL did not canonicalize");
+    vi.mocked(acquireUrl).mockResolvedValue({
+      finalUrl: url,
+      canonicalUrl: canonical,
+      statusCode: 200,
+      headers: { "content-type": "text/html" },
+      body: "<html><body><main><h1>Loading</h1><div>Wait</div></main></body></html>",
+      contentType: "text/html",
+      charset: "utf-8",
+      contentHash: "dynamic-shell-content",
+      acquiredAt: new Date(0).toISOString(),
+      redirectChain: [],
+      resolvedIps: { ipv4: ["93.184.216.34"], ipv6: [] },
+    });
+
+    const result = await acquireCandidate({ url });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatchObject({
+      code: "EMPTY_CONTENT",
+      details: {
+        reason: "too_little_structured_text",
+        structuredBlockCount: 1,
+        extractedBlockWordCount: 1,
+      },
+    });
+  });
 });
 
 describe("validateCandidate", () => {

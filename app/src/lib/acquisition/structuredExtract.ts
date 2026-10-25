@@ -122,6 +122,15 @@ export function extractStructuredContentFromDoc(doc: CleanedDocument): Structure
       return; // Don't recurse into content children
     }
 
+    // Some course platforms (including courseware pages built with generic
+    // layout components) put prose directly in div/span nodes instead of p.
+    // Capture only a div's own non-link inline text. Nested divs and semantic
+    // blocks remain separate boundaries, and link-only menus are not content.
+    if (["body", "main", "article", "section", "div"].includes(node.tagName)) {
+      const text = extractDivInlineText(node);
+      if (text) blocks.push({ text, tagName: "div" });
+    }
+
     // Links
     if (node.tagName === "a" && node.attributes.href) {
       const href = resolveUrl(node.attributes.href, baseUrl);
@@ -232,6 +241,23 @@ function extractInlineText(node: ReturnType<typeof import("./parseHtml").parseHt
     }
   }
   return result;
+}
+
+/** Extract direct/inline text from a div, excluding links and nested blocks. */
+function extractDivInlineText(
+  node: ReturnType<typeof import("./parseHtml").parseHtmlSimple>
+): string {
+  let result = "";
+  for (const child of node.children) {
+    if (typeof child === "string") {
+      result += child;
+      continue;
+    }
+    if (child.tagName === "a" || TEXT_BLOCK_TAGS.has(child.tagName) ||
+        child.tagName.match(/^h[1-6]$/)) continue;
+    if (INLINE_TAGS.has(child.tagName)) result += extractDivInlineText(child);
+  }
+  return normalizeWhitespace(result);
 }
 
 /** Check if a code element has a pre ancestor */
