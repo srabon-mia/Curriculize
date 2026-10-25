@@ -4,7 +4,8 @@
  * Pure implementation, no AI, no external services.
  */
 
-import { promises as dns } from "dns";
+import { Resolver } from "node:dns/promises";
+import { promises as dns } from "node:dns";
 import { isIpBlocked, isHostnameBlocked } from "@/lib/deterministic/url";
 import { createDnsResolutionFailedError, createBlockedResolvedIpError, createBlockedUrlError } from "./errors";
 import type { AcquisitionError } from "./errors";
@@ -58,7 +59,8 @@ export function validateResolvedIps(ipv4: string[], ipv6: string[]): Acquisition
  * If the input is already an IP address (IPv4, IPv6, or IPv4-mapped IPv6),
  * skip DNS resolution and validate directly against the SSRF blocklist.
  */
-export async function resolveAndValidate(hostname: string): Promise<ResolvedHost> {
+export async function resolveAndValidate(hostname: string, signal?: AbortSignal): Promise<ResolvedHost> {
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const normalized = normalizeHostname(hostname);
 
   // Step 0: Check if input is an IP address (IPv4, IPv6, or IPv4-mapped IPv6)
@@ -99,16 +101,37 @@ export async function resolveAndValidate(hostname: string): Promise<ResolvedHost
   let resolvedIpv4: string[] = [];
   let resolvedIpv6: string[] = [];
 
-  try {
-    resolvedIpv4 = await dns.resolve4(normalized);
-  } catch {
-    // No A records or resolution failed - not an error yet
-  }
-
-  try {
-    resolvedIpv6 = await dns.resolve6(normalized);
-  } catch {
-    // No AAAA records or resolution failed - not an error yet
+  if (!signal) {
+    try {
+      resolvedIpv4 = await dns.resolve4(normalized);
+    } catch {
+      // No A records or resolution failed - not an error yet
+    }
+    try {
+      resolvedIpv6 = await dns.resolve6(normalized);
+    } catch {
+      // No AAAA records or resolution failed - not an error yet
+    }
+  } else {
+    const resolver = new Resolver();
+    const cancelResolution = () => resolver.cancel();
+    signal.addEventListener('abort', cancelResolution, { once: true });
+    try {
+      try {
+        resolvedIpv4 = await resolver.resolve4(normalized);
+      } catch {
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      }
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      try {
+        resolvedIpv6 = await resolver.resolve6(normalized);
+      } catch {
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      }
+    } finally {
+      signal.removeEventListener('abort', cancelResolution);
+      resolver.cancel();
+    }
   }
 
   // Step 3: Check if we got any records

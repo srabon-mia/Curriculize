@@ -70,6 +70,8 @@ export interface AcquisitionOptions {
   maxRedirects?: number;
   /** Request timeout in milliseconds (default: 10000) */
   timeoutMs?: number;
+  /** Cooperative invocation cancellation; validation and all network stages honor it. */
+  signal?: AbortSignal;
   /** Maximum response body size in bytes (default: 5MB) */
   maxResponseSize?: number;
   /** Allowed content types (default: text/html, text/plain, application/xhtml+xml) */
@@ -83,7 +85,7 @@ export interface AcquisitionOptions {
 }
 
 /** Default acquisition options */
-export const DEFAULT_ACQUISITION_OPTIONS: Omit<Required<AcquisitionOptions>, "preResolvedIps"> & { preResolvedIps: { ipv4: string[]; ipv6: string[] } | undefined } = {
+export const DEFAULT_ACQUISITION_OPTIONS: Omit<Required<AcquisitionOptions>, "preResolvedIps" | "signal"> & { preResolvedIps: { ipv4: string[]; ipv6: string[] } | undefined } = {
   maxRedirects: 5,
   timeoutMs: 10_000,
   maxResponseSize: 5 * 1024 * 1024,

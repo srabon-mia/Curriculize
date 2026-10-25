@@ -287,7 +287,7 @@ export async function acquireUrl(
       valid: true,
     };
   } else {
-    currentResolved = await resolveAndValidate(initialValidation.canonical!.parsed.hostname);
+    currentResolved = await resolveAndValidate(initialValidation.canonical!.parsed.hostname, opts.signal);
     if (!currentResolved.valid) {
       throw currentResolved.error!;
     }
@@ -313,6 +313,9 @@ export async function acquireUrl(
     // Prepare request options for pinned IP fetch
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), opts.timeoutMs);
+    const abortWithInvocation = () => controller.abort();
+    opts.signal?.addEventListener('abort', abortWithInvocation, { once: true });
+    if (opts.signal?.aborted) controller.abort();
 
     let response;
     try {
@@ -328,7 +331,9 @@ export async function acquireUrl(
       });
     } catch (err) {
       clearTimeout(timeoutId);
+      opts.signal?.removeEventListener('abort', abortWithInvocation);
       if (err instanceof DOMException && err.name === "AbortError") {
+        if (opts.signal?.aborted) throw err;
         throw createTimeoutError(currentUrl, opts.timeoutMs);
       }
       if (isAcquisitionError(err)) throw err;
@@ -336,6 +341,7 @@ export async function acquireUrl(
     }
 
     clearTimeout(timeoutId);
+    opts.signal?.removeEventListener('abort', abortWithInvocation);
 
     const statusCode = response.statusCode;
     const headers = response.headers;
@@ -373,7 +379,7 @@ export async function acquireUrl(
           newResolved = currentResolved!;
         } else {
           // Different host - re-resolve and re-validate DNS
-          newResolved = await resolveAndValidate(canonical.parsed.hostname);
+          newResolved = await resolveAndValidate(canonical.parsed.hostname, opts.signal);
           if (!newResolved.valid) {
             redirectChain.push({
               url: canonical.url,

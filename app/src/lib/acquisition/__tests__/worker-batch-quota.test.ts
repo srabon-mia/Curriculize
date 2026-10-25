@@ -106,7 +106,7 @@ describe('topic discovery diagnostics', () => {
 
 function queryResult(data: unknown) {
   const query: Record<string, unknown> = {};
-  for (const method of ['select', 'eq', 'in', 'order']) {
+  for (const method of ['select', 'eq', 'in', 'order', 'abortSignal']) {
     query[method] = () => query;
   }
   query.single = async () => ({ data, error: null });
@@ -118,6 +118,7 @@ function queryResult(data: unknown) {
 describe('durable worker batch quota', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.releaseJobClaim.mockResolvedValue(true);
     const completed = new Set<string>();
     mocks.getJobById.mockImplementation(async () => ({
       result_data: { batchCheckpoint: { completedTopicIds: [...completed] } },
@@ -175,13 +176,13 @@ describe('durable worker batch quota', () => {
     });
 
     const firstDone = await processBatchDiscovery(job, 'Geometry', topics);
-    expect(firstDone).toBe(false);
+    expect(firstDone).toBe('yielded');
     expect(mocks.recordResourceCoverageAttempt.mock.calls.map(([call]) => call.targetId)).toEqual(['topic-3', 'topic-3', 'topic-4', 'topic-4']);
     expect(mocks.releaseJobClaim).toHaveBeenCalledTimes(1);
     expect(mocks.releaseJobClaim).toHaveBeenLastCalledWith('same-job', 'fenced-token', 7);
 
     const secondDone = await processBatchDiscovery(job, 'Geometry', topics);
-    expect(secondDone).toBe(false);
+    expect(secondDone).toBe('yielded');
     expect(mocks.recordResourceCoverageAttempt.mock.calls.map(([call]) => call.targetId)).toEqual([
       'topic-3', 'topic-3', 'topic-4', 'topic-4', 'topic-5', 'topic-5', 'topic-6', 'topic-6',
     ]);
@@ -189,7 +190,7 @@ describe('durable worker batch quota', () => {
     expect(mocks.releaseJobClaim).toHaveBeenLastCalledWith('same-job', 'fenced-token', 7);
 
     const thirdDone = await processBatchDiscovery(job, 'Geometry', topics);
-    expect(thirdDone).toBe(false);
+    expect(thirdDone).toBe('yielded');
     expect(mocks.recordResourceCoverageAttempt.mock.calls.map(([call]) => call.targetId)).toEqual([
       'topic-3', 'topic-3', 'topic-4', 'topic-4', 'topic-5', 'topic-5', 'topic-6', 'topic-6', 'topic-7', 'topic-7', 'topic-8', 'topic-8',
     ]);
@@ -203,7 +204,7 @@ describe('durable worker batch quota', () => {
     ]);
     expect(mocks.releaseJobClaim).toHaveBeenCalledTimes(3);
     expect(mocks.getJobById).toHaveBeenCalledTimes(4);
-    expect(mocks.getJobById).toHaveBeenCalledWith('same-job');
+    expect(mocks.getJobById).toHaveBeenCalledWith('same-job', undefined);
     expect(mocks.complete.mock.calls.every(([, options]) => options.maxTokens === 4000)).toBe(true);
   });
 });

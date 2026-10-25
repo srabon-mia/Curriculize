@@ -27,13 +27,16 @@ export function getStoredCoverageStatus(input: {
 /** Run a bounded target retry loop; persistence exceptions intentionally escape. */
 export async function runBoundedCoverageAttempts(input: {
   maxAttempts: number;
-  attempt: () => Promise<"attempted" | "budget_exhausted" | "ownership_lost">;
+  initialAttempts?: number;
+  attemptIdFor?: (attemptIndex: number) => string;
+  attempt: (attemptIndex: number) => Promise<"attempted" | "budget_exhausted" | "ownership_lost">;
   measureEligibleResources: () => Promise<number>;
   threshold: number;
   record: (result: { resourcesFound: number; sufficient: boolean; budgetExhausted: boolean; attemptId: string }) => Promise<CoverageAttemptDecision>;
 }): Promise<"complete" | "insufficient" | "ownership_lost"> {
-  for (let attempt = 0; attempt < input.maxAttempts; attempt++) {
-    const outcome = await input.attempt();
+  const startAt = Math.min(input.maxAttempts, Math.max(0, input.initialAttempts ?? 0));
+  for (let attemptIndex = startAt; attemptIndex < input.maxAttempts; attemptIndex++) {
+    const outcome = await input.attempt(attemptIndex);
     if (outcome === "ownership_lost") return "ownership_lost";
     const budgetExhausted = outcome === "budget_exhausted";
     const resourcesFound = await input.measureEligibleResources();
@@ -41,7 +44,7 @@ export async function runBoundedCoverageAttempts(input: {
       resourcesFound,
       sufficient: resourcesFound >= input.threshold,
       budgetExhausted,
-      attemptId: crypto.randomUUID(),
+      attemptId: input.attemptIdFor?.(attemptIndex) ?? crypto.randomUUID(),
     });
     if (decision.status === "ownership_lost") return "ownership_lost";
     if (!decision.retry) return decision.status === "complete" ? "complete" : "insufficient";

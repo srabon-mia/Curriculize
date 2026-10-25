@@ -52,7 +52,11 @@ import {
   advanceCheckpoint,
   recordResourceCoverageAttempt,
   CoverageAttemptRpcError,
+  saveJobSkeleton,
+  SaveJobSkeletonError,
   completeJob,
+  publishAndCompleteJob,
+  PublishAndCompleteError,
   failJob,
   recoverStaleJobs,
   getJobById,
@@ -83,6 +87,86 @@ describe("Job Service Layer - RPC Contract Verification", () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+  });
+
+  describe("saveJobSkeleton", () => {
+    const input = {
+      jobId: "job-1", claimToken: "claim-1", claimVersion: 2,
+      skeleton: { title: "Math", source_type: "adapted", source_attribution: null, source_url: null,
+        nodes: [{ title: "Algebra", order_index: 0, major_understandings: [{ code: "A.1", description: "Expressions" }] }] },
+    };
+
+    it("persists under the exact fenced RPC arguments and accepts saved", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ data: { status: "saved" }, error: null });
+      await expect(saveJobSkeleton(input)).resolves.toBe("saved");
+      expect(mockSupabase.rpc).toHaveBeenCalledWith("save_job_skeleton", {
+        p_job_id: input.jobId, p_claim_token: input.claimToken,
+        p_expected_claim_version: input.claimVersion, p_skeleton: input.skeleton,
+      });
+    });
+
+    it("accepts an identical replay and distinguishes lease loss", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({ data: { status: "already_saved" }, error: null })
+        .mockResolvedValueOnce({ data: { status: "ownership_lost_or_expired" }, error: null });
+      await expect(saveJobSkeleton(input)).resolves.toBe("already_saved");
+      await expect(saveJobSkeleton(input)).resolves.toBe("ownership_lost");
+    });
+
+    it.each(["invalid_skeleton", "skeleton_conflict", "unknown"])("surfaces RPC status %s as an error", async (status) => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ data: { status }, error: null });
+      await expect(saveJobSkeleton(input)).rejects.toBeInstanceOf(SaveJobSkeletonError);
+    });
+
+    it("surfaces database errors instead of reporting a shortfall", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ data: null, error: new Error("db") });
+      await expect(saveJobSkeleton(input)).rejects.toMatchObject({ code: "DATABASE_ERROR" });
+    });
+
+    it("rejects empty and malformed RPC responses", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({ data: null, error: null })
+        .mockResolvedValueOnce({ data: { status: 12 }, error: null });
+      await expect(saveJobSkeleton(input)).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+      await expect(saveJobSkeleton(input)).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+    });
+  });
+
+  describe("publishAndCompleteJob", () => {
+    const input = { jobId: "job-1", claimToken: "claim-1", claimVersion: 2 };
+
+    it("calls the atomic fenced publication RPC and accepts success", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ data: { status: "completed" }, error: null });
+      await expect(publishAndCompleteJob(input)).resolves.toBe("completed");
+      expect(mockSupabase.rpc).toHaveBeenCalledWith("publish_and_complete_job", {
+        p_job_id: input.jobId,
+        p_claim_token: input.claimToken,
+        p_expected_claim_version: input.claimVersion,
+      });
+    });
+
+    it("accepts a replay after the transaction committed but its response was lost", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ data: { status: "already_completed" }, error: null });
+      await expect(publishAndCompleteJob(input)).resolves.toBe("completed");
+    });
+
+    it("distinguishes stale ownership and a missing curriculum", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({ data: { status: "ownership_lost_or_expired" }, error: null })
+        .mockResolvedValueOnce({ data: { status: "curriculum_not_found" }, error: null });
+      await expect(publishAndCompleteJob(input)).resolves.toBe("ownership_lost");
+      await expect(publishAndCompleteJob(input)).rejects.toMatchObject({ code: "curriculum_not_found" });
+    });
+
+    it("surfaces database and malformed-response failures", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({ data: null, error: new Error("db") })
+        .mockResolvedValueOnce({ data: null, error: null })
+        .mockResolvedValueOnce({ data: { status: 7 }, error: null });
+      await expect(publishAndCompleteJob(input)).rejects.toBeInstanceOf(PublishAndCompleteError);
+      await expect(publishAndCompleteJob(input)).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+      await expect(publishAndCompleteJob(input)).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+    });
   });
 
   describe("claimNextJob", () => {
@@ -556,15 +640,13 @@ describe("Job Service Layer - RPC Contract Verification", () => {
       expect(result).toEqual([{ id: "test-job", status: "pending", retry_count: 1 }]);
     });
 
-    it("returns empty array when RPC returns an error", async () => {
+    it("propagates an RPC error instead of treating recovery failure as no stale jobs", async () => {
       (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         data: null,
         error: new Error("DB error"),
       });
 
-      const result = await recoverStaleJobs();
-
-      expect(result).toEqual([]);
+      await expect(recoverStaleJobs()).rejects.toThrow("Recover stale jobs RPC failed");
     });
   });
 

@@ -72,6 +72,47 @@ describe("resource coverage status", () => {
     expect(checkpointCounts).toEqual([0, 3]);
   });
 
+  it("resumes at the next persisted retry using its deterministic attempt ID", async () => {
+    const attemptIndices: number[] = [];
+    const recordedIds: string[] = [];
+    const outcome = await runBoundedCoverageAttempts({
+      maxAttempts: 2,
+      initialAttempts: 1,
+      attemptIdFor: (index) => `attempt-${index}`,
+      attempt: async (index) => { attemptIndices.push(index); return 'attempted'; },
+      measureEligibleResources: async () => 3,
+      record: async (result) => {
+        recordedIds.push(result.attemptId);
+        return { attempts: 2, status: 'complete', retry: false };
+      },
+    });
+    expect(attemptIndices).toEqual([1]);
+    expect(recordedIds).toEqual(['attempt-1']);
+    expect(outcome).toBe('complete');
+  });
+
+  it("reuses the same attempt ID when an invocation is interrupted before its attempt checkpoint", async () => {
+    const ids: string[] = [];
+    let interrupt = true;
+    const config = {
+      maxAttempts: 2,
+      attemptIdFor: (index: number) => `attempt-${index}`,
+      attempt: async (index: number) => {
+        ids.push(`reserved-${index}`);
+        if (interrupt) { interrupt = false; throw new Error('deadline'); }
+        return 'attempted' as const;
+      },
+      measureEligibleResources: async () => 0,
+      record: async ({ attemptId }: { attemptId: string }) => {
+        ids.push(attemptId);
+        return { attempts: 1, status: 'insufficient', retry: false } as const;
+      },
+    };
+    await expect(runBoundedCoverageAttempts(config)).rejects.toThrow('deadline');
+    await expect(runBoundedCoverageAttempts(config)).resolves.toBe('insufficient');
+    expect(ids).toEqual(['reserved-0', 'reserved-0', 'attempt-0']);
+  });
+
   it("bounds repeated empty or malformed results and records insufficient", async () => {
     let attempts = 0;
     const statuses: string[] = [];

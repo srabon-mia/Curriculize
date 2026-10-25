@@ -12,10 +12,12 @@ import {
   advanceCheckpoint,
   recordResourceCoverageAttempt,
   completeJob,
+  publishAndCompleteJob,
   failJob,
   recoverStaleJobs,
   releaseJobClaim,
   saveJobSources,
+  saveJobSkeleton,
   getJobById,
   DEFAULT_BUDGET_LIMITS,
   LEASE_RENEWAL_INTERVAL_MS,
@@ -34,6 +36,9 @@ import type { AICompleteResult } from '@/lib/ai/types';
 import type { JobBudgetLimits, JobClaimResult } from '@/lib/acquisition/jobTypes';
 import { mapUnderstandingCodesToIds } from '@/lib/acquisition/coverage';
 import { runBoundedCoverageAttempts } from '@/lib/acquisition/coverage';
+import { createWorkerDeadline, WorkerYieldRequested } from '@/lib/acquisition/workerDeadline';
+import { withAbortSignal } from '@/lib/acquisition/abortableRequest';
+import { createHash } from 'node:crypto';
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -67,6 +72,110 @@ function getServiceClient() {
   return createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 }
 
+/** Stable UUIDs make a resumed discovery reuse its durable AI reservation. */
+export function stableAttemptUuid(...parts: string[]): string {
+  const bytes = createHash('sha256').update(parts.join(':')).digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function storedCoverageAttempts(resultData: unknown, phase: 'topic' | 'batch', targetId: string): number {
+  if (!resultData || typeof resultData !== 'object') return 0;
+  const coverage = (resultData as Record<string, unknown>).resourceCoverage;
+  if (!coverage || typeof coverage !== 'object') return 0;
+  const record = (coverage as Record<string, unknown>)[`${phase}:${targetId}`];
+  if (!record || typeof record !== 'object') return 0;
+  const attempts = (record as Record<string, unknown>).attempts;
+  return Number.isSafeInteger(attempts) && (attempts as number) >= 0 ? attempts as number : 0;
+}
+
+export async function materializeSkeletonRows(
+  supabase: ReturnType<typeof getAdminClient>,
+  curriculumId: string,
+  skeleton: Skeleton,
+  checkDeadline: () => void = () => undefined,
+  signal?: AbortSignal
+): Promise<Array<{ nodeId: string; node: SkeletonNode }>> {
+  checkDeadline();
+  const { error: curriculumUpdateError } = await withAbortSignal(supabase.from('curricula').update({
+    title: skeleton.title,
+    source_type: skeleton.source_type,
+    source_attribution: skeleton.source_attribution,
+    source_url: skeleton.source_url,
+  }).eq('id', curriculumId), signal);
+  if (curriculumUpdateError) throw new Error(`Failed to save curriculum skeleton metadata: ${curriculumUpdateError.message}`);
+
+  const nodeIds: Array<{ nodeId: string; node: SkeletonNode }> = [];
+  for (const node of skeleton.nodes) {
+    checkDeadline();
+    const topicExternalKey = `topic-${node.order_index}`;
+    const { data: nodeRow, error: nodeError } = await withAbortSignal(supabase.from('nodes').upsert({
+      curriculum_id: curriculumId,
+      title: node.title,
+      order_index: node.order_index,
+      external_key: topicExternalKey,
+    }, { onConflict: 'curriculum_id,external_key' }).select('id').single(), signal);
+    if (nodeError || !nodeRow) throw new Error(`Failed to materialize ${topicExternalKey}: ${nodeError?.message ?? 'row missing'}`);
+
+    const mus = node.major_understandings.map((mu, i) => ({
+      node_id: nodeRow.id,
+      external_key: mu.code ?? `${node.order_index}.${i + 1}`,
+      code: mu.code,
+      description: mu.description,
+      order_index: i,
+    }));
+    checkDeadline();
+    const { error: musError } = await withAbortSignal(supabase.from('major_understandings')
+      .upsert(mus, { onConflict: 'node_id,external_key' }), signal);
+    if (musError) throw new Error(`Failed to materialize understandings for ${topicExternalKey}: ${musError.message}`);
+    nodeIds.push({ nodeId: nodeRow.id, node });
+  }
+
+  checkDeadline();
+  const { data: materializedNodes, error: verifyNodesError } = await withAbortSignal(supabase.from('nodes')
+    .select('id, external_key, title, order_index').eq('curriculum_id', curriculumId), signal);
+  if (verifyNodesError) throw new Error(`Failed to verify topics: ${verifyNodesError.message}`);
+  if ((materializedNodes ?? []).length !== skeleton.nodes.length) throw new Error('Skeleton materialization incomplete: topic rows missing');
+  const nodeByKey = new Map((materializedNodes ?? []).map((row) => [row.external_key, row]));
+  const nodeIdsForQuery = (materializedNodes ?? []).map((row) => row.id);
+  const { data: materializedMus, error: verifyMusError } = await withAbortSignal(supabase.from('major_understandings')
+    .select('id, node_id, external_key, code, description, order_index').in('node_id', nodeIdsForQuery), signal);
+  if (verifyMusError) throw new Error(`Failed to verify understandings: ${verifyMusError.message}`);
+  for (const expectedNode of skeleton.nodes) {
+    const row = nodeByKey.get(`topic-${expectedNode.order_index}`);
+    if (!row || row.title !== expectedNode.title || row.order_index !== expectedNode.order_index) {
+      throw new Error(`Skeleton materialization mismatch for topic-${expectedNode.order_index}`);
+    }
+    const actualMus = (materializedMus ?? []).filter((mu) => mu.node_id === row.id);
+    if (actualMus.length !== expectedNode.major_understandings.length) {
+      throw new Error(`Skeleton materialization incomplete for topic-${expectedNode.order_index} understandings`);
+    }
+    for (let i = 0; i < expectedNode.major_understandings.length; i++) {
+      const expected = expectedNode.major_understandings[i];
+      const externalKey = expected.code ?? `${expectedNode.order_index}.${i + 1}`;
+      const actual = actualMus.find((mu) => mu.external_key === externalKey);
+      if (!actual || actual.code !== expected.code || actual.description !== expected.description || actual.order_index !== i) {
+        throw new Error(`Skeleton materialization mismatch for understanding ${externalKey}`);
+      }
+    }
+  }
+  return skeleton.nodes.map((node) => ({
+    nodeId: nodeByKey.get(`topic-${node.order_index}`)!.id,
+    node,
+  }));
+}
+
+export async function saveSkeletonBeforeMaterialization<T>(
+  save: () => Promise<'saved' | 'already_saved' | 'ownership_lost'>,
+  materialize: () => Promise<T>
+): Promise<{ status: 'ownership_lost' } | { status: 'materialized'; result: T }> {
+  const status = await save();
+  if (status === 'ownership_lost') return { status };
+  return { status: 'materialized', result: await materialize() };
+}
+
 // Lazy AI provider getter
 function getAI(operation: string) {
   return getAIProvider(undefined, { operation });
@@ -75,16 +184,16 @@ function getAI(operation: string) {
 /**
  * Call AI provider with web search for curriculum skeleton.
  */
-async function callAISkeleton(prompt: string): Promise<string> {
-  const textResult: AICompleteResult = await getAI("worker_initial_discovery").complete(prompt, { useSearch: true, maxTokens: 4000 });
+async function callAISkeleton(prompt: string, signal: AbortSignal): Promise<string> {
+  const textResult: AICompleteResult = await getAI("worker_initial_discovery").complete(prompt, { useSearch: true, maxTokens: 4000, signal });
   return textResult.text;
 }
 
 /**
  * Call AI provider for source discovery (no search).
  */
-async function callAISources(prompt: string): Promise<string> {
-  const textResult: AICompleteResult = await getAI("worker_source_discovery").complete(prompt, { useSearch: false, maxTokens: 2000 });
+async function callAISources(prompt: string, signal: AbortSignal): Promise<string> {
+  const textResult: AICompleteResult = await getAI("worker_source_discovery").complete(prompt, { useSearch: false, maxTokens: 2000, signal });
   return textResult.text;
 }
 
@@ -97,7 +206,8 @@ export async function callAIDiscover(
     curriculumId: string;
     jobId: string;
     topicId: string;
-  }
+  },
+  signal?: AbortSignal
 ): Promise<string> {
   const textResult: AICompleteResult = await getAI("worker_topic_discovery").complete(prompt, {
     useSearch: true,
@@ -108,6 +218,7 @@ export async function callAIDiscover(
       topicId: diagnostics.topicId,
       operation: 'worker_topic_discovery',
     },
+    signal,
   });
   return textResult.text;
 }
@@ -115,11 +226,11 @@ export async function callAIDiscover(
 /**
  * Call AI provider for per-understanding batch discovery.
  */
-async function callAITopicBatch(prompt: string): Promise<string> {
+async function callAITopicBatch(prompt: string, signal?: AbortSignal): Promise<string> {
   // This response contains candidates for every understanding in a topic.
   // 2,000 tokens can truncate the requested 2-per-understanding list; a
   // larger response cap adds no extra AI call and is still bounded.
-  const textResult: AICompleteResult = await getAI("worker_resource_discovery").complete(prompt, { useSearch: true, maxTokens: 4000 });
+  const textResult: AICompleteResult = await getAI("worker_resource_discovery").complete(prompt, { useSearch: true, maxTokens: 4000, signal });
   return textResult.text;
 }
 
@@ -172,10 +283,47 @@ function parseSkeleton(text: string): Skeleton | null {
   try {
     const match = text.match(/\{[\s\S]*\}/);
     if (!match) return null;
-    return JSON.parse(match[0]) as Skeleton;
+    const value = JSON.parse(match[0]) as Partial<Skeleton>;
+    if (typeof value.title !== 'string' || !value.title.trim() ||
+        (value.source_type !== 'adapted' && value.source_type !== 'ai_organized') ||
+        !Array.isArray(value.nodes) || value.nodes.length === 0 ||
+        !(value.source_attribution === null || typeof value.source_attribution === 'string') ||
+        !(value.source_url === null || typeof value.source_url === 'string')) return null;
+    const orders = new Set<number>();
+    for (const node of value.nodes) {
+      if (!node || typeof node.title !== 'string' || !node.title.trim() ||
+          !Number.isSafeInteger(node.order_index) || node.order_index < 0 || orders.has(node.order_index) ||
+          !Array.isArray(node.major_understandings) || node.major_understandings.length === 0) return null;
+      orders.add(node.order_index);
+      const externalKeys = new Set<string>();
+      for (let i = 0; i < node.major_understandings.length; i++) {
+        const mu = node.major_understandings[i];
+        if (!mu || typeof mu.description !== 'string' || !mu.description.trim() ||
+            !(mu.code === null || (typeof mu.code === 'string' && mu.code.trim()))) return null;
+        const key = mu.code ?? `${node.order_index}.${i + 1}`;
+        if (externalKeys.has(key)) return null;
+        externalKeys.add(key);
+      }
+    }
+    return value as Skeleton;
   } catch {
     return null;
   }
+}
+
+function parseStoredSkeleton(value: unknown): Skeleton | null {
+  if (!value || typeof value !== 'object') return null;
+  return parseSkeleton(JSON.stringify(value));
+}
+
+export function classifySkeletonCheckpoint(value: unknown, existingTopicCount: number):
+  | { status: 'not_generated' }
+  | { status: 'persisted'; skeleton: Skeleton }
+  | { status: 'legacy_ambiguous' }
+  | { status: 'invalid_checkpoint' } {
+  if (value === undefined) return existingTopicCount > 0 ? { status: 'legacy_ambiguous' } : { status: 'not_generated' };
+  const skeleton = parseStoredSkeleton(value);
+  return skeleton ? { status: 'persisted', skeleton } : { status: 'invalid_checkpoint' };
 }
 
 /**
@@ -384,7 +532,60 @@ function mapToDiscoveryCandidate(candidate: ResourceCandidate, sourceDomains: st
  * Main worker function: process a single job from claim to completion.
  * This is the core durable worker logic.
  */
-export async function processJob(job: JobClaimResult): Promise<void> {
+export type ProcessJobOutcome = 'completed' | 'failed' | 'yielded' | 'ownership_lost';
+
+export async function releaseDeadlineYield(
+  job: JobClaimResult,
+  release: typeof releaseJobClaim = releaseJobClaim,
+  signal?: AbortSignal
+): Promise<ProcessJobOutcome> {
+  let released = false;
+  try {
+    released = await release(job.id, job.claim_token!, job.claim_version, signal);
+  } catch (error) {
+    console.warn('[worker] Deadline claim release failed; stale-lease recovery will decide ownership', {
+      job_id: job.id,
+      error_name: error instanceof Error ? error.name : 'UnknownError',
+    });
+  }
+  if (!released) {
+    console.warn('[worker] Deadline yield could not release claim; stale-lease recovery will decide ownership', { job_id: job.id });
+    return 'ownership_lost';
+  }
+  return 'yielded';
+}
+
+async function releaseClaimForYield(job: JobClaimResult, deadline?: ReturnType<typeof createWorkerDeadline>): Promise<boolean> {
+  try {
+    return deadline
+      ? await deadline.runCleanup((signal) => releaseJobClaim(job.id, job.claim_token!, job.claim_version, signal))
+      : await releaseJobClaim(job.id, job.claim_token!, job.claim_version);
+  } catch (error) {
+    console.warn('[worker] Fenced claim release failed; lease recovery will decide ownership', {
+      job_id: job.id,
+      error_name: error instanceof Error ? error.name : 'UnknownError',
+    });
+    return false;
+  }
+}
+
+export async function finalizeJobPublication(
+  job: JobClaimResult,
+  finalize: typeof publishAndCompleteJob = publishAndCompleteJob,
+  signal?: AbortSignal
+): Promise<ProcessJobOutcome> {
+  return finalize({
+    jobId: job.id,
+    claimToken: job.claim_token!,
+    claimVersion: job.claim_version,
+    signal,
+  });
+}
+
+export async function processJob(
+  job: JobClaimResult,
+  invocationDeadline?: ReturnType<typeof createWorkerDeadline>
+): Promise<ProcessJobOutcome> {
   const jobId = job.id;
   const claimToken = job.claim_token;
   const claimVersion = job.claim_version;
@@ -392,58 +593,66 @@ export async function processJob(job: JobClaimResult): Promise<void> {
   const inputData = job.input_data as Record<string, unknown> | null;
   const curriculumId = job.curriculum_id;
   const maxAiCalls = budgetLimits?.max_ai_calls ?? DEFAULT_BUDGET_LIMITS.max_ai_calls;
+  const ownsDeadline = !invocationDeadline;
+  const deadline = invocationDeadline ?? createWorkerDeadline();
 
   if (!curriculumId) {
-    const { failJob } = await import('@/lib/acquisition/jobService');
-    await failJob(job.id, job.claim_token!, job.claim_version, 'No curriculum_id on job');
-    return;
+    try {
+      const failed = await failJob(job.id, job.claim_token!, job.claim_version, 'No curriculum_id on job', deadline.cleanupSignal());
+      return failed ? 'failed' : 'ownership_lost';
+    } finally {
+      if (ownsDeadline) deadline.dispose();
+    }
   }
 
   // Heartbeat interval
   const heartbeatInterval = setInterval(async () => {
     const { renewLease } = await import('@/lib/acquisition/jobService');
-    const renewed = await renewLease(job.id, job.claim_token!);
+    const renewed = await renewLease(job.id, job.claim_token!, deadline.signal);
     if (!renewed) {
       clearInterval(heartbeatInterval);
     }
   }, 60_000); // Every 60 seconds
 
   try {
-    // Step 1: Recover stale jobs before processing
-    await recoverStaleJobs();
-
+    deadline.check();
     // Step 2: Get curriculum and build skeleton
     const supabase = getAdminClient();
-    const { data: curriculum } = await supabase
+    const { data: curriculum, error: curriculumError } = await withAbortSignal(supabase
       .from('curricula')
       .select('*')
       .eq('id', curriculumId)
-      .single();
+      .single(), deadline.signal);
+    deadline.check();
+    if (curriculumError) throw new Error(`Failed to load curriculum: ${curriculumError.message}`);
 
     if (!curriculum) {
       const { failJob } = await import('@/lib/acquisition/jobService');
-      await failJob(job.id, job.claim_token!, job.claim_version, 'Curriculum not found');
-      return;
+      return await failJob(job.id, job.claim_token!, job.claim_version, 'Curriculum not found', deadline.signal)
+        ? 'failed' : 'ownership_lost';
     }
 
     const curriculumNotes = curriculum.notes ? JSON.parse(curriculum.notes) as Record<string, unknown> : {};
+    const jobState = await getJobById(job.id, deadline.signal);
+    if (!jobState) throw new Error('Unable to read acquisition job checkpoint');
+    const storedSkeletonValue = (jobState.result_data as { skeleton?: unknown } | null)?.skeleton;
+    const { data: existingTopics, error: existingTopicsError } = await withAbortSignal(supabase
+      .from('nodes').select('id').eq('curriculum_id', curriculumId), deadline.signal);
+    deadline.check();
+    if (existingTopicsError) throw new Error(`Failed to inspect existing topic rows: ${existingTopicsError.message}`);
+    const skeletonState = classifySkeletonCheckpoint(storedSkeletonValue, existingTopics?.length ?? 0);
+    let skeleton = skeletonState.status === 'persisted' ? skeletonState.skeleton : null;
+    if (skeletonState.status === 'invalid_checkpoint') {
+      throw new Error('Persisted skeleton checkpoint is malformed; manual recovery required');
+    }
+    if (skeletonState.status === 'legacy_ambiguous') {
+      return await failJob(job.id, job.claim_token!, job.claim_version,
+        'legacy_structure_without_skeleton: existing topic rows cannot prove full structure; operator recovery required', deadline.signal)
+        ? 'failed' : 'ownership_lost';
+    }
 
-    // Step 2a: Resume detection - check if nodes already exist from a previous
-    // invocation. If they do, we skip skeleton generation to avoid re-spending
-    // an AI call and potentially producing a different topic list that would
-    // invalidate completedTopicIds checkpoint entries.
-    const { data: existingNodes } = await supabase
-      .from('nodes')
-      .select('*')
-      .eq('curriculum_id', curriculumId)
-      .order('order_index', { ascending: true });
-
-    const structureExists = (existingNodes?.length ?? 0) > 0;
-
-    // Step 2b: Source discovery caching - reuse persisted sources if available
-    // to avoid re-spending the AI call on resume.
-    const jobState = await getJobById(job.id);
-    const persistedSources = (jobState?.result_data as { discoveredSources?: unknown })?.discoveredSources;
+    // Source discovery cache remains independent of the structural checkpoint.
+    const persistedSources = (jobState.result_data as { discoveredSources?: unknown } | null)?.discoveredSources;
     const cachedSources: DiscoveredSource[] = Array.isArray(persistedSources)
       ? persistedSources.filter(
           (s): s is DiscoveredSource =>
@@ -455,36 +664,9 @@ export async function processJob(job: JobClaimResult): Promise<void> {
     // Title used in discovery prompts. On a fresh run this is the AI-generated
     // skeleton title; on resume it is the title persisted by the earlier run.
     let discoveryTitle = curriculum.title;
-    let skeleton: Skeleton | null = null;
-
-    if (structureExists) {
-      // Reuse the persisted structure - no AI call, no re-insert.
-      const { data: existingMus } = await supabase
-        .from('major_understandings')
-        .select('id, node_id, code, description, order_index')
-        .in('node_id', (existingNodes ?? []).map((n) => n.id));
-
-      for (const node of existingNodes ?? []) {
-        const mus = (existingMus ?? [])
-          .filter((m) => m.node_id === node.id)
-          .sort((a, b) => a.order_index - b.order_index)
-          .map((m) => ({
-            code: m.code,
-            description: m.description,
-          }));
-
-        nodeIds.push({
-          nodeId: node.id,
-          node: {
-            title: node.title,
-            order_index: node.order_index,
-            major_understandings: mus,
-          },
-        });
-      }
-
-      console.log(`[worker] Resuming with ${nodeIds.length} existing topics (skeleton AI call skipped)`);
-    } else {
+    let structureMaterialized = false;
+    if (!skeleton) {
+      deadline.check();
       const skeletonPrompt = buildSkeletonPrompt(
         curriculum.title,
         (curriculumNotes.grade_level as string) ?? 'high school',
@@ -496,75 +678,57 @@ export async function processJob(job: JobClaimResult): Promise<void> {
       );
 
       // Reserve AI call for skeleton
-      const skeletonReservationId = crypto.randomUUID();
+      const skeletonReservationId = stableAttemptUuid(job.id, 'skeleton');
       const skeletonReservation = await reserveAICall(
         job.id, job.claim_token!, job.claim_version,
         maxAiCalls,
-        skeletonReservationId
+        skeletonReservationId,
+        deadline.signal
       );
 
       if (!skeletonReservation.reserved) {
         if (skeletonReservation.reason === 'budget_exhausted') {
-          const { completeJob } = await import('@/lib/acquisition/jobService');
-          await completeJob(job.id, job.claim_token!, job.claim_version, false);
+          const failed = await failJob(job.id, job.claim_token!, job.claim_version,
+            'AI call budget exhausted before a skeleton was saved', deadline.signal);
+          if (!failed) return 'ownership_lost';
         }
-        return;
+        return skeletonReservation.reason === 'budget_exhausted' ? 'failed' : 'ownership_lost';
       }
 
-      const skeletonText = await callAISkeleton(skeletonPrompt);
-      const skeleton = parseSkeleton(skeletonText);
-      if (!skeleton) {
+      deadline.checkBeforeExpensiveOperation();
+      const skeletonText = await callAISkeleton(skeletonPrompt, deadline.signal);
+      const generatedSkeleton = parseSkeleton(skeletonText);
+      if (!generatedSkeleton) {
         const { failJob } = await import('@/lib/acquisition/jobService');
-        await failJob(job.id, job.claim_token!, job.claim_version, 'Failed to parse skeleton');
-        return;
+        return await failJob(job.id, job.claim_token!, job.claim_version, 'Failed to parse skeleton', deadline.signal)
+          ? 'failed' : 'ownership_lost';
       }
 
-      // Update curriculum with skeleton info
-      await getAdminClient()
-        .from('curricula')
-        .update({
-          title: skeleton.title,
-          source_type: skeleton.source_type,
-          source_attribution: skeleton.source_attribution,
-          source_url: skeleton.source_url,
-        })
-        .eq('id', curriculumId);
-
-      discoveryTitle = skeleton.title;
-
-      // Step 3: Insert nodes and major understandings
-      for (const node of skeleton.nodes) {
-        const topicExternalKey = `topic-${node.order_index}`;
-        const { data: nodeRow } = await supabase
-          .from('nodes')
-          .upsert({
-            curriculum_id: curriculumId,
-            title: node.title,
-            order_index: node.order_index,
-            external_key: topicExternalKey,
-          }, { onConflict: 'curriculum_id,external_key' })
-          .select('id')
-          .single();
-
-        if (!nodeRow) continue;
-
-        const mus = node.major_understandings.map((mu: SkeletonNode['major_understandings'][0], i: number) => ({
-          node_id: nodeRow.id,
-          external_key: mu.code ?? `${node.order_index}.${i + 1}`,
-          code: mu.code,
-          description: mu.description,
-          order_index: i,
-        }));
-
-        await supabase
-          .from('major_understandings')
-          .upsert(mus, { onConflict: 'node_id,external_key' });
-        nodeIds.push({ nodeId: nodeRow.id, node });
-      }
+      deadline.check();
+      const saveResult = await saveSkeletonBeforeMaterialization(
+        () => saveJobSkeleton({
+          jobId: job.id, claimToken: job.claim_token!, claimVersion: job.claim_version, skeleton: generatedSkeleton,
+          signal: deadline.signal,
+        }),
+        () => materializeSkeletonRows(supabase, curriculumId, generatedSkeleton, () => deadline.check(), deadline.signal)
+      );
+      if (saveResult.status === 'ownership_lost') return 'ownership_lost';
+      nodeIds.push(...saveResult.result);
+      structureMaterialized = true;
+      skeleton = generatedSkeleton;
+    } else {
+      console.log(`[worker] Reusing immutable skeleton checkpoint with ${skeleton.nodes.length} topics`);
     }
 
+    // Re-materialize the entire expected structure on every resume. The
+    // immutable job checkpoint plus stable keys make interrupted writes repairable.
+    if (!structureMaterialized) {
+      nodeIds.push(...await materializeSkeletonRows(supabase, curriculumId, skeleton, () => deadline.check(), deadline.signal));
+    }
+    discoveryTitle = skeleton.title;
+
     // Read checkpoint to skip already-completed topics
-    const jobData = await getJobById(job.id);
+    const jobData = await getJobById(job.id, deadline.signal);
     const rawCompletedTopics =
       (jobData?.result_data as { checkpoint?: { completedTopicIds: unknown } })?.checkpoint
         ?.completedTopicIds;
@@ -584,20 +748,26 @@ export async function processJob(job: JobClaimResult): Promise<void> {
         (curriculumNotes.learning_goal as string) ?? 'understand the subject'
       );
 
-      const sourcesReservationId = crypto.randomUUID();
+      const sourcesReservationId = stableAttemptUuid(job.id, 'sources');
+      deadline.check();
       const sourcesReservation = await reserveAICall(
         job.id, job.claim_token!, job.claim_version,
         maxAiCalls,
-        sourcesReservationId
+        sourcesReservationId,
+        deadline.signal
       );
 
       if (sourcesReservation.reserved) {
-        const sourcesText = await callAISources(sourcesPrompt);
+        deadline.checkBeforeExpensiveOperation();
+        const sourcesText = await callAISources(sourcesPrompt, deadline.signal);
+        deadline.check();
         discoveredSources = parseSources(sourcesText);
         // Persist so a resumed invocation does not re-spend this AI call.
-        await saveJobSources(
-          job.id, job.claim_token!, job.claim_version, discoveredSources
+        deadline.check();
+        const savedSources = await saveJobSources(
+          job.id, job.claim_token!, job.claim_version, discoveredSources, deadline.signal
         );
+        if (!savedSources) throw new Error('Failed to persist discovered source checkpoint');
       }
     } else {
       console.log(`[worker] Reusing ${discoveredSources.length} cached sources (source AI call skipped)`);
@@ -626,7 +796,7 @@ export async function processJob(job: JobClaimResult): Promise<void> {
         console.log(
           `[worker] Topic quota (${MAX_TOPICS_PER_INVOCATION}) reached, releasing claim for next cron run`
         );
-        const released = await releaseJobClaim(job.id, job.claim_token!, job.claim_version);
+        const released = await releaseClaimForYield(job, deadline);
         if (!released) {
           // release failed: claim already lost (stolen by another worker) OR
           // release refused (e.g., yield cap reached). In either case, do not
@@ -636,7 +806,7 @@ export async function processJob(job: JobClaimResult): Promise<void> {
             `[worker] release_job_claim returned false — ownership lost or yield refused; yielding for next cron run`
           );
         }
-        return;
+        return released ? 'yielded' : 'ownership_lost';
       }
       topicsProcessedThisInvocation++;
 
@@ -672,19 +842,24 @@ export async function processJob(job: JobClaimResult): Promise<void> {
       try {
         coverageOutcome = await runBoundedCoverageAttempts({
         maxAttempts: MAX_COVERAGE_ATTEMPTS,
+        initialAttempts: storedCoverageAttempts(jobData?.result_data, 'topic', nodeId),
+        attemptIdFor: (attemptIndex) => stableAttemptUuid(job.id, 'topic', nodeId, String(attemptIndex)),
         threshold: 3,
-        attempt: async () => {
+        attempt: async (attemptIndex) => {
+          deadline.checkBeforeExpensiveOperation();
           const reservation = await reserveAICall(
-            job.id, job.claim_token!, job.claim_version, maxAiCalls, crypto.randomUUID()
+            job.id, job.claim_token!, job.claim_version, maxAiCalls,
+            stableAttemptUuid(job.id, 'topic', nodeId, String(attemptIndex)), deadline.signal
           );
           if (!reservation.reserved) {
             return reservation.reason === "budget_exhausted" ? "budget_exhausted" : "ownership_lost";
           }
+          deadline.checkBeforeExpensiveOperation();
           const responseText = await callAIDiscover(topicPrompt, {
             curriculumId,
             jobId: job.id,
             topicId: nodeId,
-          });
+          }, deadline.signal);
           discoveryMetrics.responseTextChars += responseText.length;
           const candidates: ResourceCandidate[] = parseCandidates(responseText);
           discoveryMetrics.parsedCandidates += candidates.length;
@@ -702,10 +877,12 @@ export async function processJob(job: JobClaimResult): Promise<void> {
               discoveryMetrics.rejectedUrlOrTitle++;
               continue;
             }
+            deadline.checkBeforeExpensiveOperation();
             const acquisitionResult = await acquireCandidate(
               { url: mappedCandidate.url, title: mappedCandidate.title, sourceDomain: mappedCandidate.sourceDomain, resourceType: mappedCandidate.resourceType, aiNote: mappedCandidate.aiNote },
-              { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000 },
+              { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000, signal: deadline.signal },
             );
+            deadline.check();
             if (!acquisitionResult.success) {
               const code = acquisitionResult.error?.code;
               if (code === 'EMPTY_CONTENT') discoveryMetrics.contentExtractionFailures++;
@@ -752,7 +929,7 @@ export async function processJob(job: JobClaimResult): Promise<void> {
                   licenseStatus: mappedCandidate.licenseStatus,
                   aiNote: candidate.ai_note ?? null,
                 },
-              });
+              }, deadline.signal);
               requireSuccessfulPersistence(persistResult, job.id, nodeId);
               if (persistResult.resource_id) discoveryMetrics.persistenceSuccesses++;
               else discoveryMetrics.persistenceFailures++;
@@ -764,18 +941,21 @@ export async function processJob(job: JobClaimResult): Promise<void> {
           return "attempted";
         },
         measureEligibleResources: async () => {
-          const { data, error } = await supabase.from("resources").select("id")
-            .eq("node_id", nodeId).eq("status", "approved").eq("content_type_verified", true);
+            deadline.check();
+          const { data, error } = await withAbortSignal(supabase.from("resources").select("id")
+            .eq("node_id", nodeId).eq("status", "approved").eq("content_type_verified", true), deadline.signal);
+          deadline.check();
           if (error) throw new Error(`Failed to measure topic resource coverage: ${error.message}`);
           const eligibleAssociations = data?.length ?? 0;
           discoveryMetrics.eligibleAssociations = eligibleAssociations;
           return eligibleAssociations;
         },
         record: async ({ resourcesFound, sufficient, budgetExhausted, attemptId }) => {
+          deadline.check();
           const result = await recordResourceCoverageAttempt({
             jobId: job.id, claimToken: job.claim_token!, claimVersion: job.claim_version,
             phase: "topic", targetId: nodeId, attemptId, resourcesFound, sufficient,
-            maxAttempts: MAX_COVERAGE_ATTEMPTS, budgetExhausted,
+            maxAttempts: MAX_COVERAGE_ATTEMPTS, budgetExhausted, signal: deadline.signal,
           });
           if (result?.status === "insufficient") {
             console.warn(`[worker] Topic ${nodeId} ended with insufficient eligible resource coverage (${resourcesFound}/3)`);
@@ -786,54 +966,65 @@ export async function processJob(job: JobClaimResult): Promise<void> {
       } finally {
         logTopicDiscoveryMetrics(nodeId, discoveryMetrics);
       }
-      if (coverageOutcome === "ownership_lost") return;
+      if (coverageOutcome === "ownership_lost") return 'ownership_lost';
     }
 
     // Step 6: Background per-understanding batch discovery.
     // Returns false when it yielded (quota exhausted) so we do NOT publish or
     // complete the job — the next cron invocation resumes from the batch
     // checkpoint.
-    const batchComplete = await processBatchDiscovery(
+    const batchOutcome = await processBatchDiscovery(
       job,
       discoveryTitle,
       nodeIds,
-      discoveredSources.map((source) => source.domain)
+      discoveredSources.map((source) => source.domain),
+      deadline
     );
 
-    if (!batchComplete) {
+    if (batchOutcome !== true) {
       // Yielded: claim already released inside processBatchDiscovery.
-      return;
+      return batchOutcome;
     }
 
-    // Final completion: only mark the job 'completed' if ALL work succeeded.
-    const completeOk = await completeJob(
-      job.id,
-      job.claim_token!,
-      job.claim_version,
-      true
-    );
+    // Final completion: only mark the job 'completed' if ALL work succeeded
+    // and there is enough invocation budget to perform the terminal write.
+    deadline.checkBeforeExpensiveOperation();
+    const finalization = await finalizeJobPublication(job, publishAndCompleteJob, deadline.signal);
 
-    if (!completeOk) {
-      // completeJob failed (claim lost or concurrent completion). The job
+    if (finalization === 'ownership_lost') {
+      // Atomic publication rejected this stale or expired claim. The job
       // will be recovered or retried by the cron worker. Do NOT publish.
       console.error(
-        `[worker] completeJob returned false — job ${job.id} may have been reclaimed; leaving curriculum unpublished`
+        `[worker] atomic publication rejected — job ${job.id} may have been reclaimed; leaving curriculum unpublished`
       );
-      return;
+      return 'ownership_lost';
     }
 
-    // Job is terminally completed. Now publish the curriculum.
-    await supabase
-      .from('curricula')
-      .update({ status: 'published' })
-      .eq('id', curriculumId);
+    // Publication and terminal job completion were committed atomically.
+    return 'completed';
 
   } catch (error) {
+    if (error instanceof WorkerYieldRequested || deadline.signal.aborted) {
+      console.info('[worker] Invocation budget reached; releasing claim for checkpoint resume', { job_id: job.id });
+      return releaseDeadlineYield(job, releaseJobClaim, deadline.cleanupSignal());
+    }
     console.error('Job processing error:', error);
     const { failJob } = await import('@/lib/acquisition/jobService');
-    await failJob(job.id, job.claim_token!, job.claim_version, error instanceof Error ? error.message : 'Unknown error');
+    try {
+      const failureRecorded = await failJob(job.id, job.claim_token!, job.claim_version,
+        error instanceof Error ? error.message : 'Unknown error', deadline.cleanupSignal());
+      if (!failureRecorded) return 'ownership_lost';
+    } catch (failureWriteError) {
+      console.error('[worker] Unable to persist job failure before invocation ends', {
+        job_id: job.id,
+        error_name: failureWriteError instanceof Error ? failureWriteError.name : 'UnknownError',
+      });
+      return 'ownership_lost';
+    }
+    return 'failed';
   } finally {
     clearInterval(heartbeatInterval);
+    if (ownsDeadline) deadline.dispose();
   }
 }
 
@@ -853,23 +1044,27 @@ export async function processBatchDiscovery(
   job: JobClaimResult,
   discoveryTitle: string,
   nodeIds: Array<{ nodeId: string; node: SkeletonNode }>,
-  prioritizedDomains: string[] = []
-): Promise<boolean> {
+  prioritizedDomains: string[] = [],
+  deadline?: ReturnType<typeof createWorkerDeadline>
+): Promise<true | 'yielded' | 'ownership_lost'> {
   const budgetLimits = job.budget_limits;
   const maxAiCalls = budgetLimits?.max_ai_calls ?? DEFAULT_BUDGET_LIMITS.max_ai_calls;
 
   const supabase = getAdminClient();
-  const { data: curriculumRow } = await supabase
+  deadline?.check();
+  const { data: curriculumRow, error: curriculumError } = await withAbortSignal(supabase
     .from('curricula')
     .select('title')
     .eq('id', job.curriculum_id)
-    .single();
+    .single(), deadline?.signal);
+  deadline?.check();
+  if (curriculumError) throw new Error(`Failed to load curriculum for batch discovery: ${curriculumError.message}`);
 
   const bgCurriculumTitle = curriculumRow?.title ?? discoveryTitle;
 
   // Read the batch-phase checkpoint so a resumed invocation skips topics whose
   // batch discovery already completed.
-  const batchJobData = await getJobById(job.id);
+  const batchJobData = await getJobById(job.id, deadline?.signal);
   const rawCompletedBatchTopics =
     (batchJobData?.result_data as { batchCheckpoint?: { completedTopicIds: unknown } })
       ?.batchCheckpoint?.completedTopicIds;
@@ -890,10 +1085,13 @@ export async function processBatchDiscovery(
       continue;
     }
 
-    const { data: muRows } = await supabase
+    deadline?.check();
+    const { data: muRows, error: muError } = await withAbortSignal(supabase
       .from('major_understandings')
       .select('id, code, description, external_key')
-      .eq('node_id', nodeId);
+      .eq('node_id', nodeId), deadline?.signal);
+    deadline?.check();
+    if (muError) throw new Error(`Failed to load understandings for batch discovery: ${muError.message}`);
 
     if (!muRows || muRows.length === 0) continue;
 
@@ -904,13 +1102,13 @@ export async function processBatchDiscovery(
       console.log(
         `[worker] Batch quota (${MAX_TOPICS_PER_INVOCATION}) reached, releasing claim for next cron run`
       );
-      const released = await releaseJobClaim(job.id, job.claim_token!, job.claim_version);
+      const released = await releaseClaimForYield(job, deadline);
       if (!released) {
         console.log(
           `[worker] release_job_claim returned false — ownership lost or yield refused; yielding for next cron run`
         );
       }
-      return false;
+      return released ? 'yielded' : 'ownership_lost';
     }
     batchTopicsProcessed++;
 
@@ -935,15 +1133,20 @@ export async function processBatchDiscovery(
     const muIds = muRows.map((mu) => mu.id as string);
     const coverageOutcome = await runBoundedCoverageAttempts({
       maxAttempts: MAX_COVERAGE_ATTEMPTS,
+      initialAttempts: storedCoverageAttempts(batchJobData?.result_data, 'batch', nodeId),
+      attemptIdFor: (attemptIndex) => stableAttemptUuid(job.id, 'batch', nodeId, String(attemptIndex)),
       threshold: 2,
-      attempt: async () => {
+      attempt: async (attemptIndex) => {
+        deadline?.checkBeforeExpensiveOperation();
         const reservation = await reserveAICall(
-          job.id, job.claim_token, job.claim_version, maxAiCalls, crypto.randomUUID()
+          job.id, job.claim_token, job.claim_version, maxAiCalls,
+          stableAttemptUuid(job.id, 'batch', nodeId, String(attemptIndex)), deadline?.signal
         );
         if (!reservation.reserved) {
           return reservation.reason === "budget_exhausted" ? "budget_exhausted" : "ownership_lost";
         }
-        const batchText = await callAITopicBatch(prompt);
+        deadline?.checkBeforeExpensiveOperation();
+        const batchText = await callAITopicBatch(prompt, deadline?.signal);
         const batchResources = parseBatchResources(batchText);
         let associatedTargetCount = 0;
         let malformedCandidateCount = 0;
@@ -987,10 +1190,12 @@ export async function processBatchDiscovery(
             const licenseStatus = candidate.license_status === 'cc_open' ? 'cc_open' : 'link_only';
             const resourceType = normalizeResourceType(candidate.resource_type);
 
+            deadline?.checkBeforeExpensiveOperation();
             const acquisitionResult = await acquireCandidate(
               { url: discoveryCandidate.url, title: discoveryCandidate.title, sourceDomain: discoveryCandidate.sourceDomain, resourceType, aiNote: discoveryCandidate.aiNote },
-              { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000 },
+              { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000, signal: deadline?.signal },
             );
+            deadline?.check();
 
             if (!acquisitionResult.success || !acquisitionResult.acquiredPage || !acquisitionResult.structuredContent) {
               fetchFailureCount++;
@@ -1019,6 +1224,7 @@ export async function processBatchDiscovery(
               continue;
             }
             if (verificationResult.status !== 'verified') verificationFailureCount++;
+            deadline?.check();
             const persistResult = await persistWithFence(job.id, job.claim_token, {
               acquiredPage,
               structuredContent,
@@ -1027,7 +1233,7 @@ export async function processBatchDiscovery(
               target: { understandingId: muId },
               acquisitionJobId: job.id,
               callerMetadata: { resourceType, licenseStatus, aiNote: candidate.ai_note ?? null },
-            });
+            }, deadline?.signal);
             requireSuccessfulPersistence(persistResult, job.id, nodeId);
             persistedAssociationCount++;
           }
@@ -1045,17 +1251,20 @@ export async function processBatchDiscovery(
         return "attempted";
       },
       measureEligibleResources: async () => {
-        const { data, error } = await supabase.from("resources").select("major_understanding_id")
-          .in("major_understanding_id", muIds).eq("status", "approved").eq("content_type_verified", true);
+        deadline?.check();
+        const { data, error } = await withAbortSignal(supabase.from("resources").select("major_understanding_id")
+          .in("major_understanding_id", muIds).eq("status", "approved").eq("content_type_verified", true), deadline?.signal);
+        deadline?.check();
         if (error) throw new Error(`Failed to measure understanding resource coverage: ${error.message}`);
         const rows = data ?? [];
         return Math.min(...muIds.map((muId) => rows.filter((row) => row.major_understanding_id === muId).length));
       },
       record: async ({ resourcesFound, sufficient, budgetExhausted, attemptId }) => {
+        deadline?.check();
         const result = await recordResourceCoverageAttempt({
           jobId: job.id, claimToken: job.claim_token, claimVersion: job.claim_version,
           phase: "batch", targetId: nodeId, attemptId, resourcesFound, sufficient,
-          maxAttempts: MAX_COVERAGE_ATTEMPTS, budgetExhausted,
+          maxAttempts: MAX_COVERAGE_ATTEMPTS, budgetExhausted, signal: deadline?.signal,
         });
         if (result?.status === "insufficient") {
           console.warn(`[worker] Understanding coverage in topic ${nodeId} ended insufficient (minimum ${resourcesFound}/2 per understanding)`);
@@ -1063,7 +1272,7 @@ export async function processBatchDiscovery(
         return result;
       },
     });
-    if (coverageOutcome === "ownership_lost") return false;
+    if (coverageOutcome === "ownership_lost") return 'ownership_lost';
   }
 
   // Every topic's batch discovery has been processed.

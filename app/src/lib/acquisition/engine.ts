@@ -58,6 +58,12 @@ export class AcquisitionDedupTracker {
   }
 }
 
+function cacheOptionsWithoutSignal(options: AcquisitionOptions): AcquisitionOptions {
+  const result = { ...options };
+  delete result.signal;
+  return result;
+}
+
 /**
  * Validate and normalize a discovery candidate URL.
  * Returns canonical info or throws AcquisitionError.
@@ -107,6 +113,7 @@ export async function acquireCandidate(
   dedupTracker?: AcquisitionDedupTracker,
   cache?: CacheStore
 ): Promise<AcquisitionResult> {
+  if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   // URL validation
   let canonical: CanonicalUrl;
   try {
@@ -139,7 +146,7 @@ export async function acquireCandidate(
   // rejected when the same URL is repeated within one topic, while a fresh
   // topic tracker can reuse this acquired content without another fetch.
   if (cache) {
-    const cacheKey = resourceExtractionKey(candidate.url, options);
+    const cacheKey = resourceExtractionKey(candidate.url, cacheOptionsWithoutSignal(options));
     const cached = cache.getRaw<AcquisitionResult>(cacheKey);
     if (cached) return cached;
   }
@@ -149,6 +156,7 @@ export async function acquireCandidate(
   try {
     acquired = await acquireUrl(candidate.url, options);
   } catch (err) {
+    if (options.signal?.aborted || (err instanceof Error && err.name === 'AbortError')) throw err;
     if (isAcquisitionError(err)) {
       return {
         candidate,
@@ -162,6 +170,8 @@ export async function acquireCandidate(
       error: { code: "ACQUISITION_FAILED", message: String(err) },
     };
   }
+
+  if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
   // Content hash deduplication
   if (dedupTracker && dedupTracker.checkContentHash(acquired.contentHash)) {
@@ -191,6 +201,8 @@ export async function acquireCandidate(
     };
   }
 
+  if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
   // Phase 5 output
   const cleaned = serializeCleanedDocument(doc);
 
@@ -214,6 +226,7 @@ export async function acquireCandidate(
   }
 
   // Phase 6A output
+  if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const structuredContent = extractStructuredContentFromDoc(doc);
 
   const result: AcquisitionResult = {
@@ -227,7 +240,7 @@ export async function acquireCandidate(
   // Phase 11: Cache successful result (never cache failures).
   // Uses the cache store's defaultTtlMs (falls back to store default or no expiry).
   if (cache) {
-    const cacheKey = resourceExtractionKey(candidate.url, options);
+    const cacheKey = resourceExtractionKey(candidate.url, cacheOptionsWithoutSignal(options));
     cache.setRaw(cacheKey, result);
   }
 

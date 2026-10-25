@@ -441,6 +441,31 @@ export class AzureProvider implements AIProvider {
     url: string,
     requestBody: AzureChatRequest | AzureResponsesRequest,
     maxAttempts = 4,
+    signal?: AbortSignal,
+    timeoutMs?: number
+  ): Promise<T> {
+    if (!timeoutMs || timeoutMs <= 0) {
+      return this.requestWithRetryLoop<T>(url, requestBody, maxAttempts, signal);
+    }
+    const controller = new AbortController();
+    const abortFromCaller = () => controller.abort();
+    signal?.addEventListener('abort', abortFromCaller, { once: true });
+    if (signal?.aborted) controller.abort();
+    const timeout = timeoutMs && timeoutMs > 0
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : undefined;
+    try {
+      return await this.requestWithRetryLoop<T>(url, requestBody, maxAttempts, controller.signal);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      signal?.removeEventListener('abort', abortFromCaller);
+    }
+  }
+
+  private async requestWithRetryLoop<T>(
+    url: string,
+    requestBody: AzureChatRequest | AzureResponsesRequest,
+    maxAttempts: number,
     signal?: AbortSignal
   ): Promise<T> {
     let lastError: Error | null = null;
@@ -732,7 +757,7 @@ export class AzureProvider implements AIProvider {
       // Use Responses API with web search tool
       const request = this.buildResponsesRequest(prompt, options);
       const url = this.buildResponsesUrl();
-      const response = await this.requestWithRetry<AzureResponsesResponse>(url, request, 4, options.signal);
+      const response = await this.requestWithRetry<AzureResponsesResponse>(url, request, 4, options.signal, options.timeoutMs);
 
       const { text, citations, searchCompleted } = this.extractResponsesResult(response, options.diagnostics);
 
@@ -758,7 +783,7 @@ export class AzureProvider implements AIProvider {
       // Use chat completions for non-search calls
       const request = this.buildChatRequest(prompt, options);
       const url = this.buildChatUrl();
-      const response = await this.requestWithRetry<AzureChatResponse>(url, request, 4, options.signal);
+      const response = await this.requestWithRetry<AzureChatResponse>(url, request, 4, options.signal, options.timeoutMs);
 
       const text = this.extractChatText(response);
 
@@ -880,7 +905,7 @@ export class AzureProvider implements AIProvider {
     const url = this.buildChatUrl();
     let response: AzureChatResponse;
     try {
-      response = await this.requestWithRetry<AzureChatResponse>(url, request, 4, completeOptions.signal);
+      response = await this.requestWithRetry<AzureChatResponse>(url, request, 4, completeOptions.signal, completeOptions.timeoutMs);
     } catch (error) {
       const aiError = error instanceof AIError ? error : undefined;
       console.error("[Azure] Structured response request failed", {

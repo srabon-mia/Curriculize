@@ -695,12 +695,12 @@ describe("AzureProvider", () => {
   });
 
   test("respects timeoutMs option via AbortSignal", async () => {
-    // Mock fetch to simulate timeout
-    mockFetch.mockImplementation(() => new Promise((_, reject) => {
-      setTimeout(() => reject(new DOMException("Aborted", "AbortError")), 100);
+    // Fetch remains pending until the provider's own timeout aborts its signal.
+    mockFetch.mockImplementation((_url, init) => new Promise((_, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
     }));
 
-    await expect(provider.complete("Test prompt", { timeoutMs: 50 })).rejects.toMatchObject({
+    await expect(provider.complete("Test prompt", { timeoutMs: 20 })).rejects.toMatchObject({
       code: "ABORTED",
     });
   });
@@ -1227,10 +1227,10 @@ describe("AzureProvider", () => {
     expect(structuredRequest.messages[0].content).toContain("https://example.org/geometry");
     const attemptLogs = searchLogs.mock.calls
       .filter(([message]) => message === "[Azure] Responses API web search summary")
-      .map(([, details]) => details);
+      .map(([, details]) => details as { attempt_number?: number; job_id?: string; curriculum_id?: string; stream_id?: string });
     expect(attemptLogs).toHaveLength(2);
-    expect(attemptLogs.map((details: any) => details.attempt_number)).toEqual([1, 2]);
-    expect(attemptLogs.every((details: any) => details.job_id === "job-1" && details.curriculum_id === "curr-1" && details.stream_id === "stream-1")).toBe(true);
+    expect(attemptLogs.map((details) => details.attempt_number)).toEqual([1, 2]);
+    expect(attemptLogs.every((details) => details.job_id === "job-1" && details.curriculum_id === "curr-1" && details.stream_id === "stream-1")).toBe(true);
     searchLogs.mockRestore();
   });
 
