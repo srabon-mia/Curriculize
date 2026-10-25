@@ -78,6 +78,7 @@ describe('topic discovery diagnostics', () => {
       rejectedUrlOrTitle: 1,
       fetchFailures: 1,
       contentExtractionFailures: 0,
+      interstitialPageFailures: 0,
       verificationRejections: 1,
       persistenceSuccesses: 1,
       persistenceFailures: 0,
@@ -94,6 +95,7 @@ describe('topic discovery diagnostics', () => {
       rejected_url_or_title: 1,
       fetch_failures: 1,
       content_extraction_failures: 0,
+      interstitial_page_failures: 0,
       verification_rejections: 1,
       persistence_successes: 1,
       persistence_failures: 0,
@@ -166,7 +168,7 @@ describe('durable worker batch quota', () => {
         metadata: { title: 'Differential Equations Lesson', description: '', author: '', datePublished: '', language: 'en' },
         source: { cleanedHash: 'cleaned-hash', contentHash: 'content-hash' },
         statistics: { wordCount: 140, headingCount: 1, paragraphCount: 2 },
-        blocks: [{ text: 'A differential equation is defined as a relation involving derivatives.' }],
+        blocks: [{ text: 'A differential equation is defined as a relation involving derivatives.', tagName: 'p' }],
       },
     } as never);
     vi.mocked(persistWithFence).mockImplementation(async (_jobId, _claimToken, input) => ({
@@ -178,8 +180,8 @@ describe('durable worker batch quota', () => {
     mocks.recordResourceCoverageAttempt.mockResolvedValue({ status: 'complete', retry: false });
 
     const targetMus: Record<string, Array<{ id: string; code: string; description: string; external_key: string }>> = {
-      'topic-a': [1, 2].map((i) => ({ id: `mu-a-${i}`, code: `A.${i}`, description: `Topic A concept ${i}`, external_key: `A.${i}` })),
-      'topic-b': [1, 2].map((i) => ({ id: `mu-b-${i}`, code: `B.${i}`, description: `Topic B concept ${i}`, external_key: `B.${i}` })),
+      'topic-a': [1, 2].map((i) => ({ id: `mu-a-${i}`, code: `A.${i}`, description: `Differential equations concept ${i}`, external_key: `A.${i}` })),
+      'topic-b': [1, 2].map((i) => ({ id: `mu-b-${i}`, code: `B.${i}`, description: `Differential equations concept ${i}`, external_key: `B.${i}` })),
     };
     let selectedNodeId = '';
     const eligibleRows = Object.values(targetMus).flatMap((rows) => rows.flatMap((mu) => [

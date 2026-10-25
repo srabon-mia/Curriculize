@@ -492,7 +492,7 @@ describe("Integration: Phase 11 resource-extraction caching", () => {
     setMockImplementation(async () => createMockResponse({
       statusCode: 200,
       headers: { "content-type": "text/html; charset=utf-8" },
-      body: `<html><body>Content</body></html>`
+      body: `<html><body>Page Content</body></html>`
     }));
 
     // Call with short timeout
