@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { classifySkeletonCheckpoint, getUncheckpointedTopicIds, materializeSkeletonRows, reconstructCheckpointedLegacySkeleton, releaseDeadlineYield, runBoundedStructureCall, saveSkeletonBeforeMaterialization, stableAttemptUuid } from '@/lib/acquisition/worker';
+import { classifySkeletonCheckpoint, getUncheckpointedTopicIds, materializeSkeletonRows, reconstructCheckpointedLegacySkeleton, releaseDeadlineYield, runBoundedStructureCall, saveSkeletonBeforeMaterialization, saveSkeletonCheckpointWithCleanup, stableAttemptUuid } from '@/lib/acquisition/worker';
+import { createWorkerDeadline } from '@/lib/acquisition/workerDeadline';
 import type { JobClaimResult } from '@/lib/acquisition/jobTypes';
 
 const skeleton = {
@@ -86,12 +87,15 @@ describe('durable skeleton materialization', () => {
       await expect(pending).resolves.toBe('structure');
       expect(callSignal?.aborted).toBe(false);
 
+      let checkpointWritten = false;
       const timeoutCall = runBoundedStructureCall((signal) => new Promise((_resolve, reject) => {
         signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
       }), 120_000);
-      const timeoutAssertion = expect(timeoutCall).rejects.toThrow('Aborted');
+      const timeoutResult = timeoutCall.then((value) => { checkpointWritten = true; return value; });
+      const timeoutAssertion = expect(timeoutResult).rejects.toThrow('bounded 120 second limit');
       await vi.advanceTimersByTimeAsync(120_000);
       await timeoutAssertion;
+      expect(checkpointWritten).toBe(false);
     } finally {
       vi.useRealTimers();
     }
@@ -114,23 +118,54 @@ describe('durable skeleton materialization', () => {
     expect(result).toEqual({ status: 'materialized', result: ['topic'] });
   });
 
-  it('keeps a slow structure result durable before the ordinary worker budget yields', async () => {
-    const calls: string[] = [];
-    let checkpoint: typeof skeleton | null = null;
-    // Models a structure call finishing after the 18s work budget: the fenced
-    // checkpoint write succeeds, then materialization notices the yield.
-    await expect(saveSkeletonBeforeMaterialization(
-      async () => { calls.push('save'); checkpoint = skeleton; return 'saved'; },
-      async () => { calls.push('materialize'); throw new Error('worker budget reached'); },
-    )).rejects.toThrow('worker budget reached');
-    expect(checkpoint).toEqual(skeleton);
-    expect(calls).toEqual(['save', 'materialize']);
+  it('uses the fenced cleanup signal when the worker deadline has elapsed during structure generation', async () => {
+    const expiredWork = new AbortController();
+    expiredWork.abort();
+    const cleanup = new AbortController();
+    const deadline = { cleanupSignal: vi.fn(() => cleanup.signal) } as unknown as ReturnType<typeof import('@/lib/acquisition/worker').createWorkerDeadline>;
+    const save = vi.fn(async (signal: AbortSignal) => {
+      expect(signal).toBe(cleanup.signal);
+      expect(signal.aborted).toBe(false);
+      expect(expiredWork.signal.aborted).toBe(true);
+      return 'saved' as const;
+    });
 
-    // On the next invocation the persisted structure is reused, so no second
-    // expensive structure-generation call is needed.
-    const resumed = classifySkeletonCheckpoint(checkpoint, 0);
-    expect(resumed.status).toBe('persisted');
-    expect(calls.filter((call) => call === 'save')).toHaveLength(1);
+    await expect(saveSkeletonCheckpointWithCleanup(save, deadline)).resolves.toBe('saved');
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  it('checkpoints a successful structure response across a worker yield and skips AI on resume', async () => {
+    vi.useFakeTimers();
+    const deadline = createWorkerDeadline(18_000);
+    try {
+      let checkpoint: typeof skeleton | null = null;
+      let structureCalls = 0;
+      const response = runBoundedStructureCall(async () => {
+        structureCalls++;
+        return new Promise<typeof skeleton>((resolve) => setTimeout(() => resolve(skeleton), 20_000));
+      }, 120_000);
+      await vi.advanceTimersByTimeAsync(20_000);
+      const generated = await response;
+      expect(deadline.signal.aborted).toBe(true);
+
+      await expect(saveSkeletonBeforeMaterialization(
+        async () => saveSkeletonCheckpointWithCleanup(async (signal) => {
+          expect(signal.aborted).toBe(false);
+          checkpoint = generated;
+          return 'saved';
+        }, deadline),
+        async () => { deadline.check(); return undefined; },
+      )).rejects.toThrow('Processor work budget reached');
+      expect(checkpoint).toEqual(skeleton);
+
+      // This is the next invocation's production branch condition: a valid
+      // stored checkpoint bypasses the initial structure-generation branch.
+      if (classifySkeletonCheckpoint(checkpoint, 0).status !== 'persisted') structureCalls++;
+      expect(structureCalls).toBe(1);
+    } finally {
+      deadline.dispose();
+      vi.useRealTimers();
+    }
   });
 
   it('does not insert when the fenced checkpoint RPC reports ownership loss', async () => {

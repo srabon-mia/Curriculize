@@ -188,6 +188,14 @@ export async function saveSkeletonBeforeMaterialization<T>(
   return { status: 'materialized', result: await materialize() };
 }
 
+/** Persist an already-valid skeleton using the bounded post-deadline cleanup window. */
+export function saveSkeletonCheckpointWithCleanup(
+  save: (signal: AbortSignal) => Promise<'saved' | 'already_saved' | 'ownership_lost'>,
+  deadline: ReturnType<typeof createWorkerDeadline>
+): Promise<'saved' | 'already_saved' | 'ownership_lost'> {
+  return save(deadline.cleanupSignal());
+}
+
 // Lazy AI provider getter
 function getAI(operation: string) {
   return getAIProvider(undefined, { operation });
@@ -206,9 +214,18 @@ export async function runBoundedStructureCall<T>(
   timeoutMs = SKELETON_CALL_TIMEOUT_MS
 ): Promise<T> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   try {
     return await call(controller.signal);
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(`Curriculum structure generation exceeded its bounded ${timeoutMs / 1000} second limit`, { cause: error });
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
@@ -863,25 +880,27 @@ export async function processJob(
       try {
         skeletonText = await callAISkeletonWithinBound(skeletonPrompt);
       } catch (error) {
-        if (deadline.signal.aborted) {
-          const failed = await failJob(job.id, job.claim_token!, job.claim_version,
-            'Curriculum structure generation exceeded its bounded 120 second limit', deadline.cleanupSignal());
-          return failed ? 'failed' : 'ownership_lost';
-        }
-        throw error;
+        // A failed/interrupted AI call has no resumable partial response.
+        // Record the ordinary worker failure through the existing fence even
+        // when the work-budget signal has expired; never invent a checkpoint.
+        const failed = await failJob(job.id, job.claim_token!, job.claim_version,
+          error instanceof Error ? error.message : 'Curriculum structure generation failed', deadline.cleanupSignal());
+        return failed ? 'failed' : 'ownership_lost';
       }
       const generatedSkeleton = parseSkeleton(skeletonText);
       if (!generatedSkeleton) {
-        const { failJob } = await import('@/lib/acquisition/jobService');
-        return await failJob(job.id, job.claim_token!, job.claim_version, 'Failed to parse skeleton', deadline.signal)
+        return await failJob(job.id, job.claim_token!, job.claim_version, 'Failed to parse skeleton', deadline.cleanupSignal())
           ? 'failed' : 'ownership_lost';
       }
 
       const saveResult = await saveSkeletonBeforeMaterialization(
-        () => saveJobSkeleton({
+        () => saveSkeletonCheckpointWithCleanup((signal) => saveJobSkeleton({
           jobId: job.id, claimToken: job.claim_token!, claimVersion: job.claim_version, skeleton: generatedSkeleton,
-          signal: deadline.signal.aborted ? deadline.cleanupSignal() : deadline.signal,
-        }),
+          // Once a valid structure exists in memory, persist it in the bounded
+          // cleanup window. Passing the work signal here has a race: the
+          // 18s timer can abort an in-flight fenced checkpoint RPC.
+          signal,
+        }), deadline),
         () => materializeSkeletonRows(supabase, curriculumId, generatedSkeleton, () => deadline.check(), deadline.signal)
       );
       if (saveResult.status === 'ownership_lost') return 'ownership_lost';
