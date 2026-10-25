@@ -669,11 +669,19 @@ const OBSERVER_POLL_MS = 10_000;
 const OBSERVER_WINDOW_MS = 3.5 * 60_000;
 
 /**
- * The browser connection only observes durable state. The scheduled processor
- * is the sole owner of discovery work; this stream yields before Vercel's
- * request limit so the client can reconnect without starting another job.
+ * Run generation in the request that the student opens. The durable processor
+ * remains available for stale-job recovery, but must not be required to start
+ * every newly created curriculum.
  */
 export async function GET(
+  request: Request,
+  context: { params: Promise<{ id: string }> }
+) {
+  return legacyGenerationGet(request, context);
+}
+
+/** Read-only observer retained for status checks and focused regression tests. */
+export async function observeGeneration(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {

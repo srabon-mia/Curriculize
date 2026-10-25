@@ -399,9 +399,9 @@ vi.mock("@/lib/acquisition/jobTypes", () => ({
 }));
 
 // Import the route AFTER all mocks are registered
-// These integration tests retain coverage of the former inline implementation;
-// production GET now only observes jobs owned by the durable processor.
-const { legacyGenerationGet: GET, GET: observeGeneration } = await import("./route");
+// Exercise the production inline generation path and retain direct coverage of
+// the read-only observer used to inspect durable job state.
+const { GET, observeGeneration } = await import("./route");
 
 // ============================================================
 // Test data factories
