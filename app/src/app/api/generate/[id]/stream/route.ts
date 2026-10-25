@@ -13,14 +13,10 @@ import { AcquisitionDedupTracker } from "@/lib/acquisition";
 import { DEFAULT_BUDGET_LIMITS } from "@/lib/acquisition/jobTypes";
 import { CandidateArraySchema, SourcesArraySchema } from "@/lib/acquisition/discoverySchemas";
 import {
-  claimNextJob,
   reserveAICall,
   releaseJobClaim,
   recordResourceCoverageAttempt,
-  recoverStaleJobs,
 } from "@/lib/acquisition/jobService";
-import { processJob } from "@/lib/acquisition/worker";
-import { createWorkerDeadline } from "@/lib/acquisition/workerDeadline";
 import { runBoundedCoverageAttempts, mapUnderstandingCodesToIds } from "@/lib/acquisition/coverage";
 import { PersistenceError } from "@/lib/persistence";
 import { z } from "zod";
@@ -344,7 +340,6 @@ type ClaimResult =
       mode: "observer";
       jobId: string;
       curriculumStatus: "draft" | "published";
-      checkpointVersion?: number;
       checkpoints: {
         completedTopicIds: string[];
         batchCompletedTopicIds: string[];
@@ -359,11 +354,6 @@ export async function claimOrRegisterJob(
   curriculumId: string,
   inputData: Record<string, unknown>
 ): Promise<ClaimResult> {
-  // A browser reconnect is also a request-triggered recovery opportunity.
-  // The recovery RPC itself checks lease expiry with the database clock, so a
-  // valid owner is never reclaimed due to application/database clock skew.
-  await recoverExpiredCurriculumJob(curriculumId);
-
   // 1. Atomically claim any existing *pending* job for this curriculum.
   //    claim_next_job only claims status='pending' (never 'running'),
   //    so this is race-free against other SSE/claim attempts.
@@ -422,11 +412,6 @@ export async function claimOrRegisterJob(
       // Another SSE request (or cron worker) already created a job for
       // this curriculum. Retry claim_next_job — it may find the job in
       // pending state (if the other path created pending, not running).
-      // The competing owner may have let its lease expire between our first
-      // claim attempt and the unique-conflict response. Recheck expiry before
-      // attaching as an observer so the existing job can resume in this
-      // request even when no scheduled recovery invocation is available.
-      await recoverExpiredCurriculumJob(curriculumId);
       const { data: retryClaimed } = await supabase.rpc("claim_next_job", {
         p_job_type: "curriculum_generation",
         p_curriculum_id: curriculumId,
@@ -475,25 +460,6 @@ export async function claimOrRegisterJob(
   };
 }
 
-async function recoverExpiredCurriculumJob(curriculumId: string): Promise<void> {
-  const { data: runningJob, error } = await supabase
-    .from("acquisition_jobs")
-    .select("id")
-    .eq("curriculum_id", curriculumId)
-    .eq("job_type", "curriculum_generation")
-    .eq("status", "running")
-    .maybeSingle();
-
-  if (error) throw new Error(`Could not check generation lease: ${error.message}`);
-  if (!runningJob) return;
-
-  const recovered = await recoverStaleJobs();
-  const recoveredJob = recovered.find((job) => job.id === runningJob.id);
-  if (recoveredJob?.status === "failed") {
-    throw new Error("This saved generation reached its retry limit and was marked failed. Start a new generation to try again.");
-  }
-}
-
 /**
  * Attach as read-only observer to an existing running job.
  * Returns the job's checkpoints so the SSE stream can report progress.
@@ -502,7 +468,7 @@ async function attachAsObserver(curriculumId: string): Promise<ClaimResult> {
   // Find the running job for this curriculum
   const { data: runningJob } = await supabase
     .from("acquisition_jobs")
-    .select("id, result_data, checkpoint_version, curriculum_id, curricula!inner(status)")
+    .select("id, result_data, curriculum_id, curricula!inner(status)")
     .eq("curriculum_id", curriculumId)
     .eq("job_type", "curriculum_generation")
     .eq("status", "running")
@@ -534,7 +500,6 @@ async function attachAsObserver(curriculumId: string): Promise<ClaimResult> {
     mode: "observer",
     jobId: runningJob.id,
     curriculumStatus: curriculumStatus === "published" ? "published" : "draft",
-    checkpointVersion: typeof runningJob.checkpoint_version === "number" ? runningJob.checkpoint_version : 0,
     checkpoints: {
       completedTopicIds: resultData?.checkpoint?.completedTopicIds ?? [],
       batchCompletedTopicIds: resultData?.batchCheckpoint?.completedTopicIds ?? [],
@@ -704,266 +669,41 @@ export async function failJob(
 
 const OBSERVER_POLL_MS = 10_000;
 const OBSERVER_WINDOW_MS = 3.5 * 60_000;
-const OBSERVER_MAX_POLLS = Math.ceil(OBSERVER_WINDOW_MS / OBSERVER_POLL_MS);
-const OBSERVER_STALL_POLLS = Math.ceil(3 * 60_000 / OBSERVER_POLL_MS);
-
-type ObserverSend = (event: string, data: unknown) => void;
 
 /**
- * Observe without owning or mutating the job. A pending transition hands off
- * to the normal claim path; terminal states are forwarded; a job with no
- * checkpoint progress gets a recoverable UI state instead of an endless SSE
- * reconnect cycle. The observer never fails or releases another owner's job.
- */
-export async function monitorObservedJob(
-  jobId: string,
-  curriculumId: string,
-  signal: AbortSignal,
-  send: ObserverSend,
-  close: () => void,
-  initialCheckpointVersion = 0
-): Promise<void> {
-  let lastCheckpointVersion = initialCheckpointVersion;
-  let pollsWithoutProgress = 0;
-  let progressDuringWindow = false;
-  let pendingDuringWindow = false;
-
-  const waitForNextPoll = () => new Promise<void>((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      signal.removeEventListener("abort", finish);
-      resolve();
-    };
-    const timer = setTimeout(finish, OBSERVER_POLL_MS);
-    signal.addEventListener("abort", finish, { once: true });
-  });
-
-  for (let poll = 0; poll < OBSERVER_MAX_POLLS && !signal.aborted; poll++) {
-    const { data: current, error } = await supabase
-      .from("acquisition_jobs")
-      .select("status, error, result_data, checkpoint_version")
-      .eq("id", jobId)
-      .single();
-
-    if (signal.aborted) break;
-    if (error || !current) {
-      send("status", {
-        message: "Generation is saved; checking its latest status…",
-        step: "status_unavailable",
-        job_id: jobId,
-      });
-      pollsWithoutProgress++;
-    } else if (current.status === "completed") {
-      send("complete", { curriculum_id: curriculumId, phase: "background" });
-      close();
-      return;
-    } else if (current.status === "failed") {
-      send("error", { message: current.error || "Generation failed." });
-      close();
-      return;
-    } else if (current.status === "pending") {
-      pendingDuringWindow = true;
-      send("status", {
-        message: "Generation is queued and will resume from its saved checkpoints.",
-        step: "pending",
-        job_id: jobId,
-      });
-      // GET is a read-only observer. Leave claiming to /api/jobs/process and
-      // keep this connection open until the processor claims or completes it.
-    } else {
-      const checkpointVersion = typeof current.checkpoint_version === "number"
-        ? current.checkpoint_version
-        : lastCheckpointVersion;
-      const progressed = checkpointVersion > lastCheckpointVersion;
-      if (progressed) {
-        lastCheckpointVersion = checkpointVersion;
-        pollsWithoutProgress = 0;
-        progressDuringWindow = true;
-      } else {
-        pollsWithoutProgress++;
-      }
-
-      const resultData = current.result_data as {
-        checkpoint?: { completedTopicIds?: unknown[] };
-        batchCheckpoint?: { completedTopicIds?: unknown[] };
-      } | null;
-      const topicCount = resultData?.checkpoint?.completedTopicIds?.length ?? 0;
-      const batchCount = resultData?.batchCheckpoint?.completedTopicIds?.length ?? 0;
-      send("status", {
-        message: `Generation is running. ${topicCount} topic(s) and ${batchCount} understanding batch(es) are checkpointed.`,
-        step: "running",
-        current: topicCount + batchCount,
-        total: -1,
-        checkpoint_version: checkpointVersion,
-        job_id: jobId,
-      });
-    }
-
-    if (pollsWithoutProgress >= OBSERVER_STALL_POLLS) {
-      send("paused", {
-        message: "Generation is still saved and has not been marked failed, but its checkpoints have not advanced. Retry to check or resume it.",
-        job_id: jobId,
-      });
-      close();
-      return;
-    }
-    await waitForNextPoll();
-  }
-
-  if (signal.aborted) {
-    close();
-    return;
-  }
-  if (progressDuringWindow || pendingDuringWindow) {
-    send("continue", { job_id: jobId });
-  } else {
-    send("paused", {
-      message: "Generation is still saved and has not been marked failed, but its checkpoints have not advanced. Retry to check or resume it.",
-      job_id: jobId,
-    });
-  }
-  close();
-}
-
-type HandoffState =
-  | { kind: "running"; ownershipUncertain: boolean }
-  | { kind: "terminal"; status: "completed" | "failed"; error: string | null }
-  | { kind: "pending" };
-
-class NewJobHandoffError extends Error {
-  constructor(readonly reason: "pending" | "indeterminate") {
-    super(reason);
-  }
-}
-
-function sendTerminalJobStatus(
-  status: "completed" | "failed",
-  error: string | null,
-  curriculumId: string,
-  send: ObserverSend,
-  close: () => void
-): void {
-  if (status === "completed") {
-    send("complete", { curriculum_id: curriculumId, phase: "background" });
-  } else {
-    send("error", { message: error || "Generation failed." });
-  }
-  close();
-}
-
-async function readHandoffState(jobId: string): Promise<HandoffState> {
-  const { data: current, error } = await supabase
-    .from("acquisition_jobs")
-    .select("status, error")
-    .eq("id", jobId)
-    .maybeSingle();
-  if (error || !current || typeof current.status !== "string") {
-    throw new NewJobHandoffError("indeterminate");
-  }
-  if (current.status === "pending") return { kind: "pending" };
-  if (current.status === "running") return { kind: "running", ownershipUncertain: false };
-  if (current.status === "completed" || current.status === "failed") {
-    return { kind: "terminal", status: current.status, error: current.error ?? null };
-  }
-  throw new NewJobHandoffError("indeterminate");
-}
-
-/** Claim and start only the job just inserted by this first-generation request. */
-async function handoffNewJob(
-  curriculumId: string,
-  jobId: string,
-  onStarted: () => void
-): Promise<HandoffState | { kind: "claimed" }> {
-  // A single SSE request owns this dispatch loop. Every continuation obtains a
-  // fresh atomic claim; if another processor owns it, this observer never
-  // starts duplicate work. The loop is bounded below the route's 300s limit.
-  const dispatchDeadline = Date.now() + 270_000;
-  let started = false;
-  while (Date.now() < dispatchDeadline) {
-    const deadline = createWorkerDeadline();
-    try {
-      let job;
-      try {
-        job = await claimNextJob("curriculum_generation", curriculumId, deadline.signal);
-      } catch {
-        // The RPC may have committed before its response was lost. A status read
-        // cannot recover the claim token, so a running row is observed only.
-        const state = await readHandoffState(jobId);
-        if (state.kind === "running") return { ...state, ownershipUncertain: true };
-        if (state.kind === "terminal") return state;
-        throw new NewJobHandoffError("pending");
-      }
-
-      if (!job) {
-        const state = await readHandoffState(jobId);
-        if (state.kind === "running" || state.kind === "terminal") return state;
-        throw new NewJobHandoffError("pending");
-      }
-      if (job.id !== jobId) throw new NewJobHandoffError("indeterminate");
-      if (!started) {
-        started = true;
-        onStarted();
-      }
-      const outcome = await processJob(job, deadline);
-      if (outcome !== 'yielded') return { kind: "claimed" };
-    } finally {
-      deadline.dispose();
-    }
-
-    const state = await readHandoffState(jobId);
-    if (state.kind !== 'pending') return state.kind === 'running'
-      ? { ...state, ownershipUncertain: true }
-      : state;
-  }
-  // The route's bounded dispatch window ended. The last fenced yield leaves
-  // the durable job pending and eligible for the configured processor.
-  return { kind: "claimed" };
-}
-
-/**
- * Observe progress and start only a job newly registered by this request using
- * the durable worker. Reconnects to saved jobs remain observer-only.
+ * Run generation in the request that the student opens. The durable processor
+ * remains available for stale-job recovery, but must not be required to start
+ * every newly created curriculum.
  */
 export async function GET(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
-  return observeGeneration(request, context);
+  return legacyGenerationGet(request, context);
 }
 
-/** Observe a job; newly registered work gets one targeted durable-worker handoff. */
+/** Read-only observer retained for status checks and focused regression tests. */
 export async function observeGeneration(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
   const encoder = new TextEncoder();
-  const observerController = new AbortController();
-  const abortObserver = () => observerController.abort();
   let closed = false;
+  let cancelPoll: (() => void) | null = null;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      request.signal.addEventListener("abort", abortObserver, { once: true });
-      if (request.signal.aborted) observerController.abort();
       const send = (event: string, data: unknown) => {
-        if (closed || observerController.signal.aborted) return;
+        if (closed || request.signal.aborted) return;
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       };
       const close = () => {
         if (closed) return;
         closed = true;
-        request.signal.removeEventListener("abort", abortObserver);
         try { controller.close(); } catch { /* client disconnected */ }
       };
 
       try {
-        if (observerController.signal.aborted) {
-          close();
-          return;
-        }
         const { data: curriculum, error: curriculumError } = await supabase
           .from("curricula")
           .select("title, notes")
@@ -995,7 +735,7 @@ export async function observeGeneration(
         // A reconnect to a terminal job must observe it, never create a second job.
         const { data: latestJob, error: latestError } = await supabase
           .from("acquisition_jobs")
-          .select("id, status, error, result_data, checkpoint_version")
+          .select("id, status, error, result_data")
           .eq("curriculum_id", id)
           .eq("job_type", "curriculum_generation")
           .order("created_at", { ascending: false })
@@ -1008,13 +748,18 @@ export async function observeGeneration(
           return;
         }
 
-        if (latestJob?.status === "completed" || latestJob?.status === "failed") {
-          sendTerminalJobStatus(latestJob.status, latestJob.error ?? null, id, send, close);
+        if (latestJob?.status === "completed") {
+          send("complete", { curriculum_id: id, phase: "background" });
+          close();
+          return;
+        }
+        if (latestJob?.status === "failed") {
+          send("error", { message: latestJob.error || "Generation failed." });
+          close();
           return;
         }
 
         let jobId = latestJob?.id as string | undefined;
-        let createdNewJob = false;
         if (!jobId) {
           const { data: inserted, error: insertError } = await supabase
             .from("acquisition_jobs")
@@ -1034,15 +779,21 @@ export async function observeGeneration(
             // Re-read it instead of inserting a duplicate or claiming it.
             const { data: activeJob, error: activeError } = await supabase
               .from("acquisition_jobs")
-              .select("id, status, error, result_data, checkpoint_version")
+              .select("id, status, error, result_data")
               .eq("curriculum_id", id)
               .eq("job_type", "curriculum_generation")
               .order("created_at", { ascending: false })
               .limit(1)
               .maybeSingle();
             if (activeError) throw new Error(`Could not observe active generation job: ${activeError.message}`);
-            if (activeJob?.status === "completed" || activeJob?.status === "failed") {
-              sendTerminalJobStatus(activeJob.status, activeJob.error ?? null, id, send, close);
+            if (activeJob?.status === "completed") {
+              send("complete", { curriculum_id: id, phase: "background" });
+              close();
+              return;
+            }
+            if (activeJob?.status === "failed") {
+              send("error", { message: activeJob.error || "Generation failed." });
+              close();
               return;
             }
             jobId = activeJob?.id;
@@ -1050,54 +801,66 @@ export async function observeGeneration(
             throw new Error(`Could not create durable generation job: ${insertError.message}`);
           } else {
             jobId = inserted?.id;
-            createdNewJob = Boolean(jobId);
           }
         }
         if (!jobId) throw new Error("Could not register or observe the durable generation job.");
 
-        if (createdNewJob) {
-          send("status", { message: "Generation job created.", step: "init", job_id: jobId });
-          try {
-            const handoff = await handoffNewJob(id, jobId, () => {
-              send("status", { message: "Finding the best curriculum structure…", step: "skeleton", job_id: jobId });
-            });
-            if (handoff.kind === "terminal") {
-              sendTerminalJobStatus(handoff.status, handoff.error, id, send, close);
-              return;
-            }
-            if (handoff.kind === "running") {
-              send("status", {
-                message: handoff.ownershipUncertain
-                  ? "The job is marked running, but this request could not confirm its claim owner. Observing saved progress; stale-lease recovery may be needed if it does not advance."
-                  : "Another processor owns this generation. Observing its progress…",
-                step: "running",
-                job_id: jobId,
-              });
-            }
-          } catch (error) {
-            console.error("[stream] New-job processor handoff failed", {
-              job_id: jobId,
-              error_name: error instanceof Error ? error.name : "UnknownError",
-            });
-            send("error", {
-              message: error instanceof NewJobHandoffError && error.reason === "pending"
-                ? "Generation was created but remains pending because this request could not claim it. Please check processor availability."
-                : "Could not confirm whether generation started. The job may have an active lease; check saved progress and allow stale-lease recovery before retrying.",
-            });
+        send("status", { message: "Connected to saved generation progress.", step: "reconnect", job_id: jobId, is_reconnect: true });
+        const startedAt = Date.now();
+        while (!closed && !request.signal.aborted && Date.now() - startedAt < OBSERVER_WINDOW_MS) {
+          const { data: current, error } = await supabase
+            .from("acquisition_jobs")
+            .select("status, error, result_data")
+            .eq("id", jobId)
+            .single();
+
+          if (error || !current) {
+            // A temporary status read failure is not a failed generation.
+            send("status", { message: "Generation is saved; checking its latest status…", step: "status_unavailable", job_id: jobId });
+          } else if (current.status === "completed") {
+            send("complete", { curriculum_id: id, phase: "background" });
             close();
             return;
+          } else if (current.status === "failed") {
+            send("error", { message: current.error || "Generation failed." });
+            close();
+            return;
+          } else {
+            const resultData = current.result_data as {
+              checkpoint?: { completedTopicIds?: unknown[] };
+              batchCheckpoint?: { completedTopicIds?: unknown[] };
+            } | null;
+            const topicCount = resultData?.checkpoint?.completedTopicIds?.length ?? 0;
+            const batchCount = resultData?.batchCheckpoint?.completedTopicIds?.length ?? 0;
+            const pending = current.status === "pending";
+            send("status", {
+              message: pending
+                ? "Generation is queued and will resume from its saved checkpoints."
+                : `Generation is running. ${topicCount} topic(s) and ${batchCount} understanding batch(es) are checkpointed.`,
+              step: pending ? "pending" : "running",
+              current: topicCount + batchCount,
+              total: -1,
+              job_id: jobId,
+            });
           }
-        } else {
-          send("status", { message: "Connected to saved generation progress.", step: "reconnect", job_id: jobId, is_reconnect: true });
+
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(() => {
+              cancelPoll = null;
+              resolve();
+            }, OBSERVER_POLL_MS);
+            cancelPoll = () => {
+              clearTimeout(timer);
+              cancelPoll = null;
+              resolve();
+            };
+          });
         }
-        await monitorObservedJob(
-          jobId,
-          id,
-          observerController.signal,
-          send,
-          close,
-          typeof latestJob?.checkpoint_version === "number" ? latestJob.checkpoint_version : 0
-        );
+
+        if (!closed && !request.signal.aborted) {
+          send("continue", { job_id: jobId });
+          close();
+        }
       } catch (error) {
         console.error("[stream] Durable job observation failed:", error);
         send("error", { message: "Could not read the saved generation status. Please reconnect." });
@@ -1105,10 +868,9 @@ export async function observeGeneration(
       }
     },
     cancel() {
-      // Closing the browser stream stops polling only; it never fails the job.
+      // Closing the browser stream stops observation only; it never fails the job.
       closed = true;
-      request.signal.removeEventListener("abort", abortObserver);
-      observerController.abort();
+      cancelPoll?.();
     },
   });
 
@@ -1154,7 +916,6 @@ export async function legacyGenerationGet(
         mode: "observer";
         jobId: string;
         curriculumStatus: "draft" | "published";
-        checkpointVersion?: number;
         checkpoints: {
           completedTopicIds: string[];
           batchCompletedTopicIds: string[];
@@ -1221,28 +982,24 @@ export async function legacyGenerationGet(
             send(controller, "status", {
               message: `Resuming… ${jobRecord.checkpoints.completedTopicIds.length} topic(s) already processed`,
               step: "resume",
-              current: jobRecord.checkpoints.completedTopicIds.length + jobRecord.checkpoints.batchCompletedTopicIds.length,
+              current: jobRecord.checkpoints.completedTopicIds.length,
               total: -1, // Unknown total until skeleton is parsed by owner
             });
           }
 
-          // Observe the durable row without renewing, releasing, or otherwise
-          // mutating another owner's claim. Poll until it progresses, becomes
-          // pending/terminal, or needs a user-visible no-progress pause.
+          // In observer mode, we just wait and periodically report status
+          // The owner stream will do the actual work and send events
+          // We close after sending initial status - the client will reconnect
+          // and eventually the owner will complete and send 'complete' event
           send(controller, "status", {
             message: "Waiting for generation to complete…",
             step: "waiting",
             job_id: jobRecord.jobId,
           });
 
-          await monitorObservedJob(
-            jobRecord.jobId,
-            id,
-            request.signal,
-            (event, data) => send(controller, event, data),
-            () => { try { controller.close(); } catch { /* client disconnected */ } },
-            jobRecord.checkpointVersion
-          );
+          // Close the stream - the client will reconnect via EventSource
+          // and eventually receive events from the owner stream
+          controller.close();
           return;
         }
 

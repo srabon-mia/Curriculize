@@ -48,9 +48,6 @@ let simulatedResumeJob: any = null;
 let simulatedCurriculum: any = null;
 let observerRunningJob: any = null;
 let durableJobRow: any = null;
-let observerReadSequence: any[] = [];
-let acquisitionMaybeSingleSequence: Array<{ data: any; error: any }> = [];
-let claimStateAfterAttempt: string | null = null;
 
 // ============================================================
 // Configurable RPC result overrides for lifecycle testing.
@@ -61,12 +58,6 @@ const rpcOverrides: Record<string, { data: unknown; error: unknown }> = {};
 const rpcCallCounts: Record<string, number> = {};
 const rpcSequences: Record<string, Array<{ data: unknown; error: unknown }>> = {};
 const coverageAttemptCounts: Record<string, number> = {};
-
-function abortableRpcResult(result: { data: unknown; error: unknown }) {
-  const pending: any = Promise.resolve(result);
-  pending.abortSignal = () => pending;
-  return pending;
-}
 
 // Flag-controlled INSERT error for acquisition_jobs (for testing unique
 // violation / failure paths without mockImplementationOnce interference).
@@ -130,7 +121,6 @@ function createMockSupabaseClient() {
     order: vi.fn().mockReturnThis(),
     limit: vi.fn().mockReturnThis(),
     in: vi.fn().mockReturnThis(),
-    abortSignal: vi.fn().mockReturnThis(),
     update: vi.fn().mockReturnThis(),
     then: vi.fn().mockImplementation((cb: any) =>
       Promise.resolve({ data: [], error: null }).then(cb)
@@ -220,22 +210,12 @@ function createMockSupabaseClient() {
         tableChain.select.mockImplementation(() => {
           const selectChain: any = { ...chain };
           selectChain.single = vi.fn().mockResolvedValue({
-            data: undefined,
+            data: resumeScenario && simulatedResumeJob
+              ? { ...simulatedResumeJob, curricula: { status: "draft" } }
+              : durableJobRow ?? observerRunningJob,
             error: null,
           });
-          selectChain.single.mockImplementation(() => Promise.resolve({
-            data: observerReadSequence.length > 0
-              ? observerReadSequence.shift()
-              : resumeScenario && simulatedResumeJob
-                ? { ...simulatedResumeJob, curricula: { status: "draft" } }
-                : durableJobRow ?? observerRunningJob,
-            error: null,
-          }));
-          selectChain.maybeSingle = vi.fn().mockImplementation(() => Promise.resolve(
-            acquisitionMaybeSingleSequence.length > 0
-              ? acquisitionMaybeSingleSequence.shift()
-              : { data: durableJobRow, error: null }
-          ));
+          selectChain.maybeSingle = vi.fn().mockResolvedValue({ data: durableJobRow, error: null });
           return selectChain;
         });
         tableChain.insert = vi.fn().mockImplementation((data: any) => {
@@ -297,60 +277,27 @@ function createMockSupabaseClient() {
 
       // Sequenced responses (for testing retry / call-order logic)
       if (rpcSequences[name] && rpcSequences[name][callCount]) {
-        return abortableRpcResult(rpcSequences[name][callCount]);
+        return Promise.resolve(rpcSequences[name][callCount]);
       }
 
       if (rpcOverrides[name]) {
-        if (name === "claim_next_job" && claimStateAfterAttempt !== null && durableJobRow) {
-          durableJobRow.status = claimStateAfterAttempt;
-          if (claimStateAfterAttempt === "failed") durableJobRow.error = "simulated terminal failure";
-          if (claimStateAfterAttempt === "running") {
-            durableJobRow.claim_token = "other-processor-token";
-            durableJobRow.claim_version = (durableJobRow.claim_version ?? 0) + 1;
-          }
-        }
-        return abortableRpcResult(rpcOverrides[name]);
+        return Promise.resolve(rpcOverrides[name]);
       }
 
       // Default: claim_next_job returns null (no pending job found)
       if (name === "claim_next_job") {
-        if (claimStateAfterAttempt !== null && durableJobRow) {
-          durableJobRow.status = claimStateAfterAttempt;
-          if (claimStateAfterAttempt === "failed") durableJobRow.error = "simulated terminal failure";
-          if (claimStateAfterAttempt === "running") {
-            durableJobRow.claim_token = "other-processor-token";
-            durableJobRow.claim_version = (durableJobRow.claim_version ?? 0) + 1;
-          }
-          return abortableRpcResult({ data: null, error: null });
-        }
         if (!resumeScenario && durableJobRow?.status === "pending") {
           durableJobRow.status = "running";
           durableJobRow.claim_token = "tok-reclaimed";
           durableJobRow.claim_version += 1;
-          return abortableRpcResult({ data: durableJobRow, error: null });
+          return Promise.resolve({ data: durableJobRow, error: null });
         }
         if (resumeScenario && simulatedResumeJob?.status === "pending") {
           simulatedResumeJob.status = "running";
           simulatedResumeJob.claim_version += 1;
-          return abortableRpcResult({ data: simulatedResumeJob, error: null });
+          return Promise.resolve({ data: simulatedResumeJob, error: null });
         }
-        return abortableRpcResult({ data: null, error: null });
-      }
-
-      if (name === "recover_stale_jobs") {
-        if (durableJobRow?.status === "running" && durableJobRow.claim_expires_at &&
-            Date.parse(durableJobRow.claim_expires_at) <= Date.now()) {
-          const retryCount = durableJobRow.retry_count ?? 0;
-          const maxRetries = durableJobRow.budget_limits?.max_retries ?? 3;
-          durableJobRow.status = retryCount < maxRetries ? "pending" : "failed";
-          durableJobRow.retry_count = retryCount < maxRetries ? retryCount + 1 : retryCount;
-          durableJobRow.claim_token = null;
-          durableJobRow.claim_expires_at = null;
-          durableJobRow.claim_version = (durableJobRow.claim_version ?? 0) + 1;
-          durableJobRow.error = "recovered: lease expired";
-          return Promise.resolve({ data: [{ id: durableJobRow.id, status: durableJobRow.status, retry_count: durableJobRow.retry_count }], error: null });
-        }
-        return Promise.resolve({ data: [], error: null });
+        return Promise.resolve({ data: null, error: null });
       }
 
       if (name === "record_resource_coverage_attempt") {
@@ -415,10 +362,6 @@ vi.mock("@supabase/supabase-js", () => ({
   createClient: vi.fn(() => mockSupabaseClient),
 }));
 
-vi.mock("@/lib/acquisition/worker", () => ({
-  processJob: vi.fn().mockResolvedValue("yielded"),
-}));
-
 // ============================================================
 // Mock AI provider factory
 // ============================================================
@@ -456,11 +399,9 @@ vi.mock("@/lib/acquisition/jobTypes", () => ({
 }));
 
 // Import the route AFTER all mocks are registered
-// Existing detailed pipeline tests exercise the retained legacy helper. The
-// exported GET is tested separately as the production read-only observer.
-const { GET: routeGET, legacyGenerationGet, observeGeneration, claimOrRegisterJob, monitorObservedJob } = await import("./route");
-const { processJob } = await import("@/lib/acquisition/worker");
-const GET = legacyGenerationGet;
+// Exercise the production inline generation path and retain direct coverage of
+// the read-only observer used to inspect durable job state.
+const { GET, observeGeneration } = await import("./route");
 
 // ============================================================
 // Test data factories
@@ -718,9 +659,6 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     simulatedCurriculum = null;
     observerRunningJob = null;
     durableJobRow = null;
-    observerReadSequence = [];
-    acquisitionMaybeSingleSequence = [];
-    claimStateAfterAttempt = null;
 
     mockAIInstance = new MockProvider();
     vi.mocked((await import("@/lib/ai")).getAIProvider).mockImplementation(() => mockAIInstance);
@@ -918,150 +856,6 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       // Service-role client bypasses RLS (acquisition_jobs INSERT policy requires
       // is_admin, but the service role bypasses RLS per migration 0006:562-567).
       expect(jobInserts[0].created_by).toBe(null);
-    });
-
-    it("request-triggered recovery reclaims this curriculum's expired lease before creating a job", async () => {
-      durableJobRow = {
-        id: "expired-job",
-        curriculum_id: "test-curriculum-id",
-        job_type: "curriculum_generation",
-        status: "running",
-        claim_token: "expired-token",
-        claim_version: 4,
-        claim_expires_at: new Date(Date.now() - 60_000).toISOString(),
-        retry_count: 0,
-        budget_limits: { max_retries: 3 },
-        result_data: { checkpoint: { completedTopicIds: ["topic-1"] } },
-      };
-
-      const result = await claimOrRegisterJob("test-curriculum-id", { topic: "Test" });
-
-      expect(result).toMatchObject({ mode: "owner", id: "expired-job" });
-      expect(durableJobRow.status).toBe("running");
-      expect(durableJobRow.claim_token).toBe("tok-reclaimed");
-      expect(capturedJobInserts()).toHaveLength(0);
-      const rpcNames = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.map(([name]) => name);
-      expect(rpcNames.indexOf("recover_stale_jobs")).toBeLessThan(rpcNames.indexOf("claim_next_job"));
-    });
-
-    it("does not reclaim or duplicate a job with a valid lease", async () => {
-      durableJobRow = {
-        id: "active-job",
-        curriculum_id: "test-curriculum-id",
-        job_type: "curriculum_generation",
-        status: "running",
-        claim_token: "valid-token",
-        claim_version: 4,
-        claim_expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
-        retry_count: 0,
-        budget_limits: { max_retries: 3 },
-        result_data: { checkpoint: { completedTopicIds: ["topic-1"] } },
-      };
-
-      const result = await claimOrRegisterJob("test-curriculum-id", { topic: "Test" });
-
-      expect(result).toMatchObject({ mode: "observer", jobId: "active-job" });
-      expect(durableJobRow.status).toBe("running");
-      expect(durableJobRow.claim_token).toBe("valid-token");
-      expect(capturedJobInserts()).toHaveLength(1); // the unique-conflict attempt; no replacement row
-      expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.some(([name]) => name === "recover_stale_jobs")).toBe(true);
-    });
-
-    it("does not create a replacement job when stale recovery exhausts the retry limit", async () => {
-      durableJobRow = {
-        id: "expired-job",
-        curriculum_id: "test-curriculum-id",
-        job_type: "curriculum_generation",
-        status: "running",
-        claim_token: "expired-token",
-        claim_version: 4,
-        claim_expires_at: new Date(Date.now() - 60_000).toISOString(),
-        retry_count: 3,
-        budget_limits: { max_retries: 3 },
-        result_data: { checkpoint: { completedTopicIds: ["topic-1"] } },
-      };
-
-      await expect(claimOrRegisterJob("test-curriculum-id", { topic: "Test" }))
-        .rejects.toThrow(/reached its retry limit/i);
-      expect(durableJobRow.status).toBe("failed");
-      expect(capturedJobInserts()).toHaveLength(0);
-    });
-  });
-
-  describe("read-only active-job observation", () => {
-    it("forwards terminal completion after topic and batch checkpoints progress", async () => {
-      observerReadSequence = [
-        { status: "running", error: null, checkpoint_version: 5, result_data: { checkpoint: { completedTopicIds: ["t1"] }, batchCheckpoint: { completedTopicIds: [] } } },
-        { status: "running", error: null, checkpoint_version: 6, result_data: { checkpoint: { completedTopicIds: ["t1"] }, batchCheckpoint: { completedTopicIds: ["t1"] } } },
-        { status: "completed", error: null, checkpoint_version: 6, result_data: {} },
-      ];
-      const events: Array<{ event: string; data: any }> = [];
-      let closed = false;
-      const controller = new AbortController();
-
-      await monitorObservedJob("job-1", "test-curriculum-id", controller.signal,
-        (event, data) => events.push({ event, data }), () => { closed = true; }, 4);
-
-      expect(events.filter(({ event }) => event === "status").map(({ data }) => data.current)).toEqual([1, 2]);
-      expect(events.at(-1)).toEqual({ event: "complete", data: { curriculum_id: "test-curriculum-id", phase: "background" } });
-      expect(closed).toBe(true);
-      expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("complete_job", expect.anything());
-      expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("fail_job", expect.anything());
-    });
-
-    it("keeps observing a pending job until the durable processor claims it", async () => {
-      observerReadSequence = [
-        { status: "pending", error: null, checkpoint_version: 7, result_data: { checkpoint: { completedTopicIds: ["t1"] }, batchCheckpoint: { completedTopicIds: ["t1"] } } },
-        { status: "running", error: null, checkpoint_version: 8, result_data: { checkpoint: { completedTopicIds: ["t1"] }, batchCheckpoint: { completedTopicIds: ["t1"] } } },
-        { status: "completed", error: null, checkpoint_version: 8, result_data: {} },
-      ];
-      const events: string[] = [];
-      const controller = new AbortController();
-      let closed = false;
-
-      await monitorObservedJob("job-1", "test-curriculum-id", controller.signal,
-        (event) => events.push(event), () => { closed = true; }, 6);
-
-      expect(events).toEqual(["status", "status", "complete"]);
-      expect(closed).toBe(true);
-      expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("release_job_claim", expect.anything());
-    });
-
-    it("reconnects after the observer window when a job is still pending", async () => {
-      observerReadSequence = Array.from({ length: 21 }, () => ({
-        status: "pending", error: null, checkpoint_version: 7,
-        result_data: { checkpoint: { completedTopicIds: ["t1"] } },
-      }));
-      const events: string[] = [];
-      let closed = false;
-
-      await monitorObservedJob("job-1", "test-curriculum-id", new AbortController().signal,
-        (event) => events.push(event), () => { closed = true; }, 7);
-
-      expect(events.at(-1)).toBe("continue");
-      expect(events).not.toContain("paused");
-      expect(closed).toBe(true);
-      expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("claim_next_job", expect.anything());
-    });
-
-    it("stops polling a non-progressing running job with a recoverable pause, without failing it", async () => {
-      observerReadSequence = Array.from({ length: 30 }, () => ({
-        status: "running", error: null, checkpoint_version: 9,
-        result_data: { checkpoint: { completedTopicIds: ["t1"] }, batchCheckpoint: { completedTopicIds: [] } },
-      }));
-      const events: Array<{ event: string; data: any }> = [];
-      let closed = false;
-      const controller = new AbortController();
-
-      await monitorObservedJob("job-1", "test-curriculum-id", controller.signal,
-        (event, data) => events.push({ event, data }), () => { closed = true; }, 9);
-
-      expect(events.filter(({ event }) => event === "status").length).toBeGreaterThan(0);
-      expect(events.at(-1)?.event).toBe("paused");
-      expect(events.at(-1)?.data.message).toMatch(/still saved.*not been marked failed/i);
-      expect(closed).toBe(true);
-      expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("fail_job", expect.anything());
-      expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("release_job_claim", expect.anything());
     });
   });
 
@@ -2092,7 +1886,6 @@ describe("Skeleton retry with budget/ownership checks", () => {
 describe("Durable generation stream observer", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(processJob).mockResolvedValue("yielded");
     resetRpcOverrides();
     resetRpcSequences();
     jobInsertMockError = null;
@@ -2101,7 +1894,6 @@ describe("Durable generation stream observer", () => {
     simulatedCurriculum = null;
     observerRunningJob = null;
     durableJobRow = null;
-    observerReadSequence = [];
     capturedInserts.length = 0;
   });
 
@@ -2124,32 +1916,6 @@ describe("Durable generation stream observer", () => {
     });
   }
 
-  it("routes production GET to the read-only observer, not inline AI or resource discovery", async () => {
-    durableJobRow = {
-      id: "job-complete",
-      status: "completed",
-      error: null,
-      result_data: { checkpoint: { completedTopicIds: ["topic-1"] } },
-      checkpoint_version: 1,
-    };
-    const { getAIProvider } = await import("@/lib/ai");
-    const { discoverVerifiedResource } = await import("@/lib/learningEngine");
-    vi.mocked(getAIProvider).mockClear();
-    vi.mocked(discoverVerifiedResource).mockClear();
-
-    const response = await routeGET(request(), {
-      params: Promise.resolve({ id: "test-curriculum-id" }),
-    });
-    const events = await readEvents(response, 1);
-
-    expect(events.join("\n")).toContain('event: complete');
-    expect(vi.mocked(getAIProvider)).not.toHaveBeenCalled();
-    expect(vi.mocked(discoverVerifiedResource)).not.toHaveBeenCalled();
-    expect(processJob).not.toHaveBeenCalled();
-    expect(mockSupabaseClient.rpc).not.toHaveBeenCalled();
-    expect(capturedInserts.filter((entry) => entry.table === "resources")).toHaveLength(0);
-  });
-
   it("observes a running job after the prior stream owner disappeared, without doing discovery", async () => {
     durableJobRow = {
       id: "job-1", status: "running", error: null, claim_token: "prior-owner",
@@ -2165,25 +1931,7 @@ describe("Durable generation stream observer", () => {
     expect(durableJobRow.result_data.checkpoint.completedTopicIds).toEqual(["topic-1"]);
   });
 
-  it("stops the observer poll timer when the response stream is cancelled", async () => {
-    durableJobRow = {
-      id: "job-running", status: "running", error: null,
-      result_data: { checkpoint: { completedTopicIds: [] } }, checkpoint_version: 1,
-    };
-    const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
-    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
-    const reader = response.body!.getReader();
-
-    await reader.read(); // Connected status
-    await reader.read(); // Running status; monitor has entered its poll wait
-    await reader.cancel();
-
-    expect(clearTimeoutSpy).toHaveBeenCalled();
-    clearTimeoutSpy.mockRestore();
-  });
-
-  it("reuses an existing pending job on reconnect without taking a processing claim", async () => {
-    durableJobRow = { id: "job-1", status: "pending", error: null, result_data: {}, checkpoint_version: 0 };
+  it("creates one pending job and reuses it on reconnect without taking a processing claim", async () => {
     const first = await observeGeneration(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
     const firstEvents = await readEvents(first, 2);
     expect(firstEvents.join("\n")).toContain('"step":"pending"');
@@ -2193,126 +1941,9 @@ describe("Durable generation stream observer", () => {
     const reconnectEvents = await readEvents(reconnect, 2);
 
     expect(reconnectEvents.join("\n")).toContain('"step":"pending"');
-    expect(capturedJobInserts()).toHaveLength(0);
+    expect(capturedJobInserts()).toHaveLength(1);
     expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("claim_next_job", expect.anything());
     expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("reserve_ai_call", expect.anything());
-    expect(processJob).not.toHaveBeenCalled();
-  });
-
-  it("starts only a newly inserted job through the durable worker and shows first-generation progress", async () => {
-    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
-    const events = await readEvents(response, 2);
-    const joined = events.join("\n");
-
-    expect(processJob).toHaveBeenCalledTimes(1);
-    expect(joined).toContain("Generation job created.");
-    expect(joined).toContain("Finding the best curriculum structure…");
-    expect(joined).not.toContain("Connected to saved generation progress.");
-    expect(capturedJobInserts()).toHaveLength(1);
-    expect(mockSupabaseClient.rpc).toHaveBeenCalledWith("claim_next_job", {
-      p_job_type: "curriculum_generation",
-      p_curriculum_id: "test-curriculum-id",
-    });
-    expect(processJob).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(processJob).mock.calls[0][0]).toMatchObject({ id: "job-1", curriculum_id: "test-curriculum-id" });
-  });
-
-  it.each(["pending", "running"] as const)("does not dispatch an existing %s job when the browser reconnects", async (status) => {
-    durableJobRow = {
-      id: "job-existing", status, error: null,
-      result_data: { checkpoint: { completedTopicIds: [] } }, checkpoint_version: 1,
-    };
-
-    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
-    const events = await readEvents(response, 2);
-
-    expect(events.join("\n")).toContain("Connected to saved generation progress.");
-    expect(capturedJobInserts()).toHaveLength(0);
-    expect(processJob).not.toHaveBeenCalled();
-  });
-
-  it("observes a running job after a null claim without dispatching another worker", async () => {
-    claimStateAfterAttempt = "running";
-    rpcOverrides["claim_next_job"] = { data: null, error: null };
-
-    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
-    const joined = (await readEvents(response, 2)).join("\n");
-
-    expect(joined).toContain("Another processor owns this generation.");
-    expect(joined).not.toContain("Finding the best curriculum structure…");
-    expect(processJob).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    ["completed", "event: complete"],
-    ["failed", "simulated terminal failure"],
-  ] as const)("handles a null claim followed by terminal status %s without startup messaging", async (status, expected) => {
-    claimStateAfterAttempt = status;
-    rpcOverrides["claim_next_job"] = { data: null, error: null };
-
-    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
-    const joined = (await readEvents(response)).join("\n");
-
-    expect(joined).toContain("Generation job created.");
-    expect(joined).toContain(expected);
-    expect(joined).not.toContain("Finding the best curriculum structure…");
-    expect(processJob).not.toHaveBeenCalled();
-  });
-
-  it("reports a null claim that leaves the new job pending", async () => {
-    claimStateAfterAttempt = "pending";
-    rpcOverrides["claim_next_job"] = { data: null, error: null };
-
-    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
-    const joined = (await readEvents(response)).join("\n");
-
-    expect(joined).toContain("remains pending");
-    expect(joined).not.toContain("Finding the best curriculum structure…");
-    expect(processJob).not.toHaveBeenCalled();
-  });
-
-  it("observes but does not dispatch when the claim errors and the reread is running", async () => {
-    claimStateAfterAttempt = "running";
-    rpcOverrides["claim_next_job"] = { data: null, error: { message: "claim response lost" } };
-
-    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
-    const joined = (await readEvents(response, 2)).join("\n");
-
-    expect(joined).toContain("could not confirm its claim owner");
-    expect(joined).toContain("stale-lease recovery may be needed");
-    expect(joined).not.toContain("Finding the best curriculum structure…");
-    expect(processJob).not.toHaveBeenCalled();
-  });
-
-  it("reports a claim error when the reread confirms the job remains pending", async () => {
-    claimStateAfterAttempt = "pending";
-    rpcOverrides["claim_next_job"] = { data: null, error: { message: "claim failed" } };
-
-    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
-    const joined = (await readEvents(response)).join("\n");
-
-    expect(joined).toContain("remains pending");
-    expect(joined).not.toContain("Finding the best curriculum structure…");
-    expect(processJob).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    ["reread failure", { data: null, error: { message: "read unavailable" } }],
-    ["unknown status", { data: { status: "unexpected", error: null }, error: null }],
-    ["missing row", { data: null, error: null }],
-  ] as const)("reports indeterminate startup on %s", async (_label, rereadResult) => {
-    rpcOverrides["claim_next_job"] = { data: null, error: null };
-    acquisitionMaybeSingleSequence = [
-      { data: null, error: null }, // no job before this request inserts one
-      rereadResult,
-    ];
-
-    const response = await routeGET(request(), { params: Promise.resolve({ id: "test-curriculum-id" }) });
-    const joined = (await readEvents(response)).join("\n");
-
-    expect(joined).toContain("Could not confirm whether generation started.");
-    expect(joined).not.toContain("Finding the best curriculum structure…");
-    expect(processJob).not.toHaveBeenCalled();
   });
 
   it("emits a terminal complete event when the durable job is completed", async () => {
