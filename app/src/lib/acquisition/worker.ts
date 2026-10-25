@@ -34,7 +34,6 @@ import { getNodesWithUnderstandings, type NodeWithChildren } from '@/lib/curricu
 import { createClient } from '@supabase/supabase-js';
 import type { AICompleteResult } from '@/lib/ai/types';
 import type { JobBudgetLimits, JobClaimResult } from '@/lib/acquisition/jobTypes';
-import type { PersistedDiscoveryCacheEntry, TopicCandidateCheckpointEntry } from '@/lib/acquisition/jobService';
 import { mapUnderstandingCodesToIds } from '@/lib/acquisition/coverage';
 import { runBoundedCoverageAttempts } from '@/lib/acquisition/coverage';
 import { createWorkerDeadline, WorkerYieldRequested } from '@/lib/acquisition/workerDeadline';
@@ -46,22 +45,11 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
 const MAX_TOPICS_PER_INVOCATION = 2;
 const MAX_COVERAGE_ATTEMPTS = 2;
-// Azure structure generation can exceed the ordinary 18s processor work
-// budget. Give this one call a bounded window, then checkpoint its result
-// using the still-fenced claim before honoring the invocation yield.
-const SKELETON_CALL_TIMEOUT_MS = 120_000;
 
 class ResourcePersistenceError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'ResourcePersistenceError';
-  }
-}
-
-class WorkerClaimLostError extends Error {
-  constructor() {
-    super('The fenced topic-discovery checkpoint was rejected');
-    this.name = 'WorkerClaimLostError';
   }
 }
 
@@ -196,14 +184,6 @@ export async function saveSkeletonBeforeMaterialization<T>(
   return { status: 'materialized', result: await materialize() };
 }
 
-/** Persist an already-valid skeleton using the bounded post-deadline cleanup window. */
-export function saveSkeletonCheckpointWithCleanup(
-  save: (signal: AbortSignal) => Promise<'saved' | 'already_saved' | 'ownership_lost'>,
-  deadline: ReturnType<typeof createWorkerDeadline>
-): Promise<'saved' | 'already_saved' | 'ownership_lost'> {
-  return save(deadline.cleanupSignal());
-}
-
 // Lazy AI provider getter
 function getAI(operation: string) {
   return getAIProvider(undefined, { operation });
@@ -215,32 +195,6 @@ function getAI(operation: string) {
 async function callAISkeleton(prompt: string, signal: AbortSignal): Promise<string> {
   const textResult: AICompleteResult = await getAI("worker_initial_discovery").complete(prompt, { useSearch: true, maxTokens: 4000, signal });
   return textResult.text;
-}
-
-export async function runBoundedStructureCall<T>(
-  call: (signal: AbortSignal) => Promise<T>,
-  timeoutMs = SKELETON_CALL_TIMEOUT_MS
-): Promise<T> {
-  const controller = new AbortController();
-  let timedOut = false;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
-  try {
-    return await call(controller.signal);
-  } catch (error) {
-    if (timedOut) {
-      throw new Error(`Curriculum structure generation exceeded its bounded ${timeoutMs / 1000} second limit`, { cause: error });
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function callAISkeletonWithinBound(prompt: string): Promise<string> {
-  return runBoundedStructureCall((signal) => callAISkeleton(prompt, signal));
 }
 
 /**
@@ -333,99 +287,6 @@ interface Skeleton {
   nodes: SkeletonNode[];
 }
 
-/**
- * Recover the pre-worker stream's structure only when at least one completed
- * topic proves the legacy writer passed its full structure-materialization
- * loop, and every saved row and checkpoint ID is internally consistent.
- */
-export function reconstructCheckpointedLegacySkeleton(input: {
-  curriculum: {
-    title: unknown;
-    source_type: unknown;
-    source_attribution: unknown;
-    source_url: unknown;
-  };
-  topics: Array<{
-    id: string;
-    title: string;
-    order_index: number;
-    external_key: string | null;
-  }>;
-  understandings: Array<{
-    node_id: string;
-    code: string | null;
-    description: string;
-    external_key: string | null;
-    order_index: number;
-  }>;
-  completedTopicIds: unknown;
-}): Skeleton | null {
-  const { curriculum, topics, understandings, completedTopicIds } = input;
-  if (
-    typeof curriculum.title !== 'string' || !curriculum.title.trim() ||
-    (curriculum.source_type !== 'adapted' && curriculum.source_type !== 'ai_organized') ||
-    !(curriculum.source_attribution === null || typeof curriculum.source_attribution === 'string') ||
-    !(curriculum.source_url === null || typeof curriculum.source_url === 'string') ||
-    !Array.isArray(completedTopicIds) || completedTopicIds.length === 0 ||
-    topics.length === 0 || topics.length > 12
-  ) return null;
-
-  const completedIds = new Set(completedTopicIds.filter((id): id is string => typeof id === 'string'));
-  if (completedIds.size !== completedTopicIds.length || completedIds.size > topics.length) return null;
-
-  const topicIds = new Set<string>();
-  const orders = new Set<number>();
-  const orderedTopics = [...topics].sort((a, b) => a.order_index - b.order_index);
-  for (const topic of orderedTopics) {
-    if (
-      !topic.id || topicIds.has(topic.id) ||
-      typeof topic.title !== 'string' || !topic.title.trim() ||
-      !Number.isSafeInteger(topic.order_index) || topic.order_index <= 0 || orders.has(topic.order_index) ||
-      topic.external_key !== `topic-${topic.order_index}`
-    ) return null;
-    topicIds.add(topic.id);
-    orders.add(topic.order_index);
-  }
-  if ([...completedIds].some((id) => !topicIds.has(id))) return null;
-  if (understandings.some((row) => !topicIds.has(row.node_id))) return null;
-
-  const nodes: SkeletonNode[] = [];
-  for (const topic of orderedTopics) {
-    const rows = understandings
-      .filter((row) => row.node_id === topic.id)
-      .sort((a, b) => a.order_index - b.order_index);
-    if (rows.length === 0) return null;
-    const majorUnderstandings: SkeletonNode['major_understandings'] = [];
-    const understandingKeys = new Set<string>();
-    for (let index = 0; index < rows.length; index++) {
-      const row = rows[index];
-      const expectedExternalKey = row.code ?? `${topic.order_index}.${index + 1}`;
-      if (
-        row.order_index !== index || typeof row.description !== 'string' || !row.description.trim() ||
-        !(row.code === null || (typeof row.code === 'string' && row.code.trim())) ||
-        row.external_key !== expectedExternalKey || understandingKeys.has(expectedExternalKey)
-      ) return null;
-      understandingKeys.add(expectedExternalKey);
-      majorUnderstandings.push({ code: row.code, description: row.description });
-    }
-    nodes.push({ title: topic.title, order_index: topic.order_index, major_understandings: majorUnderstandings });
-  }
-
-  return {
-    title: curriculum.title,
-    source_type: curriculum.source_type,
-    source_attribution: curriculum.source_attribution,
-    source_url: curriculum.source_url,
-    nodes,
-  };
-}
-
-/** Preserve the worker's existing checkpoint-resume rule in a testable form. */
-export function getUncheckpointedTopicIds(topicIds: string[], completedTopicIds: Iterable<string>): string[] {
-  const completed = new Set(completedTopicIds);
-  return topicIds.filter((topicId) => !completed.has(topicId));
-}
-
 function parseSkeleton(text: string): Skeleton | null {
   try {
     const match = text.match(/\{[\s\S]*\}/);
@@ -481,71 +342,6 @@ interface DiscoveredSource {
   name: string;
   why: string;
   best_for: string;
-}
-
-type TopicCandidateCheckpoint = TopicCandidateCheckpointEntry['__topic_candidate_checkpoint'];
-
-export function serializeDiscoveryCache(
-  sources: DiscoveredSource[],
-  checkpoint: TopicCandidateCheckpoint | null = null
-): PersistedDiscoveryCacheEntry[] {
-  return checkpoint
-    ? [...sources, { __topic_candidate_checkpoint: checkpoint }]
-    : sources;
-}
-
-export function readDiscoveryCache(value: unknown): {
-  sources: DiscoveredSource[];
-  topicCheckpoint: TopicCandidateCheckpoint | null;
-} {
-  if (!Array.isArray(value)) return { sources: [], topicCheckpoint: null };
-  const sources = value.filter((entry): entry is DiscoveredSource =>
-    typeof entry === 'object' && entry !== null && typeof (entry as DiscoveredSource).domain === 'string'
-  );
-  const marker = value.find((entry) => typeof entry === 'object' && entry !== null &&
-    '__topic_candidate_checkpoint' in entry) as TopicCandidateCheckpointEntry | undefined;
-  const checkpoint = marker?.__topic_candidate_checkpoint;
-  if (!checkpoint || typeof checkpoint.topicId !== 'string' ||
-      !Number.isSafeInteger(checkpoint.attemptIndex) || checkpoint.attemptIndex < 0 ||
-      typeof checkpoint.promptHash !== 'string' || !/^[a-f0-9]{64}$/.test(checkpoint.promptHash) ||
-      typeof checkpoint.responseText !== 'string' ||
-      !Number.isSafeInteger(checkpoint.nextCandidateIndex) || checkpoint.nextCandidateIndex < 0) {
-    return { sources, topicCheckpoint: null };
-  }
-  let candidateCount: number;
-  try {
-    const parsedResponse = extractJSON(checkpoint.responseText);
-    if (!Array.isArray(parsedResponse)) return { sources, topicCheckpoint: null };
-    candidateCount = parsedResponse.length;
-  } catch {
-    return { sources, topicCheckpoint: null };
-  }
-  if (checkpoint.nextCandidateIndex > candidateCount) return { sources, topicCheckpoint: null };
-  return { sources, topicCheckpoint: checkpoint };
-}
-
-export function getResumableTopicDiscovery(
-  checkpoint: TopicCandidateCheckpoint | null,
-  topicId: string,
-  attemptIndex: number,
-  promptHash: string
-): TopicCandidateCheckpoint | null {
-  return checkpoint?.topicId === topicId && checkpoint.attemptIndex === attemptIndex &&
-    checkpoint.promptHash === promptHash ? checkpoint : null;
-}
-
-export async function processCandidatesFromCheckpoint<T>(input: {
-  candidates: T[];
-  startAt: number;
-  checkBeforeCandidate: () => void;
-  processCandidate: (candidate: T, index: number) => Promise<void>;
-  saveNextCandidateIndex: (nextCandidateIndex: number) => Promise<void>;
-}): Promise<void> {
-  for (let index = input.startAt; index < input.candidates.length; index++) {
-    input.checkBeforeCandidate();
-    await input.processCandidate(input.candidates[index], index);
-    await input.saveNextCandidateIndex(index + 1);
-  }
 }
 
 function parseSources(text: string): DiscoveredSource[] {
@@ -852,7 +648,7 @@ export async function processJob(
     if (!jobState) throw new Error('Unable to read acquisition job checkpoint');
     const storedSkeletonValue = (jobState.result_data as { skeleton?: unknown } | null)?.skeleton;
     const { data: existingTopics, error: existingTopicsError } = await withAbortSignal(supabase
-      .from('nodes').select('id, title, order_index, external_key').eq('curriculum_id', curriculumId), deadline.signal);
+      .from('nodes').select('id').eq('curriculum_id', curriculumId), deadline.signal);
     deadline.check();
     if (existingTopicsError) throw new Error(`Failed to inspect existing topic rows: ${existingTopicsError.message}`);
     const skeletonState = classifySkeletonCheckpoint(storedSkeletonValue, existingTopics?.length ?? 0);
@@ -861,51 +657,19 @@ export async function processJob(
       throw new Error('Persisted skeleton checkpoint is malformed; manual recovery required');
     }
     if (skeletonState.status === 'legacy_ambiguous') {
-      const rawCompletedTopicIds = (jobState.result_data as { checkpoint?: { completedTopicIds?: unknown } } | null)
-        ?.checkpoint?.completedTopicIds;
-      let recoveredSkeleton: Skeleton | null = null;
-      if (Array.isArray(rawCompletedTopicIds) && existingTopics?.length) {
-        const topicIds = existingTopics.map((topic) => topic.id as string);
-        const { data: existingUnderstandings, error: understandingsError } = await withAbortSignal(supabase
-          .from('major_understandings')
-          .select('node_id, code, description, external_key, order_index')
-          .in('node_id', topicIds), deadline.signal);
-        deadline.check();
-        if (understandingsError) throw new Error(`Failed to inspect legacy understanding rows: ${understandingsError.message}`);
-        recoveredSkeleton = reconstructCheckpointedLegacySkeleton({
-          curriculum,
-          topics: existingTopics as Array<{ id: string; title: string; order_index: number; external_key: string | null }>,
-          understandings: (existingUnderstandings ?? []) as Array<{
-            node_id: string; code: string | null; description: string; external_key: string | null; order_index: number;
-          }>,
-          completedTopicIds: rawCompletedTopicIds,
-        });
-      }
-      if (!recoveredSkeleton) {
-        return await failJob(job.id, job.claim_token!, job.claim_version,
-          'legacy_structure_without_skeleton: saved rows and topic checkpoints do not prove a complete, consistent structure; operator recovery required', deadline.signal)
-          ? 'failed' : 'ownership_lost';
-      }
-      console.warn('[worker] Reconstructing legacy skeleton from fully checkpointed rows', {
-        job_id: job.id,
-        topic_count: recoveredSkeleton.nodes.length,
-      });
-      const saveStatus = await saveJobSkeleton({
-        jobId: job.id, claimToken: job.claim_token!, claimVersion: job.claim_version,
-        skeleton: recoveredSkeleton, signal: deadline.signal,
-      });
-      if (saveStatus === 'ownership_lost') return 'ownership_lost';
-      if (saveStatus !== 'saved' && saveStatus !== 'already_saved') {
-        throw new Error(`Could not persist reconstructed legacy skeleton: ${saveStatus}`);
-      }
-      skeleton = recoveredSkeleton;
+      return await failJob(job.id, job.claim_token!, job.claim_version,
+        'legacy_structure_without_skeleton: existing topic rows cannot prove full structure; operator recovery required', deadline.signal)
+        ? 'failed' : 'ownership_lost';
     }
 
     // Source discovery cache remains independent of the structural checkpoint.
     const persistedSources = (jobState.result_data as { discoveredSources?: unknown } | null)?.discoveredSources;
-    const discoveryCache = readDiscoveryCache(persistedSources);
-    const cachedSources = discoveryCache.sources;
-    let topicCandidateCheckpoint = discoveryCache.topicCheckpoint;
+    const cachedSources: DiscoveredSource[] = Array.isArray(persistedSources)
+      ? persistedSources.filter(
+          (s): s is DiscoveredSource =>
+            typeof s === "object" && s !== null && typeof (s as DiscoveredSource).domain === "string"
+        )
+      : [];
 
     const nodeIds: Array<{ nodeId: string; node: SkeletonNode }> = [];
     // Title used in discovery prompts. On a fresh run this is the AI-generated
@@ -943,38 +707,23 @@ export async function processJob(
       }
 
       deadline.checkBeforeExpensiveOperation();
-      // This call may outlive the ordinary invocation budget. Its own hard
-      // timeout keeps it bounded; once it returns, persist the valuable result
-      // with the claim fence before yielding the rest of the worker pipeline.
-      let skeletonText: string;
-      try {
-        skeletonText = await callAISkeletonWithinBound(skeletonPrompt);
-      } catch (error) {
-        // A failed/interrupted AI call has no resumable partial response.
-        // Record the ordinary worker failure through the existing fence even
-        // when the work-budget signal has expired; never invent a checkpoint.
-        const failed = await failJob(job.id, job.claim_token!, job.claim_version,
-          error instanceof Error ? error.message : 'Curriculum structure generation failed', deadline.cleanupSignal());
-        return failed ? 'failed' : 'ownership_lost';
-      }
+      const skeletonText = await callAISkeleton(skeletonPrompt, deadline.signal);
       const generatedSkeleton = parseSkeleton(skeletonText);
       if (!generatedSkeleton) {
-        return await failJob(job.id, job.claim_token!, job.claim_version, 'Failed to parse skeleton', deadline.cleanupSignal())
+        const { failJob } = await import('@/lib/acquisition/jobService');
+        return await failJob(job.id, job.claim_token!, job.claim_version, 'Failed to parse skeleton', deadline.signal)
           ? 'failed' : 'ownership_lost';
       }
 
+      deadline.check();
       const saveResult = await saveSkeletonBeforeMaterialization(
-        () => saveSkeletonCheckpointWithCleanup((signal) => saveJobSkeleton({
+        () => saveJobSkeleton({
           jobId: job.id, claimToken: job.claim_token!, claimVersion: job.claim_version, skeleton: generatedSkeleton,
-          // Once a valid structure exists in memory, persist it in the bounded
-          // cleanup window. Passing the work signal here has a race: the
-          // 18s timer can abort an in-flight fenced checkpoint RPC.
-          signal,
-        }), deadline),
+          signal: deadline.signal,
+        }),
         () => materializeSkeletonRows(supabase, curriculumId, generatedSkeleton, () => deadline.check(), deadline.signal)
       );
       if (saveResult.status === 'ownership_lost') return 'ownership_lost';
-      deadline.check();
       nodeIds.push(...saveResult.result);
       structureMaterialized = true;
       skeleton = generatedSkeleton;
@@ -999,9 +748,6 @@ export async function processJob(
         ? rawCompletedTopics.filter((id): id is string => typeof id === "string")
         : []
     );
-    const remainingTopicIds = new Set(getUncheckpointedTopicIds(
-      nodeIds.map(({ nodeId }) => nodeId), completedTopics
-    ));
 
     // Step 4: Source discovery (one-time; cached in result_data for resume)
     let discoveredSources: DiscoveredSource[] = cachedSources;
@@ -1029,29 +775,14 @@ export async function processJob(
         discoveredSources = parseSources(sourcesText);
         // Persist so a resumed invocation does not re-spend this AI call.
         deadline.check();
-        // A source refresh updates the source entries while retaining any
-        // structurally valid topic response checkpoint already loaded above.
-        const sourceCache = serializeDiscoveryCache(discoveredSources, topicCandidateCheckpoint);
         const savedSources = await saveJobSources(
-          job.id, job.claim_token!, job.claim_version, sourceCache, deadline.signal
+          job.id, job.claim_token!, job.claim_version, discoveredSources, deadline.signal
         );
         if (!savedSources) throw new Error('Failed to persist discovered source checkpoint');
       }
     } else {
       console.log(`[worker] Reusing ${discoveredSources.length} cached sources (source AI call skipped)`);
     }
-
-    // The existing fenced source-cache RPC stores arbitrary JSON in
-    // result_data.discoveredSources. Keep its legacy array shape and append a
-    // marker entry so web-search output and the candidate cursor survive yield.
-    const persistTopicCandidateCheckpoint = async (checkpoint: TopicCandidateCheckpoint) => {
-      const cache = serializeDiscoveryCache(discoveredSources, checkpoint);
-      const saved = await saveJobSources(
-        job.id, job.claim_token!, job.claim_version, cache, deadline.cleanupSignal()
-      );
-      if (!saved) throw new WorkerClaimLostError();
-      topicCandidateCheckpoint = checkpoint;
-    };
 
     // Step 5: Topic-level resource discovery
     // Bounded work: at most MAX_TOPICS_PER_INVOCATION new topics per invocation.
@@ -1063,7 +794,7 @@ export async function processJob(
       const { nodeId, node } = nodeIds[i];
 
       // Skip already-completed topics (resume from checkpoint)
-      if (!remainingTopicIds.has(nodeId)) {
+      if (completedTopics.has(nodeId)) {
         console.log(`[worker] Skipping topic ${nodeId} - already completed (checkpoint)`);
         continue;
       }
@@ -1134,41 +865,20 @@ export async function processJob(
           if (!reservation.reserved) {
             return reservation.reason === "budget_exhausted" ? "budget_exhausted" : "ownership_lost";
           }
-          const promptHash = createHash('sha256').update(topicPrompt).digest('hex');
-          const savedTopicCheckpoint = getResumableTopicDiscovery(topicCandidateCheckpoint, nodeId, attemptIndex, promptHash);
-          let responseText: string;
-          let startCandidateAt = 0;
-          if (savedTopicCheckpoint) {
-            responseText = savedTopicCheckpoint.responseText;
-            startCandidateAt = savedTopicCheckpoint.nextCandidateIndex;
-            console.log(`[worker] Resuming ${nodeId} candidates at ${startCandidateAt}`);
-          } else {
-            deadline.checkBeforeExpensiveOperation();
-            responseText = await callAIDiscover(topicPrompt, {
-              curriculumId,
-              jobId: job.id,
-              topicId: nodeId,
-            }, deadline.signal);
-            await persistTopicCandidateCheckpoint({
-              topicId: nodeId,
-              attemptIndex,
-              promptHash,
-              responseText,
-              nextCandidateIndex: 0,
-            });
-          }
+          deadline.checkBeforeExpensiveOperation();
+          const responseText = await callAIDiscover(topicPrompt, {
+            curriculumId,
+            jobId: job.id,
+            topicId: nodeId,
+          }, deadline.signal);
           discoveryMetrics.responseTextChars += responseText.length;
           const candidates: ResourceCandidate[] = parseCandidates(responseText);
           discoveryMetrics.parsedCandidates += candidates.length;
-          await processCandidatesFromCheckpoint({
-            candidates,
-            startAt: startCandidateAt,
-            checkBeforeCandidate: () => deadline.checkBeforeExpensiveOperation(),
-            processCandidate: async (candidate) => {
+          for (const candidate of candidates) {
             if (!candidate || typeof candidate.url !== 'string' || !candidate.url.trim() ||
                 typeof candidate.title !== 'string' || !candidate.title.trim()) {
               discoveryMetrics.rejectedUrlOrTitle++;
-              return;
+              continue;
             }
             const resourceType = normalizeResourceType(candidate.resource_type);
             let mappedCandidate: ReturnType<typeof mapToDiscoveryCandidate>;
@@ -1176,8 +886,9 @@ export async function processJob(
               mappedCandidate = mapToDiscoveryCandidate({ ...candidate, resource_type: resourceType }, []);
             } catch {
               discoveryMetrics.rejectedUrlOrTitle++;
-              return;
+              continue;
             }
+            deadline.checkBeforeExpensiveOperation();
             const acquisitionResult = await acquireCandidate(
               { url: mappedCandidate.url, title: mappedCandidate.title, sourceDomain: mappedCandidate.sourceDomain, resourceType: mappedCandidate.resourceType, aiNote: mappedCandidate.aiNote },
               { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000, signal: deadline.signal },
@@ -1191,11 +902,11 @@ export async function processJob(
               }
               else if (code && URL_VALIDATION_FAILURES.has(code)) discoveryMetrics.rejectedUrlOrTitle++;
               else discoveryMetrics.fetchFailures++;
-              return;
+              continue;
             }
             if (!acquisitionResult.acquiredPage || !acquisitionResult.structuredContent) {
               discoveryMetrics.contentExtractionFailures++;
-              return;
+              continue;
             }
             const { acquiredPage, structuredContent } = acquisitionResult;
             let educationalEvidence: ReturnType<typeof extractEducationalEvidence>;
@@ -1219,7 +930,7 @@ export async function processJob(
               });
             } catch {
               discoveryMetrics.verificationRejections++;
-              return;
+              continue;
             }
             if (verificationResult.status !== 'verified') discoveryMetrics.verificationRejections++;
             try {
@@ -1243,15 +954,7 @@ export async function processJob(
               discoveryMetrics.persistenceFailures++;
               throw error;
             }
-            },
-            saveNextCandidateIndex: async (nextCandidateIndex) => persistTopicCandidateCheckpoint({
-              topicId: nodeId,
-              attemptIndex,
-              promptHash,
-              responseText,
-              nextCandidateIndex,
-            }),
-          });
+          }
           return "attempted";
         },
         measureEligibleResources: async () => {
@@ -1318,7 +1021,6 @@ export async function processJob(
     return 'completed';
 
   } catch (error) {
-    if (error instanceof WorkerClaimLostError) return 'ownership_lost';
     if (error instanceof WorkerYieldRequested || deadline.signal.aborted) {
       console.info('[worker] Invocation budget reached; releasing claim for checkpoint resume', { job_id: job.id });
       return releaseDeadlineYield(job, releaseJobClaim, deadline.cleanupSignal());
