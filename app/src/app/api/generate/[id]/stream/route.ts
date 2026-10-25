@@ -14,11 +14,8 @@ import { DEFAULT_BUDGET_LIMITS } from "@/lib/acquisition/jobTypes";
 import { CandidateArraySchema, SourcesArraySchema } from "@/lib/acquisition/discoverySchemas";
 import {
   reserveAICall,
-  releaseJobClaim,
-  recordResourceCoverageAttempt,
+  releaseJobClaim
 } from "@/lib/acquisition/jobService";
-import { runBoundedCoverageAttempts, mapUnderstandingCodesToIds } from "@/lib/acquisition/coverage";
-import { PersistenceError } from "@/lib/persistence";
 import { z } from "zod";
 
 export const maxDuration = 300;
@@ -27,7 +24,6 @@ export const maxDuration = 300;
 // Matches the durable worker's MAX_TOPICS_PER_INVOCATION to ensure
 // the job stays within the 300s Vercel limit and can resume via cron.
 const MAX_TOPICS_PER_SSE_INVOCATION = 2;
-const MAX_COVERAGE_ATTEMPTS = 2;
 
 const supabase = createServiceClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -273,8 +269,7 @@ function toLearnParams(
   candidate: Record<string, unknown>,
   target: { nodeId?: string; understandingId?: string },
   acquisitionJobId?: string,
-  aiNote?: string | null,
-  targetContext?: LearnParams["targetContext"]
+  aiNote?: string | null
 ): LearnParams {
   return {
     candidate: {
@@ -289,7 +284,6 @@ function toLearnParams(
       aiNote: (candidate.ai_note as string | undefined) ?? aiNote ?? null,
     },
     target,
-    targetContext,
     acquisitionJobId,
   };
 }
@@ -667,225 +661,7 @@ export async function failJob(
   return true;
 }
 
-const OBSERVER_POLL_MS = 10_000;
-const OBSERVER_WINDOW_MS = 3.5 * 60_000;
-
-/**
- * Run generation in the request that the student opens. The durable processor
- * remains available for stale-job recovery, but must not be required to start
- * every newly created curriculum.
- */
 export async function GET(
-  request: Request,
-  context: { params: Promise<{ id: string }> }
-) {
-  return legacyGenerationGet(request, context);
-}
-
-/** Read-only observer retained for status checks and focused regression tests. */
-export async function observeGeneration(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const { id } = await params;
-  const encoder = new TextEncoder();
-  let closed = false;
-  let cancelPoll: (() => void) | null = null;
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const send = (event: string, data: unknown) => {
-        if (closed || request.signal.aborted) return;
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-      };
-      const close = () => {
-        if (closed) return;
-        closed = true;
-        try { controller.close(); } catch { /* client disconnected */ }
-      };
-
-      try {
-        const { data: curriculum, error: curriculumError } = await supabase
-          .from("curricula")
-          .select("title, notes")
-          .eq("id", id)
-          .single();
-        if (curriculumError) {
-          send("status", { message: "Checking saved generation status…", step: "status_unavailable" });
-          send("continue", {});
-          close();
-          return;
-        }
-        if (!curriculum) {
-          send("error", { message: "Curriculum not found." });
-          close();
-          return;
-        }
-
-        const notes = curriculum.notes ? JSON.parse(curriculum.notes) as Record<string, unknown> : {};
-        const inputData = {
-          topic: curriculum.title,
-          grade_level: notes.grade_level ?? "high school",
-          difficulty: notes.difficulty ?? "standard",
-          existing_knowledge: notes.existing_knowledge ?? "",
-          learning_goal: notes.learning_goal ?? "understand the subject",
-          time_available: notes.time_available ?? "no time pressure",
-          added_context: notes.added_context ?? "",
-        };
-
-        // A reconnect to a terminal job must observe it, never create a second job.
-        const { data: latestJob, error: latestError } = await supabase
-          .from("acquisition_jobs")
-          .select("id, status, error, result_data")
-          .eq("curriculum_id", id)
-          .eq("job_type", "curriculum_generation")
-          .order("created_at", { ascending: false })
-          .limit(1)
-          .maybeSingle();
-        if (latestError) {
-          send("status", { message: "Generation is saved; checking its latest status…", step: "status_unavailable" });
-          send("continue", {});
-          close();
-          return;
-        }
-
-        if (latestJob?.status === "completed") {
-          send("complete", { curriculum_id: id, phase: "background" });
-          close();
-          return;
-        }
-        if (latestJob?.status === "failed") {
-          send("error", { message: latestJob.error || "Generation failed." });
-          close();
-          return;
-        }
-
-        let jobId = latestJob?.id as string | undefined;
-        if (!jobId) {
-          const { data: inserted, error: insertError } = await supabase
-            .from("acquisition_jobs")
-            .insert({
-              curriculum_id: id,
-              job_type: "curriculum_generation",
-              status: "pending",
-              input_data: inputData,
-              budget_limits: DEFAULT_BUDGET_LIMITS,
-              created_by: null,
-            })
-            .select("id")
-            .single();
-
-          if (insertError?.code === "23505") {
-            // Another browser request or processor created the active job.
-            // Re-read it instead of inserting a duplicate or claiming it.
-            const { data: activeJob, error: activeError } = await supabase
-              .from("acquisition_jobs")
-              .select("id, status, error, result_data")
-              .eq("curriculum_id", id)
-              .eq("job_type", "curriculum_generation")
-              .order("created_at", { ascending: false })
-              .limit(1)
-              .maybeSingle();
-            if (activeError) throw new Error(`Could not observe active generation job: ${activeError.message}`);
-            if (activeJob?.status === "completed") {
-              send("complete", { curriculum_id: id, phase: "background" });
-              close();
-              return;
-            }
-            if (activeJob?.status === "failed") {
-              send("error", { message: activeJob.error || "Generation failed." });
-              close();
-              return;
-            }
-            jobId = activeJob?.id;
-          } else if (insertError) {
-            throw new Error(`Could not create durable generation job: ${insertError.message}`);
-          } else {
-            jobId = inserted?.id;
-          }
-        }
-        if (!jobId) throw new Error("Could not register or observe the durable generation job.");
-
-        send("status", { message: "Connected to saved generation progress.", step: "reconnect", job_id: jobId, is_reconnect: true });
-        const startedAt = Date.now();
-        while (!closed && !request.signal.aborted && Date.now() - startedAt < OBSERVER_WINDOW_MS) {
-          const { data: current, error } = await supabase
-            .from("acquisition_jobs")
-            .select("status, error, result_data")
-            .eq("id", jobId)
-            .single();
-
-          if (error || !current) {
-            // A temporary status read failure is not a failed generation.
-            send("status", { message: "Generation is saved; checking its latest status…", step: "status_unavailable", job_id: jobId });
-          } else if (current.status === "completed") {
-            send("complete", { curriculum_id: id, phase: "background" });
-            close();
-            return;
-          } else if (current.status === "failed") {
-            send("error", { message: current.error || "Generation failed." });
-            close();
-            return;
-          } else {
-            const resultData = current.result_data as {
-              checkpoint?: { completedTopicIds?: unknown[] };
-              batchCheckpoint?: { completedTopicIds?: unknown[] };
-            } | null;
-            const topicCount = resultData?.checkpoint?.completedTopicIds?.length ?? 0;
-            const batchCount = resultData?.batchCheckpoint?.completedTopicIds?.length ?? 0;
-            const pending = current.status === "pending";
-            send("status", {
-              message: pending
-                ? "Generation is queued and will resume from its saved checkpoints."
-                : `Generation is running. ${topicCount} topic(s) and ${batchCount} understanding batch(es) are checkpointed.`,
-              step: pending ? "pending" : "running",
-              current: topicCount + batchCount,
-              total: -1,
-              job_id: jobId,
-            });
-          }
-
-          await new Promise<void>((resolve) => {
-            const timer = setTimeout(() => {
-              cancelPoll = null;
-              resolve();
-            }, OBSERVER_POLL_MS);
-            cancelPoll = () => {
-              clearTimeout(timer);
-              cancelPoll = null;
-              resolve();
-            };
-          });
-        }
-
-        if (!closed && !request.signal.aborted) {
-          send("continue", { job_id: jobId });
-          close();
-        }
-      } catch (error) {
-        console.error("[stream] Durable job observation failed:", error);
-        send("error", { message: "Could not read the saved generation status. Please reconnect." });
-        close();
-      }
-    },
-    cancel() {
-      // Closing the browser stream stops observation only; it never fails the job.
-      closed = true;
-      cancelPoll?.();
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-    },
-  });
-}
-
-// Kept for focused regression coverage of the previous inline generation
-// implementation while the durable worker owns production requests.
-export async function legacyGenerationGet(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
@@ -1544,6 +1320,11 @@ export async function legacyGenerationGet(
             continue;
           }
 
+          // Keep duplicate suppression within a topic. Sharing a content hash
+          // tracker across topics drops a valid candidate before it can be
+          // persisted against the other topic.
+          const dedupTracker = new AcquisitionDedupTracker();
+
           // Bounded work: yield when quota exhausted.
           // releaseJobClaim sets status='pending' without consuming a retry,
           // so the next SSE reconnect (or cron worker) can claim and resume.
@@ -1609,80 +1390,175 @@ export async function legacyGenerationGet(
               discoveredSources.map((s) => s.domain)
             );
 
-            const topicOutcome = await runBoundedCoverageAttempts({
-              maxAttempts: MAX_COVERAGE_ATTEMPTS,
-              threshold: 3,
-              attempt: async () => {
-                const reservation = await reserveAICall(
-                  ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version,
-                  DEFAULT_BUDGET_LIMITS.max_ai_calls, crypto.randomUUID()
-                );
-                if (!reservation.reserved) {
-                  return reservation.reason === "budget_exhausted" ? "budget_exhausted" : "ownership_lost";
-                }
-                const dedupTracker = new AcquisitionDedupTracker();
-                let candidates: z.infer<typeof CandidateArraySchema>;
-                try {
-                  candidates = await callAIStructured(topicPrompt, CandidateArraySchema, true, "topic_discovery_ai", {
-                    curriculumId: id, jobId: ownerJobRecord.id, streamId, topicId: nodeId,
-                  });
-                } catch (discoveryError) {
-                  if (discoveryError instanceof AITimeoutError) throw discoveryError;
-                  console.warn(`[stream] Discovery attempt returned no usable result for ${node.title}`, discoveryError);
-                  return "attempted";
-                }
-                if (ownershipLost) return "ownership_lost";
-                console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=topic_discovery_ai, topic_id=${nodeId}, candidate_count=${candidates.length}`);
-                for (const candidate of (Array.isArray(candidates) ? candidates : []).filter((item) => item.url && item.title)) {
-                  try {
-                    await discoverVerifiedResource(toLearnParams(
-                      candidate as Record<string, unknown>, { nodeId }, acquisitionJobId,
-                      candidate.ai_note ?? null,
-                      {
-                        topicTitle: node.title,
-                        conceptDescription: node.major_understandings.map((mu) => mu.description).join(" "),
-                      }
-                    ), { cache, dedupTracker, jobId: ownerJobRecord.id, claimToken: ownerJobRecord.claim_token });
-                  } catch (candidateError) {
-                    if (candidateError instanceof PersistenceError) throw candidateError;
-                    console.warn(`[stream] Candidate acquisition failed for ${candidate.url}`, candidateError);
-                  }
-                }
-                return "attempted";
-              },
-              measureEligibleResources: async () => {
-                const { data, error } = await supabase.from("resources").select("id")
-                  .eq("node_id", nodeId).eq("status", "approved").eq("content_type_verified", true);
-                if (error) throw new Error(`Topic coverage query failed: ${error.message}`);
-                return data?.length ?? 0;
-              },
-              record: async ({ resourcesFound, sufficient, budgetExhausted, attemptId }) => recordResourceCoverageAttempt({
-                jobId: ownerJobRecord.id, claimToken: ownerJobRecord.claim_token,
-                claimVersion: ownerJobRecord.claim_version, phase: "topic", targetId: nodeId, attemptId,
-                resourcesFound, sufficient, maxAttempts: MAX_COVERAGE_ATTEMPTS, budgetExhausted,
-              }),
-            });
-            if (topicOutcome === "ownership_lost") {
-              clearHeartbeat();
-              send(controller, "error", { message: "Generation was interrupted because the job lease could not be confirmed." });
-              controller.close();
-              return;
-            }
-            if (topicOutcome === "insufficient") {
-              console.warn(`[stream] Topic ${nodeId} has insufficient coverage after ${MAX_COVERAGE_ATTEMPTS} attempts`);
-            }
-            lastProgressTime = Date.now();
-          } catch (err) {
-            if (err instanceof PersistenceError) {
+            // Reserve AI call for topic discovery
+            const topicReservation = await reserveAICall(
+              ownerJobRecord.id,
+              ownerJobRecord.claim_token,
+              ownerJobRecord.claim_version,
+              DEFAULT_BUDGET_LIMITS.max_ai_calls,
+              crypto.randomUUID()
+            );
+            if (!topicReservation.reserved) {
+              console.error(
+                `[stream] AI budget exhausted for topic ${node.title}: ${topicReservation.reason}`
+              );
               clearHeartbeat();
               await failJob(
-                ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version,
-                `Resource persistence failed: ${err.message}`
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
+                `AI budget exhausted: ${topicReservation.reason}`
               );
-              send(controller, "error", { message: "A resource could not be saved. Generation stopped without recording it as a coverage shortfall." });
+              send(controller, "error", {
+                message: "AI generation budget exhausted. Please try again later.",
+              });
               controller.close();
               return;
             }
+
+            const candidates = await callAIStructured(topicPrompt, CandidateArraySchema, true, "topic_discovery_ai", {
+              curriculumId: id,
+              jobId: ownerJobRecord.id,
+              streamId,
+              topicId: nodeId,
+            });
+            console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=topic_discovery_ai, topic_id=${nodeId}, candidate_count=${candidates.length}`);
+
+            // Check ownership after AI call — if lost mid-call, fail the job
+            if (ownershipLost) {
+              console.log(
+                `[stream] Ownership lost during topic AI call — aborting topic ${node.title}`
+              );
+              clearHeartbeat();
+              void failJob(
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
+                "Ownership lost during topic discovery"
+              );
+              send(controller, "error", {
+                message:
+                  "Generation was interrupted — ownership of the job was lost. Please refresh to check for updates.",
+              });
+              controller.close();
+              return;
+            }
+
+            // Structured output guarantees valid array — no regex extraction needed
+            if (!Array.isArray(candidates)) {
+              console.log(`Structured output wasn't an array for topic "${node.title}", skipping`);
+              continue;
+            }
+
+            const persisted = [];
+            for (const c of candidates.filter((c) => c.url && c.title)) {
+              const params = toLearnParams(
+                c as Record<string, unknown>,
+                { nodeId },
+                acquisitionJobId,
+                c.ai_note ?? null
+              );
+              try {
+                const out = await discoverVerifiedResource(params, {
+                  cache,
+                  dedupTracker,
+                  jobId: ownerJobRecord.id,
+                  claimToken: ownerJobRecord.claim_token,
+                });
+                if (out) {
+                  persisted.push(out);
+                }
+              } catch (routeErr) {
+                // acquireVerifyPersist already isolates per-candidate failures,
+                // but guard here so one unexpected error can't abort the topic.
+                console.log(
+                  `learnResource threw for ${c.url}:`,
+                  routeErr instanceof Error ? routeErr.message : routeErr
+                );
+              }
+            }
+
+            if (persisted.length > 0) {
+              console.log(
+                `Topic "${node.title}": ${persisted.length}/${candidates.length} candidates persisted ` +
+                  `(verified: ${persisted.filter((p) => p.verificationStatus === "verified").length})`
+              );
+            }
+
+            // A topic with no successfully verified, persisted resource is
+            // still unfinished. Leave it out of the checkpoint and release
+            // the claim so a deliberate retry can rediscover it.
+            const verifiedPersistedCount = persisted.filter(
+              (result) => result.verificationStatus === "verified"
+            ).length;
+            if (verifiedPersistedCount === 0) {
+              console.warn(
+                `[stream] Topic has no verified resources; keeping it pending: stream_id=${streamId}, job_id=${ownerJobRecord.id}, topic_id=${nodeId}`
+              );
+              clearHeartbeat();
+              const released = await releaseJobClaim(
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version
+              );
+              if (!released) {
+                send(controller, "error", {
+                  message: "No verified resources were saved for this topic, and the job could not be safely paused. Check its status before retrying.",
+                });
+              } else {
+                send(controller, "paused", {
+                  message: `No verified resources were saved for ${node.title}. Progress is saved and this topic can be retried.`,
+                });
+              }
+              controller.close();
+              return;
+            }
+
+            // Checkpoint only after a verified resource has durably persisted.
+            try {
+              const checkpointOk = await advanceCheckpoint(
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
+                nodeId,
+                verifiedPersistedCount
+              );
+              if (!checkpointOk) {
+                console.error(
+                  `[stream] advance_checkpoint returned false — ownership lost, stopping topic processing`
+                );
+                clearHeartbeat();
+                void failJob(
+                  ownerJobRecord.id,
+                  ownerJobRecord.claim_token,
+                  ownerJobRecord.claim_version,
+                  "Ownership lost at topic checkpoint"
+                );
+                send(controller, "error", {
+                  message: "Generation was interrupted — ownership of the job was lost. Please refresh to check for updates.",
+                });
+                controller.close();
+                return;
+              }
+              console.info(`[stream] Checkpoint persisted: stream_id=${streamId}, job_id=${ownerJobRecord.id}, phase=topics, topic_id=${nodeId}`);
+            } catch (ckptErr) {
+              console.error("[stream] advance_checkpoint threw:", ckptErr);
+              clearHeartbeat();
+              void failJob(
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
+                `Checkpoint error: ${ckptErr instanceof Error ? ckptErr.message : String(ckptErr)}`
+              );
+              send(controller, "error", {
+                message: "Generation was interrupted — an error occurred during checkpoint. Please refresh to check for updates.",
+              });
+              controller.close();
+              return;
+            }
+            // Update progress time on successful checkpoint
+            lastProgressTime = Date.now();
+          } catch (err) {
             if (err instanceof AITimeoutError) throw err;
             const errorCode = err && typeof err === "object" && "code" in err
               ? String((err as { code: unknown }).code)
@@ -1872,79 +1748,155 @@ export async function legacyGenerationGet(
             }
             batchTopicsProcessedThisInvocation++;
 
-            const batchNode = {
-              id: nodeId, curriculum_id: id, external_key: null, title: node.title,
-              order_index: node.order_index, exam_weight_pct: null, claim_statement: null,
-              major_understandings: muRows.map((m) => ({
-                id: m.id, node_id: nodeId, external_key: m.external_key ?? m.code ?? null,
-                code: m.code ?? null, description: m.description, order_index: 0,
-              })),
-            } as NodeWithChildren;
-            const prompt = buildTopicBatchPrompt(batchNode, bgCurriculumTitle, discoveredSources.map((s) => s.domain));
-            const muIds = muRows.map((mu) => mu.id);
-            const batchOutcome = await runBoundedCoverageAttempts({
-              maxAttempts: MAX_COVERAGE_ATTEMPTS,
-              threshold: 2,
-              attempt: async () => {
-                const reservation = await reserveAICall(
-                  ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version,
-                  DEFAULT_BUDGET_LIMITS.max_ai_calls, crypto.randomUUID()
+            let topicBatchPersisted = 0;
+
+            try {
+              const prompt = buildTopicBatchPrompt(
+                {
+                  id: nodeId,
+                  curriculum_id: id,
+                  external_key: null,
+                  title: node.title,
+                  order_index: node.order_index,
+                  exam_weight_pct: null,
+                  claim_statement: null,
+                  major_understandings: muRows.map((m) => ({
+                    id: m.id,
+                    node_id: nodeId,
+                    external_key: m.external_key ?? m.code ?? null,
+                    code: m.code ?? null,
+                    description: m.description,
+                    order_index: 0,
+                  })),
+                } as NodeWithChildren,
+                bgCurriculumTitle,
+                discoveredSources.map((s) => s.domain)
+              );
+
+              // Reserve AI call for background batch topic
+              const batchReservation = await reserveAICall(
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
+                DEFAULT_BUDGET_LIMITS.max_ai_calls,
+                crypto.randomUUID()
+              );
+              if (!batchReservation.reserved) {
+                console.error(
+                  `[stream] AI budget exhausted for background batch topic ${node.title}: ${batchReservation.reason}`
                 );
-                if (!reservation.reserved) {
-                  return reservation.reason === "budget_exhausted" ? "budget_exhausted" : "ownership_lost";
-                }
-                let batchResult: z.infer<typeof BatchResponseSchema>;
-                try {
-                  batchResult = await callAIStructured(prompt, BatchResponseSchema, true, "topic_batch_ai");
-                } catch (discoveryError) {
-                  if (discoveryError instanceof AITimeoutError) throw discoveryError;
-                  console.warn(`[stream] Batch discovery attempt returned no usable result for ${node.title}`, discoveryError);
-                  return "attempted";
-                }
-                if (ownershipLost) return "ownership_lost";
-                for (const candidate of batchResult.topic_resources) {
-                  const targetMuIds = mapUnderstandingCodesToIds(
-                    candidate.understanding_codes,
-                    muRows.map((mu) => ({ id: mu.id, code: mu.code ?? null, external_key: mu.external_key ?? null }))
+                clearHeartbeat();
+                await failJob(
+                  ownerJobRecord.id,
+                  ownerJobRecord.claim_token,
+                  ownerJobRecord.claim_version,
+                  `AI budget exhausted: ${batchReservation.reason}`
+                );
+                return;
+              }
+
+              const batchResult = await callAIStructured(prompt, BatchResponseSchema, true, "topic_batch_ai");
+              console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=batch_discovery_ai, topic_id=${nodeId}, resource_count=${batchResult.topic_resources.length}`);
+
+              // Check ownership after AI call — if lost mid-call, fail the job
+              if (ownershipLost) {
+                console.error(
+                  `[stream] Ownership lost during background batch AI call — aborting`
+                );
+                clearHeartbeat();
+                void failJob(
+                  ownerJobRecord.id,
+                  ownerJobRecord.claim_token,
+                  ownerJobRecord.claim_version,
+                  "Ownership lost during background batch"
+                );
+                return;
+              }
+
+              // Structured output guarantees valid object with topic_resources array
+              const topicResources = batchResult.topic_resources;
+
+              for (const candidate of topicResources) {
+                if (!candidate.url || !candidate.title) continue;
+
+                const coveredMuIds = muRows
+                  .filter((mu) =>
+                    candidate.understanding_codes?.some(
+                      (code) => code === mu.code || code === mu.external_key
+                    )
+                  )
+                  .map((mu) => mu.id);
+
+                const targetMuIds =
+                  coveredMuIds.length > 0
+                    ? coveredMuIds
+                    : muRows.map((m) => m.id);
+
+                // Phase 12: persist each (candidate, understanding) pair through the
+                // Learning Engine so it goes through acquisition + verification +
+                // evidence before landing as a draft resource. The scoped cache
+                // makes re-acquiring the same URL (for other MUs) a cache hit, so
+                // this does not multiply network fetches. No dedup tracker here:
+                // a URL legitimately targets multiple understandings.
+                let batchPersisted = 0;
+                for (const muId of targetMuIds) {
+                  const params = toLearnParams(
+                    candidate as Record<string, unknown>,
+                    { understandingId: muId },
+                    acquisitionJobId,
+                    candidate.ai_note ?? null
                   );
-                  if (!candidate.url || !candidate.title || targetMuIds.length === 0) continue;
-                  for (const muId of targetMuIds) {
-                    try {
-                      await discoverVerifiedResource(toLearnParams(
-                        candidate as Record<string, unknown>, { understandingId: muId },
-                        acquisitionJobId, candidate.ai_note ?? null,
-                        {
-                          topicTitle: node.title,
-                          conceptDescription: muRows.find((mu) => mu.id === muId)?.description,
-                        }
-                      ), { cache, jobId: ownerJobRecord.id, claimToken: ownerJobRecord.claim_token });
-                    } catch (candidateError) {
-                      if (candidateError instanceof PersistenceError) throw candidateError;
-                      console.warn(`[stream] Batch candidate failed for ${candidate.url}`, candidateError);
-                    }
+                  try {
+                    const out = await discoverVerifiedResource(params, {
+                      cache,
+                      jobId: ownerJobRecord.id,
+                      claimToken: ownerJobRecord.claim_token,
+                    });
+                    if (out) batchPersisted++;
+                  } catch (routeErr) {
+                    console.log(
+                      `learnResource threw for ${candidate.url} (mu ${muId}):`,
+                      routeErr instanceof Error ? routeErr.message : routeErr
+                    );
                   }
                 }
-                return "attempted";
-              },
-              measureEligibleResources: async () => {
-                const { data, error } = await supabase.from("resources").select("major_understanding_id")
-                  .in("major_understanding_id", muIds).eq("status", "approved").eq("content_type_verified", true);
-                if (error) throw new Error(`Understanding coverage query failed: ${error.message}`);
-                const rows = data ?? [];
-                return Math.min(...muIds.map((muId) => rows.filter((row) => row.major_understanding_id === muId).length));
-              },
-              record: async ({ resourcesFound, sufficient, budgetExhausted, attemptId }) => recordResourceCoverageAttempt({
-                jobId: ownerJobRecord.id, claimToken: ownerJobRecord.claim_token,
-                claimVersion: ownerJobRecord.claim_version, phase: "batch", targetId: nodeId, attemptId,
-                resourcesFound, sufficient, maxAttempts: MAX_COVERAGE_ATTEMPTS, budgetExhausted,
-              }),
-            });
-            if (batchOutcome === "ownership_lost") {
-              ownershipLost = true;
-              return;
+
+                if (batchPersisted > 0) {
+                  console.log(
+                    `Batch topic "${node.title}": ${batchPersisted}/${targetMuIds.length} ` +
+                      `MU mappings persisted for "${candidate.title}"`
+                  );
+                }
+                topicBatchPersisted += batchPersisted;
+              }
+            } catch (err) {
+              if (err instanceof AITimeoutError) throw err;
+              console.log(`Batch discovery failed for topic "${node.title}":`, err);
             }
-            if (batchOutcome === "insufficient") {
-              console.warn(`[stream] Understanding coverage in topic ${nodeId} is insufficient after ${MAX_COVERAGE_ATTEMPTS} attempts`);
+
+            // Checkpoint: track this topic's background MU completion for recovery.
+            // Uses the real claim token — this call succeeds (not a no-op)
+            // because the job was claimed/registered with a valid claim token
+            // and status='running'. If the process dies after this checkpoint,
+            // recover_stale_jobs will reclaim the job and a future claim_next_job
+            // caller (cron worker or retried SSE) can resume from the checkpoint.
+            try {
+              const checkpointOk = await advanceBatchCheckpoint(
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
+                nodeId,
+                topicBatchPersisted
+              );
+              if (!checkpointOk) {
+                console.error(
+                  `[stream] advance_batch_checkpoint returned false — ownership lost, stopping background batch`
+                );
+                return;
+              }
+              console.info(`[stream] Checkpoint persisted: stream_id=${streamId}, job_id=${ownerJobRecord.id}, phase=batch, topic_id=${nodeId}`);
+            } catch (ckptErr) {
+              console.error("[stream] advance_checkpoint threw:", ckptErr);
             }
 
             if (i < nodeIds.length - 1) {

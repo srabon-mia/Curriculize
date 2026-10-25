@@ -85,15 +85,12 @@ Return ONLY a JSON object, no other text, no markdown backticks:
 }
 
 Rules:
-- Aim for 2-3 strong, distinct resources for EACH understanding, including at least one teaching resource and one practice resource when genuinely available
-- A resource may cover multiple concepts only when its content materially teaches each listed concept
-- Each resource must list every and only the understanding codes it actually covers in understanding_codes
-- Prefer roughly 3-5 additional topic-wide resources in the separate topic discovery pass; do not substitute a general topic resource for a concept-specific one
+- Find 8-12 resources total that collectively cover all the concepts
+- Each resource should list which understanding codes it covers in understanding_codes
 - resource_type must be exactly one of: "video", "text", "textbook", "problem_set", "reference_tool", "practice_exam", "other". Do not combine values.
 - If a resource covers the whole topic generally, list all codes
 - Only freely accessible resources, no login or payment required
 - Match difficulty to the course level — advanced courses need advanced resources
-- Never invent a URL, duplicate a resource, or claim coverage unsupported by the linked content
 - Return only the JSON object
 CRITICAL: Your entire response must be ONLY the JSON object starting with { and ending with }. No introduction, no explanation, no markdown. Start your response with { and end with }.`;
 }

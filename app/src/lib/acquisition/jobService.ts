@@ -4,7 +4,6 @@
  */
 
 import { createClient as createServiceClient } from '@supabase/supabase-js';
-import { throwIfSignalAborted, withAbortSignal } from '@/lib/acquisition/abortableRequest';
 import type {
   AcquisitionJob,
   JobInputData,
@@ -97,45 +96,31 @@ export async function createJobAndCurriculum(
  * Claim the next pending job for processing.
  * Called by the scheduled processor (POST /api/jobs/process).
  */
-export async function claimNextJob(jobType: string = 'curriculum_generation', curriculumId?: string, signal?: AbortSignal): Promise<JobClaimResult | null> {
+export async function claimNextJob(jobType: string = 'curriculum_generation', curriculumId?: string): Promise<JobClaimResult | null> {
   const supabase = getServiceClient();
 
-  const { data, error } = await withAbortSignal(supabase.rpc('claim_next_job', {
+  const { data, error } = await supabase.rpc('claim_next_job', {
     p_job_type: jobType,
     p_curriculum_id: curriculumId ?? null,
-  }), signal);
-  throwIfSignalAborted(signal);
+  });
 
-  if (error) {
-    throw new JobClaimRpcError();
-  }
-
-  if (!data) {
+  if (error || !data) {
     return null;
   }
 
   return data as JobClaimResult;
 }
 
-/** Distinguishes an RPC failure from a successfully observed empty queue. */
-export class JobClaimRpcError extends Error {
-  constructor() {
-    super('claim_next_job RPC failed');
-    this.name = 'JobClaimRpcError';
-  }
-}
-
 /**
  * Renew the lease for a job (heartbeat).
  */
-export async function renewLease(jobId: string, claimToken: string, signal?: AbortSignal): Promise<boolean> {
+export async function renewLease(jobId: string, claimToken: string): Promise<boolean> {
   const supabase = getServiceClient();
 
-  const { data, error } = await withAbortSignal(supabase.rpc('renew_lease', {
+  const { data, error } = await supabase.rpc('renew_lease', {
     p_job_id: jobId,
     p_claim_token: claimToken,
-  }), signal);
-  throwIfSignalAborted(signal);
+  });
 
   if (error) {
     console.error('Renew lease error:', error);
@@ -153,19 +138,17 @@ export async function reserveAICall(
   claimToken: string,
   expectedClaimVersion: number,
   maxAiCalls: number,
-  reservationId: string,
-  signal?: AbortSignal
+  reservationId: string
 ): Promise<ReserveAICallResponse> {
   const supabase = getServiceClient();
 
-  const { data, error } = await withAbortSignal(supabase.rpc('reserve_ai_call', {
+  const { data, error } = await supabase.rpc('reserve_ai_call', {
     p_job_id: jobId,
     p_claim_token: claimToken,
     p_expected_claim_version: expectedClaimVersion,
     p_max_ai_calls: maxAiCalls,
     p_reservation_id: reservationId,
-  }), signal);
-  throwIfSignalAborted(signal);
+  });
 
   if (error) {
     console.error('Reserve AI call error:', error);
@@ -181,18 +164,9 @@ export async function reserveAICall(
 export async function persistWithFence(
   jobId: string,
   claimToken: string,
-  input: PersistWithFenceRequest['input'],
-  signal?: AbortSignal
+  input: PersistWithFenceRequest['input']
 ): Promise<PersistWithFenceResponse> {
   const supabase = getServiceClient();
-  // Exact-retry detection is keyed by acquisition_job_id + content hash in
-  // persist_with_fence. Scope that key to the association target so reusing
-  // the same verified page for another topic/concept still writes its link.
-  const targetScope = input.target.nodeId
-    ? `node:${input.target.nodeId}`
-    : input.target.understandingId
-      ? `understanding:${input.target.understandingId}`
-      : "unscoped";
   // Send only fields consumed by persist_with_fence. Runtime AcquisitionPage
   // and StructuredContent objects also carry raw page bodies and extracted
   // blocks/links; those are not needed by this RPC and may contain characters
@@ -230,9 +204,7 @@ export async function persistWithFence(
       verifiedAt: input.verificationResult.verifiedAt,
     },
     target: { ...input.target },
-    acquisitionJobId: input.acquisitionJobId
-      ? `${input.acquisitionJobId}:${targetScope}`
-      : null,
+    acquisitionJobId: input.acquisitionJobId ?? null,
     callerMetadata: {
       resourceType: input.callerMetadata?.resourceType ?? null,
       licenseStatus: input.callerMetadata?.licenseStatus ?? null,
@@ -240,12 +212,11 @@ export async function persistWithFence(
     },
   };
 
-  const { data, error } = await withAbortSignal(supabase.rpc('persist_with_fence', {
+  const { data, error } = await supabase.rpc('persist_with_fence', {
     p_job_id: jobId,
     p_claim_token: claimToken,
     p_input: rpcInput,
-  }), signal);
-  throwIfSignalAborted(signal);
+  });
 
   if (error) {
     console.error('Persist with fence error:', error);
@@ -306,19 +277,17 @@ export async function advanceCheckpoint(
   claimToken: string,
   expectedClaimVersion: number,
   completedTopicId: string,
-  resourcesFound: number,
-  signal?: AbortSignal
+  resourcesFound: number
 ): Promise<boolean> {
   const supabase = getServiceClient();
 
-  const { data, error } = await withAbortSignal(supabase.rpc('advance_checkpoint', {
+  const { data, error } = await supabase.rpc('advance_checkpoint', {
     p_job_id: jobId,
     p_claim_token: claimToken,
     p_expected_claim_version: expectedClaimVersion,
     p_completed_topic_id: completedTopicId,
     p_resources_found: resourcesFound,
-  }), signal);
-  throwIfSignalAborted(signal);
+  });
 
   if (error) {
     console.error('Advance checkpoint error:', error);
@@ -354,41 +323,6 @@ export async function completeJob(
   return data as boolean;
 }
 
-export type PublishAndCompleteStatus = "completed" | "ownership_lost";
-
-export class PublishAndCompleteError extends Error {
-  constructor(message: string, readonly code: string, options?: ErrorOptions) {
-    super(message, options);
-    this.name = "PublishAndCompleteError";
-  }
-}
-
-/** Atomically publish the curriculum and terminally complete its fenced job. */
-export async function publishAndCompleteJob(input: {
-  jobId: string;
-  claimToken: string;
-  claimVersion: number;
-  signal?: AbortSignal;
-}): Promise<PublishAndCompleteStatus> {
-  const { data, error } = await withAbortSignal(getServiceClient().rpc("publish_and_complete_job", {
-    p_job_id: input.jobId,
-    p_claim_token: input.claimToken,
-    p_expected_claim_version: input.claimVersion,
-  }), input.signal);
-  throwIfSignalAborted(input.signal);
-  if (error) {
-    throw new PublishAndCompleteError("Atomic curriculum publication failed", "DATABASE_ERROR", { cause: error });
-  }
-  if (!data || typeof data !== "object" || Array.isArray(data) || typeof (data as Record<string, unknown>).status !== "string") {
-    throw new PublishAndCompleteError("Atomic curriculum publication returned an invalid response", "INVALID_RESPONSE");
-  }
-  const status = (data as { status: string }).status;
-  if (status === "completed" || status === "already_completed") return "completed";
-  if (status === "ownership_lost_or_expired") return "ownership_lost";
-  const code = status === "curriculum_not_found" ? status : "UNEXPECTED_STATUS";
-  throw new PublishAndCompleteError(`Atomic curriculum publication rejected: ${code}`, code);
-}
-
 /**
  * Fail a job with an error.
  */
@@ -396,18 +330,16 @@ export async function failJob(
   jobId: string,
   claimToken: string,
   expectedClaimVersion: number,
-  error: string,
-  signal?: AbortSignal
+  error: string
 ): Promise<boolean> {
   const supabase = getServiceClient();
 
-  const { data, error: rpcError } = await withAbortSignal(supabase.rpc('fail_job', {
+  const { data, error: rpcError } = await supabase.rpc('fail_job', {
     p_job_id: jobId,
     p_claim_token: claimToken,
     p_expected_claim_version: expectedClaimVersion,
     p_error: error,
-  }), signal);
-  throwIfSignalAborted(signal);
+  });
 
   if (rpcError) {
     console.error('Fail job error:', rpcError);
@@ -426,17 +358,15 @@ export async function failJob(
 export async function releaseJobClaim(
   jobId: string,
   claimToken: string,
-  expectedClaimVersion: number,
-  signal?: AbortSignal
+  expectedClaimVersion: number
 ): Promise<boolean> {
   const supabase = getServiceClient();
 
-  const { data, error } = await withAbortSignal(supabase.rpc('release_job_claim', {
+  const { data, error } = await supabase.rpc('release_job_claim', {
     p_job_id: jobId,
     p_claim_token: claimToken,
     p_expected_claim_version: expectedClaimVersion,
-  }), signal);
-  throwIfSignalAborted(signal);
+  });
 
   if (error) {
     console.error('Release job claim error:', error);
@@ -450,40 +380,20 @@ export async function releaseJobClaim(
  * Persist discovered sources so a resumed invocation can skip the
  * source-discovery AI call.
  */
-export interface TopicCandidateCheckpointEntry {
-  __topic_candidate_checkpoint: {
-    topicId: string;
-    attemptIndex: number;
-    promptHash: string;
-    responseText: string;
-    nextCandidateIndex: number;
-  };
-}
-
-export type PersistedDiscoveryCacheEntry =
-  | { domain: string; name: string; why: string; best_for: string }
-  | TopicCandidateCheckpointEntry;
-
 export async function saveJobSources(
   jobId: string,
   claimToken: string,
   expectedClaimVersion: number,
-  sources: PersistedDiscoveryCacheEntry[],
-  signal?: AbortSignal
+  sources: Array<{ domain: string; name: string; why: string; best_for: string }>
 ): Promise<boolean> {
-  // save_job_sources checks the token/version but does not itself check lease
-  // expiry. Renew atomically first; an expired/stale owner cannot renew, and a
-  // successful renewal keeps the following bounded cache write within lease.
-  if (!(await renewLease(jobId, claimToken, signal))) return false;
   const supabase = getServiceClient();
 
-  const { data, error } = await withAbortSignal(supabase.rpc('save_job_sources', {
+  const { data, error } = await supabase.rpc('save_job_sources', {
     p_job_id: jobId,
     p_claim_token: claimToken,
     p_expected_claim_version: expectedClaimVersion,
     p_sources: sources,
-  }), signal);
-  throwIfSignalAborted(signal);
+  });
 
   if (error) {
     console.error('Save job sources error:', error);
@@ -491,43 +401,6 @@ export async function saveJobSources(
   }
 
   return data as boolean;
-}
-
-export type SaveJobSkeletonStatus = "saved" | "already_saved" | "ownership_lost";
-
-export class SaveJobSkeletonError extends Error {
-  constructor(message: string, readonly code: string, options?: ErrorOptions) {
-    super(message, options);
-    this.name = "SaveJobSkeletonError";
-  }
-}
-
-/** Store an immutable skeleton checkpoint under the current fenced claim. */
-export async function saveJobSkeleton(input: {
-  jobId: string;
-  claimToken: string;
-  claimVersion: number;
-  skeleton: unknown;
-  signal?: AbortSignal;
-}): Promise<SaveJobSkeletonStatus> {
-  const { data, error } = await withAbortSignal(getServiceClient().rpc("save_job_skeleton", {
-    p_job_id: input.jobId,
-    p_claim_token: input.claimToken,
-    p_expected_claim_version: input.claimVersion,
-    p_skeleton: input.skeleton,
-  }), input.signal);
-  throwIfSignalAborted(input.signal);
-  if (error) {
-    throw new SaveJobSkeletonError("Skeleton checkpoint RPC failed", "DATABASE_ERROR", { cause: error });
-  }
-  if (!data || typeof data !== "object" || Array.isArray(data) || typeof (data as Record<string, unknown>).status !== "string") {
-    throw new SaveJobSkeletonError("Skeleton checkpoint RPC returned an invalid response", "INVALID_RESPONSE");
-  }
-  const status = (data as { status: string }).status;
-  if (status === "saved" || status === "already_saved") return status;
-  if (status === "ownership_lost_or_expired") return "ownership_lost";
-  const code = status === "invalid_skeleton" || status === "skeleton_conflict" ? status : "UNEXPECTED_STATUS";
-  throw new SaveJobSkeletonError(`Skeleton checkpoint rejected: ${code}`, code);
 }
 
 /**
@@ -561,85 +434,14 @@ export async function advanceBatchCheckpoint(
   return data as boolean;
 }
 
-export class CoverageAttemptRpcError extends Error {
-  constructor(message: string, readonly code: string, options?: ErrorOptions) {
-    super(message, options);
-    this.name = "CoverageAttemptRpcError";
-  }
-}
-
-export type RecordResourceCoverageAttemptResult =
-  | { status: "retrying"; retry: true; attempts: number }
-  | { status: "complete" | "insufficient"; retry: false; attempts: number }
-  | { status: "ownership_lost"; retry: false };
-
-/** Atomically records a target's bounded coverage attempt and final checkpoint. */
-export async function recordResourceCoverageAttempt(input: {
-  jobId: string;
-  claimToken: string;
-  claimVersion: number;
-  phase: "topic" | "batch";
-  targetId: string;
-  attemptId: string;
-  resourcesFound: number;
-  sufficient: boolean;
-  maxAttempts?: number;
-  budgetExhausted?: boolean;
-  signal?: AbortSignal;
-}): Promise<RecordResourceCoverageAttemptResult> {
-  const supabase = getServiceClient();
-  const { data, error } = await withAbortSignal(supabase.rpc("record_resource_coverage_attempt", {
-    p_job_id: input.jobId,
-    p_claim_token: input.claimToken,
-    p_expected_claim_version: input.claimVersion,
-    p_phase: input.phase,
-    p_target_id: input.targetId,
-    p_attempt_id: input.attemptId,
-    p_resources_found: input.resourcesFound,
-    p_sufficient: input.sufficient,
-    p_max_attempts: input.maxAttempts ?? 2,
-    p_budget_exhausted: input.budgetExhausted ?? false,
-  }), input.signal);
-  throwIfSignalAborted(input.signal);
-  if (error) {
-    throw new CoverageAttemptRpcError(
-      `Coverage attempt RPC failed: ${error.message ?? "database client error"}`,
-      "DATABASE_ERROR",
-      { cause: error }
-    );
-  }
-
-  if (data === null || typeof data !== "object" || Array.isArray(data)) {
-    throw new CoverageAttemptRpcError("Coverage attempt RPC returned an empty or malformed response", "INVALID_RESPONSE");
-  }
-
-  const response = data as Record<string, unknown>;
-  if ("error" in response) {
-    if (response.error === "ownership_lost_or_expired") {
-      return { status: "ownership_lost", retry: false };
-    }
-    const code = typeof response.error === "string" ? response.error : "UNKNOWN_RPC_ERROR";
-    throw new CoverageAttemptRpcError(`Coverage attempt RPC rejected the request: ${code}`, code);
-  }
-
-  const validStatuses = ["retrying", "complete", "insufficient"];
-  const expectedRetry = response.status === "retrying";
-  if (!validStatuses.includes(String(response.status)) ||
-      typeof response.retry !== "boolean" || response.retry !== expectedRetry ||
-      !Number.isSafeInteger(response.attempts) || (response.attempts as number) < 0) {
-    throw new CoverageAttemptRpcError("Coverage attempt RPC returned an invalid response shape", "INVALID_RESPONSE");
-  }
-  return response as RecordResourceCoverageAttemptResult;
-}
-
-export async function recoverStaleJobs(signal?: AbortSignal): Promise<Array<{ id: string; status: string; retry_count: number }>> {
+export async function recoverStaleJobs(): Promise<Array<{ id: string; status: string; retry_count: number }>> {
   const supabase = getServiceClient();
 
-  const { data, error } = await withAbortSignal(supabase.rpc('recover_stale_jobs'), signal);
-  throwIfSignalAborted(signal);
+  const { data, error } = await supabase.rpc('recover_stale_jobs');
 
   if (error) {
-    throw new Error(`Recover stale jobs RPC failed (${error.code ?? 'database error'})`);
+    console.error('Recover stale jobs error:', error);
+    return [];
   }
 
   return (data as Array<{ id: string; status: string; retry_count: number }>) || [];
@@ -648,15 +450,14 @@ export async function recoverStaleJobs(signal?: AbortSignal): Promise<Array<{ id
 /**
  * Get a job by ID (for status polling).
  */
-export async function getJobById(jobId: string, signal?: AbortSignal): Promise<AcquisitionJob | null> {
+export async function getJobById(jobId: string): Promise<AcquisitionJob | null> {
   const supabase = getServiceClient();
 
-  const { data, error } = await withAbortSignal(supabase
+  const { data, error } = await supabase
     .from('acquisition_jobs')
     .select('*')
     .eq('id', jobId)
-    .single(), signal);
-  throwIfSignalAborted(signal);
+    .single();
 
   if (error || !data) {
     return null;
