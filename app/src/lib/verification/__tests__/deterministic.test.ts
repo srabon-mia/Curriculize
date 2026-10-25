@@ -16,6 +16,7 @@ import type {
   Link,
 } from "@/lib/acquisition/structuredExtract";
 import type { EducationalEvidence, PatternMatch } from "@/lib/evidence/types";
+import { extractEducationalEvidence } from "@/lib/evidence/deterministic";
 
 function makeStructuredContent(overrides: Partial<StructuredContent> = {}): StructuredContent {
   const baseBlocks: TextBlock[] = [
@@ -112,6 +113,49 @@ function makeVerificationInput(overrides: Partial<VerificationInput> = {}): Veri
 }
 
 describe("verifyContent", () => {
+  test("uses target-relevant fetched instructional evidence for the approval signal", () => {
+    const structuredContent = makeStructuredContent({
+      blocks: [
+        { text: "We begin with the first-order differential equation y' + 2y = e^x.", tagName: "p" },
+        { text: "Multiplying both sides by the integrating factor e^(2x) gives the left side as a product derivative.", tagName: "p" },
+        { text: "Integrating gives e^(2x)y = (1/3)e^(3x) + C, therefore y = (1/3)e^x + Ce^(-2x).", tagName: "p" },
+      ],
+    });
+    const educationalEvidence = extractEducationalEvidence(structuredContent, {
+      topicTitle: "Differential Equations",
+      conceptDescription: "First-order linear differential equations and integrating factors",
+    });
+
+    const result = verifyContent(makeVerificationInput({
+      structuredContent,
+      educationalEvidence,
+    }));
+
+    expect(result.status).toBe("verified");
+    expect(result.advisorySignals.educationalEvidencePresent).toBe(true);
+  });
+
+  test("does not signal an explicit but off-target lesson as approval evidence", () => {
+    const structuredContent = makeStructuredContent({
+      blocks: [
+        { text: "Students will be able to solve quadratic equations.", tagName: "p" },
+        { text: "A quadratic equation is defined as ax^2 + bx + c = 0.", tagName: "p" },
+      ],
+    });
+    const educationalEvidence = extractEducationalEvidence(structuredContent, {
+      topicTitle: "Differential Equations",
+      conceptDescription: "First-order linear differential equations",
+    });
+
+    const result = verifyContent(makeVerificationInput({
+      structuredContent,
+      educationalEvidence,
+    }));
+
+    expect(result.status).toBe("verified");
+    expect(result.advisorySignals.educationalEvidencePresent).toBe(false);
+  });
+
   describe("hard gate: cleanedContentNonEmpty", () => {
     test("1. Normal educational resource - verified", () => {
       const input = makeVerificationInput();

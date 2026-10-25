@@ -310,7 +310,9 @@ function createMockNodes() {
       id: "node-1",
       curriculum_id: "test-curriculum-id",
       external_key: "topic-1",
-      title: "Test Topic",
+      // The acquired-page fixture below teaches quadratic equations; the
+      // target context must match so this remains a valid auto-approval case.
+      title: "Quadratic Equations",
       order_index: 1,
       exam_weight_pct: "20-30%",
       claim_statement: null,

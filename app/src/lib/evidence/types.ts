@@ -38,6 +38,12 @@ export interface PatternMatch {
   confidence: Confidence;
 }
 
+/** Curriculum target context used to keep evidence tied to its assignment. */
+export interface EvidenceTargetContext {
+  topicTitle: string;
+  conceptDescription?: string;
+}
+
 /** Educational evidence extracted from a document */
 export interface EducationalEvidence {
   /** Source identity hashes */
@@ -56,6 +62,14 @@ export interface EducationalEvidence {
     explicitDefinitions: PatternMatch[];
     /** Explicit exercise/practice/problem statements */
     explicitExercises: PatternMatch[];
+    /** Target-relevant worked mathematical examples and derivations. */
+    workedExamples?: PatternMatch[];
+    /** Target-relevant instructional explanations supported by page text. */
+    instructionalExplanations?: PatternMatch[];
+    /** Extracted educational signals that also matched the requested target. */
+    targetRelevantEvidence?: PatternMatch[];
+    /** Target terms matched in the evidence blocks, retained for auditability. */
+    targetTermsMatched?: string[];
   };
 }
 

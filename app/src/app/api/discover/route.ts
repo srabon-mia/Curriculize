@@ -280,7 +280,10 @@ export async function POST(request: Request) {
     // ---- EVIDENCE EXTRACTION ----
     let educationalEvidence;
     try {
-      educationalEvidence = extractEducationalEvidence(structuredContent);
+      educationalEvidence = extractEducationalEvidence(structuredContent, {
+        topicTitle: node.title,
+        conceptDescription: mu?.description,
+      });
     } catch (err) {
       console.log("Evidence extraction error:", err instanceof Error ? err.message : err, "for url:", candidate.url);
       skippedCount++;

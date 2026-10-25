@@ -43,6 +43,7 @@ import {
 } from "@/lib/acquisition";
 import { normalizeResourceType } from "@/lib/acquisition/resourceTypes";
 import { extractEducationalEvidence } from "@/lib/evidence";
+import type { EvidenceTargetContext } from "@/lib/evidence/types";
 import { verifyContent, type VerificationResult } from "@/lib/verification";
 import {
   persistVerifiedResource,
@@ -77,6 +78,8 @@ export interface LearnParams {
   candidate: DiscoveryCandidateInput;
   /** Where the persisted resource should attach */
   target: ResourceTarget;
+  /** Fetched-page relevance context from the curriculum target, not AI metadata. */
+  targetContext?: EvidenceTargetContext;
   /** Optional acquisition job id for idempotent retry dedup in verification_records */
   acquisitionJobId?: string;
 }
@@ -172,7 +175,10 @@ export async function discoverVerifiedResource(
   }
 
   // 6B — deterministic educational evidence from the structured content.
-  const educationalEvidence = extractEducationalEvidence(result.structuredContent);
+  const educationalEvidence = extractEducationalEvidence(
+    result.structuredContent,
+    params.targetContext
+  );
 
   // 6C — deterministic verification gate (pure, no AI).
   const verificationResult: VerificationResult = verifyContent({

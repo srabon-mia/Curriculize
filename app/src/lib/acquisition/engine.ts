@@ -85,6 +85,29 @@ export function validateCandidate(candidate: DiscoveryCandidate): CanonicalUrl {
   return validation.canonical;
 }
 
+const CLEAR_INTERSTITIAL_TEXT = [
+  /\bverify (?:that )?you are human\b/i,
+  /\bcomplete (?:the )?(?:security|captcha) check\b/i,
+  /\bchecking your browser before accessing\b/i,
+  /\benable javascript and cookies to continue\b/i,
+  /\bunusual traffic from your network\b/i,
+  /\bautomated requests from your (?:computer|network)\b/i,
+  /\byour request has been blocked\b/i,
+  /\baccess denied due to (?:a )?security check\b/i,
+];
+const CHALLENGE_TITLE = /\b(?:client challenge|security check|captcha|attention required)\b/i;
+const CHALLENGE_BODY_CONTEXT = /\b(?:enable javascript|enable cookies|verify (?:that )?you are human|security check|captcha|unusual traffic|automated requests|browser verification)\b/i;
+
+/**
+ * Identify common HTTP-200 anti-bot/interstitial bodies using their content.
+ * A challenge-like title alone is deliberately insufficient.
+ */
+export function isLikelyInterstitialPage(title: string, text: string): boolean {
+  const body = text.slice(0, 8_000);
+  if (CLEAR_INTERSTITIAL_TEXT.some((pattern) => pattern.test(body))) return true;
+  return CHALLENGE_TITLE.test(title) && CHALLENGE_BODY_CONTEXT.test(body);
+}
+
 /**
  * Generate a deduplication key for a candidate.
  * Uses Phase 4 deterministic utilities.
@@ -220,6 +243,26 @@ export async function acquireCandidate(
           statusCode: acquired.statusCode,
           contentType: acquired.contentType,
           title: cleaned.title,
+        },
+      },
+    };
+  }
+
+  // An HTTP-200 challenge page is a fetch success but not the intended lesson.
+  // Return a bounded per-candidate failure so the caller can continue to the
+  // next discovery result or the next existing coverage attempt.
+  if (isLikelyInterstitialPage(cleaned.title, cleaned.text)) {
+    return {
+      candidate,
+      success: false,
+      error: {
+        code: "UNUSABLE_INTERSTITIAL",
+        message: "Page returned challenge or interstitial content instead of usable lesson content",
+        details: {
+          url: acquired.finalUrl,
+          statusCode: acquired.statusCode,
+          title: cleaned.title,
+          reason: "challenge_or_interstitial_text_detected",
         },
       },
     };

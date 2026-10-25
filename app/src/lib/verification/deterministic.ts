@@ -50,10 +50,16 @@ function computeAdvisorySignals(
   const { interpreted } = educationalEvidence;
 
   const titlePresent = metadata.title.length > 0;
-  const educationalEvidencePresent =
+  const hasLegacyEvidence =
     interpreted.explicitLearningObjectives.length > 0 ||
     interpreted.explicitDefinitions.length > 0 ||
     interpreted.explicitExercises.length > 0;
+  // When a target context was supplied, the extractor has already restricted
+  // these signals to target-relevant page text. Keep legacy, targetless callers
+  // compatible while using the stricter result in generation pipelines.
+  const educationalEvidencePresent = interpreted.targetRelevantEvidence
+    ? interpreted.targetRelevantEvidence.length > 0
+    : hasLegacyEvidence;
 
   return {
     titlePresent,

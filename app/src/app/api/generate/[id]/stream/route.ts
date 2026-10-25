@@ -273,7 +273,8 @@ function toLearnParams(
   candidate: Record<string, unknown>,
   target: { nodeId?: string; understandingId?: string },
   acquisitionJobId?: string,
-  aiNote?: string | null
+  aiNote?: string | null,
+  targetContext?: LearnParams["targetContext"]
 ): LearnParams {
   return {
     candidate: {
@@ -288,6 +289,7 @@ function toLearnParams(
       aiNote: (candidate.ai_note as string | undefined) ?? aiNote ?? null,
     },
     target,
+    targetContext,
     acquisitionJobId,
   };
 }
@@ -1634,7 +1636,12 @@ export async function legacyGenerationGet(
                 for (const candidate of (Array.isArray(candidates) ? candidates : []).filter((item) => item.url && item.title)) {
                   try {
                     await discoverVerifiedResource(toLearnParams(
-                      candidate as Record<string, unknown>, { nodeId }, acquisitionJobId, candidate.ai_note ?? null
+                      candidate as Record<string, unknown>, { nodeId }, acquisitionJobId,
+                      candidate.ai_note ?? null,
+                      {
+                        topicTitle: node.title,
+                        conceptDescription: node.major_understandings.map((mu) => mu.description).join(" "),
+                      }
                     ), { cache, dedupTracker, jobId: ownerJobRecord.id, claimToken: ownerJobRecord.claim_token });
                   } catch (candidateError) {
                     if (candidateError instanceof PersistenceError) throw candidateError;
@@ -1905,7 +1912,11 @@ export async function legacyGenerationGet(
                     try {
                       await discoverVerifiedResource(toLearnParams(
                         candidate as Record<string, unknown>, { understandingId: muId },
-                        acquisitionJobId, candidate.ai_note ?? null
+                        acquisitionJobId, candidate.ai_note ?? null,
+                        {
+                          topicTitle: node.title,
+                          conceptDescription: muRows.find((mu) => mu.id === muId)?.description,
+                        }
                       ), { cache, jobId: ownerJobRecord.id, claimToken: ownerJobRecord.claim_token });
                     } catch (candidateError) {
                       if (candidateError instanceof PersistenceError) throw candidateError;
