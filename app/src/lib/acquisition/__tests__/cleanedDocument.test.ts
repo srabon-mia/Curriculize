@@ -4,6 +4,7 @@
 
 import { buildCleanedDocument, serializeCleanedDocument } from "../cleanedDocument";
 import { extractStructuredContentFromDoc } from "../structuredExtract";
+import { extractEducationalEvidence } from "@/lib/evidence/deterministic";
 import { cleanPage } from "../cleaner";
 import type { AcquiredPage } from "../types";
 
@@ -333,6 +334,61 @@ describe("extractStructuredContentFromDoc (Phase 6A)", () => {
     // Only the p should create a block
     expect(structured.blocks).toHaveLength(1);
     expect(structured.blocks[0].tagName).toBe("p");
+  });
+
+  test("extracts MIT-style instructional text from divs and ignores navigation", () => {
+    const nav = Array.from({ length: 25 }, (_, index) =>
+      `<h2>Course navigation ${index + 1}</h2><a href="/week-${index + 1}">Week ${index + 1}</a>`
+    ).join("");
+    const acquired = makeAcquiredPage({
+      body: `<html><body><nav>${nav}</nav><aside class="sidebar">Course menu</aside><main>
+        <h1>Differential Equations</h1>
+        <div><span>For a first-order differential equation,</span> multiplying by the integrating factor gives a derivative of a product. Integrating both sides yields the general solution.</div>
+        <div><h2>Solution method</h2><p>Apply the initial condition to determine the constant.</p></div>
+      </main></body></html>`,
+    });
+    const doc = buildCleanedDocument(acquired);
+    const structured = extractStructuredContentFromDoc(doc);
+    const evidence = extractEducationalEvidence(structured, {
+      topicTitle: "Differential Equations",
+      conceptDescription: "Solving first-order differential equations with an integrating factor",
+    });
+
+    expect(doc.tree.tagName).toBe("main");
+    expect(structured.headings).toHaveLength(2);
+    expect(structured.statistics.paragraphCount).toBe(1);
+    expect(structured.blocks.some((block) => block.tagName === "div" && block.text.includes("integrating factor"))).toBe(true);
+    expect(structured.blocks.map((block) => block.text).join(" ")).not.toContain("Course navigation");
+    expect(evidence.interpreted.targetRelevantEvidence?.length).toBeGreaterThan(0);
+  });
+
+  test("heading-heavy lesson indexes do not turn headings or links into lesson blocks", () => {
+    const index = Array.from({ length: 26 }, (_, index) =>
+      `<h2>Lecture ${index + 1}</h2><a href="/lecture-${index + 1}">Slides and notes</a>`
+    ).join("");
+    const acquired = makeAcquiredPage({
+      body: `<html><head><title>Differential Equations Course</title></head><body><main><h1>Differential Equations</h1>${index}</main></body></html>`,
+    });
+    const doc = buildCleanedDocument(acquired);
+    const structured = extractStructuredContentFromDoc(doc);
+    const evidence = extractEducationalEvidence(structured, { topicTitle: "Differential Equations" });
+
+    expect(structured.statistics.headingCount).toBe(27);
+    expect(structured.blocks).toHaveLength(0);
+    expect(structured.links).toHaveLength(26);
+    expect(evidence.interpreted.targetRelevantEvidence).toEqual([]);
+  });
+
+  test("extracts substantial instructional prose in generic div containers", () => {
+    const acquired = makeAcquiredPage({
+      body: `<html><body><main><div class="lesson-content"><div>When solving a differential equation, first separate the variables. Integrate each side and apply the initial condition to find the particular solution.</div></div></main></body></html>`,
+    });
+    const structured = extractStructuredContentFromDoc(buildCleanedDocument(acquired));
+
+    expect(structured.blocks).toEqual([{
+      tagName: "div",
+      text: "When solving a differential equation, first separate the variables. Integrate each side and apply the initial condition to find the particular solution.",
+    }]);
   });
 
   test("extracts links with resolved hrefs", () => {

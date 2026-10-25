@@ -11,6 +11,7 @@ import type {
 } from "./types";
 import { validateResourceTarget, PersistenceError } from "./types";
 import { verifyContent, type VerificationResult } from "@/lib/verification";
+import { qualifiesForAutomaticApproval } from "./approvalPolicy";
 
 /** Supabase service role client for admin operations */
 function getServiceClient() {
@@ -60,9 +61,10 @@ function computeEmbedAllowed(licenseStatus: string, domainScore: number): boolea
  * presence of explicit educational signals (learning objectives, definitions, or exercises).
  */
 function shouldAutoApprove(verificationResult: VerificationResult): boolean {
-  if (verificationResult.status !== "verified") return false;
-  // Advisory signal: educationalEvidencePresent indicates explicit educational content
-  return verificationResult.advisorySignals.educationalEvidencePresent === true;
+  return qualifiesForAutomaticApproval({
+    verificationStatus: verificationResult.status,
+    educationalEvidencePresent: verificationResult.advisorySignals.educationalEvidencePresent,
+  });
 }
 
 /** Find existing resource by canonical URL + target context */
@@ -71,7 +73,12 @@ async function findExistingResourceByCanonicalUrl(
   canonicalUrl: string,
   targetNodeId: string | undefined,
   targetUnderstandingId: string | undefined
-): Promise<{ id: string; created_at: string } | null> {
+): Promise<{
+  id: string;
+  created_at: string;
+  status: "draft" | "approved" | "rejected";
+  status_reviewed_by: string | null;
+} | null> {
   // Step 1: Find verification records with this canonical URL
   const { data: vrRows, error: vrError } = await supabase
     .from("verification_records")
@@ -93,7 +100,7 @@ async function findExistingResourceByCanonicalUrl(
   const resourceIds = vrRows.map((r) => r.resource_id);
   const { data: resources, error: resError } = await supabase
     .from("resources")
-    .select("id, node_id, major_understanding_id, created_at")
+    .select("id, node_id, major_understanding_id, created_at, status, status_reviewed_by")
     .in("id", resourceIds);
 
   if (resError) {
@@ -125,7 +132,19 @@ async function findExistingResourceByCanonicalUrl(
   // Step 4: If multiple legacy matches, pick most recent by created_at
   matching.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
-  return { id: matching[0].id, created_at: matching[0].created_at };
+  return {
+    id: matching[0].id,
+    created_at: matching[0].created_at,
+    status: matching[0].status,
+    status_reviewed_by: matching[0].status_reviewed_by,
+  };
+}
+
+function hasProtectedResourceDecision(resource: {
+  status: "draft" | "approved" | "rejected";
+  status_reviewed_by: string | null;
+}): boolean {
+  return resource.status !== "draft" || resource.status_reviewed_by !== null;
 }
 
 /** Create a new resource row */
@@ -146,7 +165,7 @@ async function createResource(
   const licenseStatus = callerMetadata?.licenseStatus ?? "link_only";
   const aiNote = callerMetadata?.aiNote ?? null;
 
-  // Auto-approve if verification passes AND educational evidence is present
+  // Auto-approve only verified pages with explicit educational evidence.
   const autoApprove = shouldAutoApprove(input.verificationResult);
 
   const insertData = {
@@ -160,6 +179,7 @@ async function createResource(
     embed_allowed: embedAllowed,
     content_type_verified: verificationStatus === "verified",
     ai_note: aiNote,
+    status_reviewed_by: null,
     status: autoApprove ? "approved" : "draft",
   };
 
@@ -196,7 +216,7 @@ async function updateResource(
   const licenseStatus = callerMetadata?.licenseStatus ?? "link_only";
   const aiNote = callerMetadata?.aiNote ?? null;
 
-  // Auto-approve if verification passes AND educational evidence is present
+  // Keep updates under the same conservative approval policy as inserts.
   const autoApprove = shouldAutoApprove(input.verificationResult);
 
   const updateData = {
@@ -214,7 +234,9 @@ async function updateResource(
   const { error } = await supabase
     .from("resources")
     .update(updateData)
-    .eq("id", resourceId);
+    .eq("id", resourceId)
+    .eq("status", "draft")
+    .is("status_reviewed_by", null);
 
   if (error) {
     throw new PersistenceError("RESOURCE_INSERT_FAILED", "Failed to update resource", {
@@ -243,6 +265,28 @@ async function resourceHasContentHash(
     throw new PersistenceError("RESOURCE_LOOKUP_FAILED", "Failed to check existing content hash", {
       resourceId,
       contentHash,
+      error: error.message,
+    });
+  }
+
+  return (data?.length ?? 0) > 0;
+}
+
+/** Respect legacy verification-level review markers while resource-level review state rolls out. */
+async function resourceHasHumanReviewedRecord(
+  supabase: ReturnType<typeof getServiceClient>,
+  resourceId: string
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("verification_records")
+    .select("id")
+    .eq("resource_id", resourceId)
+    .eq("human_reviewed", true)
+    .limit(1);
+
+  if (error) {
+    throw new PersistenceError("RESOURCE_LOOKUP_FAILED", "Failed to check manual review state", {
+      resourceId,
       error: error.message,
     });
   }
@@ -429,13 +473,23 @@ export async function persistVerifiedResource(input: PersistenceInput): Promise<
     }
   }
 
+  const legacyHumanReview = existingResource && !isExactRetry &&
+    existingResource.status === "draft" && existingResource.status_reviewed_by === null
+    ? await resourceHasHumanReviewedRecord(supabase, existingResource.id)
+    : false;
+
   if (!isExactRetry) {
     // Not an exact retry - need to create or reuse resource, then create verification record
     const isVerified = true;
 
     if (existingResource) {
       // Resource exists
-      if (isVerified) {
+      if (hasProtectedResourceDecision(existingResource) || legacyHumanReview) {
+        // An admin decision (including an intentional draft) protects both
+        // status and the resource representation from automated replacement.
+        resourceId = existingResource.id;
+        resourceIsNew = false;
+      } else if (isVerified) {
         // Verified: check if resource already has this content hash
         const hasContentHash = await resourceHasContentHash(supabase, existingResource.id, contentHash);
         if (!hasContentHash) {

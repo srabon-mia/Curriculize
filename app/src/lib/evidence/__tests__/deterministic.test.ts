@@ -657,4 +657,139 @@ describe("extractEducationalEvidence", () => {
       expect(objectives[0].blockIndex).toBe(1); // Second block (0-indexed)
     });
   });
+
+  describe("target-relevant instructional evidence", () => {
+    const target = {
+      topicTitle: "Differential Equations",
+      conceptDescription: "First-order linear differential equations and integrating factors",
+    };
+
+    test("recognizes a worked derivation without objective, definition, or exercise phrasing", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("We begin with the first-order differential equation y' + 2y = e^x."),
+          makeTextBlock("Multiplying both sides by the integrating factor e^(2x) gives the left side as a product derivative."),
+          makeTextBlock("Integrating gives e^(2x)y = (1/3)e^(3x) + C, therefore y = (1/3)e^x + Ce^(-2x)."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content, target);
+      expect(evidence.interpreted.explicitLearningObjectives).toHaveLength(0);
+      expect(evidence.interpreted.explicitDefinitions).toHaveLength(0);
+      expect(evidence.interpreted.explicitExercises).toHaveLength(0);
+      expect(evidence.interpreted.workedExamples?.length).toBeGreaterThan(0);
+      expect(evidence.interpreted.targetRelevantEvidence?.length).toBeGreaterThan(0);
+      expect(evidence.interpreted.targetTermsMatched).toContain("integrating");
+    });
+
+    test("recognizes relevant explanatory prose supported by mathematical content", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("A differential equation relates an unknown function to its derivatives, and its solutions describe how that function changes."),
+          makeTextBlock("For a first-order equation, the initial condition selects one particular solution from the family of possible curves."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content, target);
+      expect(evidence.interpreted.instructionalExplanations?.length).toBeGreaterThan(0);
+      expect(evidence.interpreted.targetRelevantEvidence?.length).toBeGreaterThan(0);
+    });
+
+    test("recognizes a genuine derivation when the target is named in its instructional block", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("For a first-order differential equation, multiply through by the integrating factor μ(x)=e^(∫p(x)dx); therefore the left side becomes the derivative of μ(x)y."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content, target);
+      expect(evidence.interpreted.workedExamples?.length).toBeGreaterThan(0);
+      expect(evidence.interpreted.targetRelevantEvidence?.length).toBeGreaterThan(0);
+    });
+
+    test("recognizes an explanation tied to a specific concept-level target", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("An integrating factor converts a first-order linear differential equation into an exact derivative, because multiplication by μ(x) changes y' + p(x)y = q(x) into (μy)' = μq."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content, {
+        topicTitle: "Differential Equations",
+        conceptDescription: "Integrating Factor Method",
+      });
+      expect(evidence.interpreted.instructionalExplanations?.length).toBeGreaterThan(0);
+      expect(evidence.interpreted.targetRelevantEvidence?.length).toBeGreaterThan(0);
+    });
+
+    test("keeps relevant explicit practice evidence", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("Practice Problems:"),
+          makeTextBlock("1. Solve the differential equation y' + 3y = 6 using an integrating factor."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content, target);
+      expect(evidence.interpreted.explicitExercises.length).toBeGreaterThan(0);
+      expect(evidence.interpreted.targetRelevantEvidence?.length).toBeGreaterThan(0);
+    });
+
+    test("does not qualify navigation, boilerplate, sparse text, or unrelated page exercises", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("Skip to content. Accept cookies. Sign in to continue."),
+          makeTextBlock("Practice Problems:"),
+          makeTextBlock("1. Find the best route through medieval trade history."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content, target);
+      expect(evidence.interpreted.targetRelevantEvidence).toEqual([]);
+    });
+
+    test("does not borrow target terms from a heading or neighboring unrelated example", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("Differential Equations", "h2"),
+          makeTextBlock("Substitute 3 into x + 2 = 5; therefore x = 3."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content, {
+        topicTitle: "Differential Equations",
+      });
+      expect(evidence.interpreted.targetRelevantEvidence).toEqual([]);
+      expect(evidence.interpreted.workedExamples).toEqual([]);
+      expect(evidence.interpreted.instructionalExplanations).toEqual([]);
+    });
+
+    test("does not treat a navigation link containing the target as instructional relevance", () => {
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock("Differential Equations", "a"),
+          makeTextBlock("Substitute 3 into x + 2 = 5; therefore x = 3."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content, {
+        topicTitle: "Differential Equations",
+      });
+      expect(evidence.interpreted.targetRelevantEvidence).toEqual([]);
+    });
+
+    test("does not treat repeated generic page text as independent instructional evidence", () => {
+      const repeatedText = "This differential equation lesson explains how solutions change over time.";
+      const content = makeStructuredContent({
+        blocks: [
+          makeTextBlock(repeatedText),
+          makeTextBlock(repeatedText),
+          makeTextBlock(repeatedText),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content, target);
+      expect(evidence.interpreted.targetRelevantEvidence).toEqual([]);
+    });
+  });
 });

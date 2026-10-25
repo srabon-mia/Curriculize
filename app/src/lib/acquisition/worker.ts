@@ -372,6 +372,7 @@ export interface TopicDiscoveryMetrics {
   rejectedUrlOrTitle: number;
   fetchFailures: number;
   contentExtractionFailures: number;
+  interstitialPageFailures: number;
   verificationRejections: number;
   persistenceSuccesses: number;
   persistenceFailures: number;
@@ -385,6 +386,7 @@ export function createTopicDiscoveryMetrics(): TopicDiscoveryMetrics {
     rejectedUrlOrTitle: 0,
     fetchFailures: 0,
     contentExtractionFailures: 0,
+    interstitialPageFailures: 0,
     verificationRejections: 0,
     persistenceSuccesses: 0,
     persistenceFailures: 0,
@@ -400,6 +402,7 @@ export function logTopicDiscoveryMetrics(topicId: string, metrics: TopicDiscover
     rejected_url_or_title: metrics.rejectedUrlOrTitle,
     fetch_failures: metrics.fetchFailures,
     content_extraction_failures: metrics.contentExtractionFailures,
+    interstitial_page_failures: metrics.interstitialPageFailures,
     verification_rejections: metrics.verificationRejections,
     persistence_successes: metrics.persistenceSuccesses,
     persistence_failures: metrics.persistenceFailures,
@@ -893,7 +896,10 @@ export async function processJob(
             deadline.check();
             if (!acquisitionResult.success) {
               const code = acquisitionResult.error?.code;
-              if (code === 'EMPTY_CONTENT') discoveryMetrics.contentExtractionFailures++;
+              if (code === 'EMPTY_CONTENT' || code === 'UNUSABLE_INTERSTITIAL') {
+                discoveryMetrics.contentExtractionFailures++;
+                if (code === 'UNUSABLE_INTERSTITIAL') discoveryMetrics.interstitialPageFailures++;
+              }
               else if (code && URL_VALIDATION_FAILURES.has(code)) discoveryMetrics.rejectedUrlOrTitle++;
               else discoveryMetrics.fetchFailures++;
               continue;
@@ -906,7 +912,10 @@ export async function processJob(
             let educationalEvidence: ReturnType<typeof extractEducationalEvidence>;
             let verificationResult: VerificationResult;
             try {
-              educationalEvidence = extractEducationalEvidence(structuredContent);
+              educationalEvidence = extractEducationalEvidence(structuredContent, {
+                topicTitle: node.title,
+                conceptDescription: node.major_understandings.map((mu) => mu.description).join(" "),
+              });
               verificationResult = verifyContent({
                 acquiredPage: {
                   contentHash: acquiredPage.contentHash,
@@ -1159,6 +1168,8 @@ export async function processBatchDiscovery(
         let associatedTargetCount = 0;
         let malformedCandidateCount = 0;
         let fetchFailureCount = 0;
+        let contentExtractionFailureCount = 0;
+        let interstitialPageFailureCount = 0;
         let verificationFailureCount = 0;
         let persistedAssociationCount = 0;
         for (const candidate of batchResources) {
@@ -1206,7 +1217,15 @@ export async function processBatchDiscovery(
             deadline?.check();
 
             if (!acquisitionResult.success || !acquisitionResult.acquiredPage || !acquisitionResult.structuredContent) {
-              fetchFailureCount++;
+              if (acquisitionResult.error?.code === 'EMPTY_CONTENT' ||
+                  acquisitionResult.error?.code === 'UNUSABLE_INTERSTITIAL') {
+                contentExtractionFailureCount++;
+                if (acquisitionResult.error?.code === 'UNUSABLE_INTERSTITIAL') {
+                  interstitialPageFailureCount++;
+                }
+              } else {
+                fetchFailureCount++;
+              }
               continue;
             }
 
@@ -1214,7 +1233,11 @@ export async function processBatchDiscovery(
             let educationalEvidence: ReturnType<typeof extractEducationalEvidence>;
             let verificationResult: VerificationResult;
             try {
-              educationalEvidence = extractEducationalEvidence(structuredContent);
+              const targetUnderstanding = muRows.find((mu) => mu.id === muId);
+              educationalEvidence = extractEducationalEvidence(structuredContent, {
+                topicTitle: node.title,
+                conceptDescription: targetUnderstanding?.description,
+              });
               verificationResult = verifyContent({
                 acquiredPage: {
                   contentHash: acquiredPage.contentHash,
@@ -1253,6 +1276,8 @@ export async function processBatchDiscovery(
           associated_targets: associatedTargetCount,
           malformed_or_unassociated: malformedCandidateCount,
           fetch_failures: fetchFailureCount,
+          content_extraction_failures: contentExtractionFailureCount,
+          interstitial_page_failures: interstitialPageFailureCount,
           verification_failures: verificationFailureCount,
           persisted_rows: persistedAssociationCount,
         });
