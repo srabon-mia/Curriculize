@@ -19,6 +19,9 @@ export const metadata: Metadata = {
   title: "Curriculize — Human-Curated Study Guides",
   description:
     "Discover structured learning roadmaps built around authoritative, human-written curricula and resources. Generate topic-by-topic study guides or browse published curricula.",
+  icons: {
+    icon: [{ url: "/favicon.jpg", type: "image/jpeg" }],
+  },
   openGraph: {
     title: "Curriculize — Human-Curated Study Guides",
     description:
