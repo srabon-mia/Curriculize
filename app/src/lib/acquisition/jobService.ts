@@ -450,13 +450,31 @@ export async function releaseJobClaim(
  * Persist discovered sources so a resumed invocation can skip the
  * source-discovery AI call.
  */
+export interface TopicCandidateCheckpointEntry {
+  __topic_candidate_checkpoint: {
+    topicId: string;
+    attemptIndex: number;
+    promptHash: string;
+    responseText: string;
+    nextCandidateIndex: number;
+  };
+}
+
+export type PersistedDiscoveryCacheEntry =
+  | { domain: string; name: string; why: string; best_for: string }
+  | TopicCandidateCheckpointEntry;
+
 export async function saveJobSources(
   jobId: string,
   claimToken: string,
   expectedClaimVersion: number,
-  sources: Array<{ domain: string; name: string; why: string; best_for: string }>,
+  sources: PersistedDiscoveryCacheEntry[],
   signal?: AbortSignal
 ): Promise<boolean> {
+  // save_job_sources checks the token/version but does not itself check lease
+  // expiry. Renew atomically first; an expired/stale owner cannot renew, and a
+  // successful renewal keeps the following bounded cache write within lease.
+  if (!(await renewLease(jobId, claimToken, signal))) return false;
   const supabase = getServiceClient();
 
   const { data, error } = await withAbortSignal(supabase.rpc('save_job_sources', {

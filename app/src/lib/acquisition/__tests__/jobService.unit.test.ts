@@ -53,6 +53,7 @@ import {
   recordResourceCoverageAttempt,
   CoverageAttemptRpcError,
   saveJobSkeleton,
+  saveJobSources,
   SaveJobSkeletonError,
   completeJob,
   publishAndCompleteJob,
@@ -129,6 +130,34 @@ describe("Job Service Layer - RPC Contract Verification", () => {
         .mockResolvedValueOnce({ data: { status: 12 }, error: null });
       await expect(saveJobSkeleton(input)).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
       await expect(saveJobSkeleton(input)).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+    });
+  });
+
+  describe("saveJobSources lease fencing", () => {
+    const sources = [{ domain: "example.org", name: "Example", why: "test", best_for: "test" }];
+
+    it("renews a live lease before writing the token/version-fenced source cache", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({ data: true, error: null })
+        .mockResolvedValueOnce({ data: true, error: null });
+
+      await expect(saveJobSources("job-1", "claim-1", 7, sources)).resolves.toBe(true);
+      expect(mockSupabase.rpc.mock.calls).toEqual([
+        ["renew_lease", { p_job_id: "job-1", p_claim_token: "claim-1" }],
+        ["save_job_sources", {
+          p_job_id: "job-1", p_claim_token: "claim-1", p_expected_claim_version: 7, p_sources: sources,
+        }],
+      ]);
+    });
+
+    it("refuses an expired/stale lease without attempting the cache write", async () => {
+      (mockSupabase.rpc as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ data: false, error: null });
+
+      await expect(saveJobSources("job-1", "expired-claim", 7, sources)).resolves.toBe(false);
+      expect(mockSupabase.rpc).toHaveBeenCalledTimes(1);
+      expect(mockSupabase.rpc).toHaveBeenCalledWith("renew_lease", {
+        p_job_id: "job-1", p_claim_token: "expired-claim",
+      });
     });
   });
 

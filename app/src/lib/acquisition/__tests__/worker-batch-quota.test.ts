@@ -42,7 +42,11 @@ vi.mock('@/lib/acquisition/engine', () => ({
 import {
   callAIDiscover,
   createTopicDiscoveryMetrics,
+  getResumableTopicDiscovery,
   logTopicDiscoveryMetrics,
+  processCandidatesFromCheckpoint,
+  readDiscoveryCache,
+  serializeDiscoveryCache,
   processBatchDiscovery,
 } from '@/lib/acquisition/worker';
 
@@ -103,6 +107,85 @@ describe('topic discovery diagnostics', () => {
     });
     expect(JSON.stringify(log.mock.calls)).not.toContain('http');
     log.mockRestore();
+  });
+
+  it('persists parsed topic candidates before a budget yield and resumes the cursor without another search', async () => {
+    const sources = [{ domain: 'openstax.org', name: 'OpenStax', why: 'textbook', best_for: 'lessons' }];
+    const responseText = '[{"url":"https://openstax.org/a","title":"A"},{"url":"https://openstax.org/b","title":"B"}]';
+    let savedCache: unknown;
+    let searchCalls = 0;
+    const discoverOrResume = (checkpoint: ReturnType<typeof readDiscoveryCache>['topicCheckpoint']) => {
+      const resumable = getResumableTopicDiscovery(checkpoint, 'topic-1', 0, 'a'.repeat(64));
+      if (resumable) return resumable.responseText;
+      searchCalls++;
+      return responseText;
+    };
+    const firstResponse = discoverOrResume(null);
+    savedCache = serializeDiscoveryCache(sources, {
+      topicId: 'topic-1', attemptIndex: 0, promptHash: 'a'.repeat(64), responseText: firstResponse, nextCandidateIndex: 0,
+    });
+    const firstCache = readDiscoveryCache(savedCache);
+    expect(firstCache.sources).toEqual(sources);
+    expect(firstCache.topicCheckpoint?.responseText).toBe(responseText);
+
+    const processed: string[] = [];
+    await expect(processCandidatesFromCheckpoint({
+      candidates: JSON.parse(firstCache.topicCheckpoint!.responseText) as Array<{ title: string }>,
+      startAt: firstCache.topicCheckpoint!.nextCandidateIndex,
+      checkBeforeCandidate: () => { throw new Error('Processor work budget reached'); },
+      processCandidate: async (candidate) => { processed.push(candidate.title); },
+      saveNextCandidateIndex: async (nextCandidateIndex) => {
+      savedCache = serializeDiscoveryCache(sources, { ...firstCache.topicCheckpoint!, nextCandidateIndex });
+      },
+    })).rejects.toThrow('Processor work budget reached');
+    expect(processed).toEqual([]);
+
+    // The subsequent invocation resumes the saved response; it does not call
+    // Azure again and advances a durable cursor after each candidate.
+    const resumedCache = readDiscoveryCache(savedCache);
+    const resumed = getResumableTopicDiscovery(resumedCache.topicCheckpoint, 'topic-1', 0, 'a'.repeat(64))!;
+    expect(discoverOrResume(resumedCache.topicCheckpoint)).toBe(responseText);
+    const resumedCandidates = JSON.parse(resumed.responseText) as Array<{ title: string }>;
+    await processCandidatesFromCheckpoint({
+      candidates: resumedCandidates,
+      startAt: resumed.nextCandidateIndex,
+      checkBeforeCandidate: () => undefined,
+      processCandidate: async (candidate) => { processed.push(candidate.title); },
+      saveNextCandidateIndex: async (nextCandidateIndex) => {
+        savedCache = serializeDiscoveryCache(sources, { ...resumed, nextCandidateIndex });
+      },
+    });
+    expect(searchCalls).toBe(1);
+    expect(processed).toEqual(['A', 'B']);
+    expect(readDiscoveryCache(savedCache).topicCheckpoint?.nextCandidateIndex).toBe(2);
+    expect(getResumableTopicDiscovery(resumedCache.topicCheckpoint, 'other-topic', 0, 'a'.repeat(64))).toBeNull();
+    expect(getResumableTopicDiscovery(resumedCache.topicCheckpoint, 'topic-1', 1, 'a'.repeat(64))).toBeNull();
+    expect(getResumableTopicDiscovery(resumedCache.topicCheckpoint, 'topic-1', 0, 'b'.repeat(64))).toBeNull();
+    expect(readDiscoveryCache(serializeDiscoveryCache(sources, {
+      ...resumed,
+      nextCandidateIndex: 99,
+    })).topicCheckpoint).toBeNull();
+    expect(readDiscoveryCache(serializeDiscoveryCache(sources, {
+      ...resumed,
+      responseText: 'not valid JSON',
+      nextCandidateIndex: 0,
+    })).topicCheckpoint).toBeNull();
+  });
+
+  it('does not advance the candidate cursor after a persistence failure', async () => {
+    const saveCursor = vi.fn(async (_nextCandidateIndex: number) => undefined);
+    const processCandidate = vi.fn(async (_candidate: string) => {
+      throw new Error('transient persistence failure');
+    });
+    await expect(processCandidatesFromCheckpoint({
+      candidates: ['candidate-1', 'candidate-2'],
+      startAt: 0,
+      checkBeforeCandidate: () => undefined,
+      processCandidate,
+      saveNextCandidateIndex: saveCursor,
+    })).rejects.toThrow('transient persistence failure');
+    expect(processCandidate).toHaveBeenCalledTimes(1);
+    expect(saveCursor).not.toHaveBeenCalled();
   });
 });
 

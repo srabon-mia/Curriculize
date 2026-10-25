@@ -34,6 +34,7 @@ import { getNodesWithUnderstandings, type NodeWithChildren } from '@/lib/curricu
 import { createClient } from '@supabase/supabase-js';
 import type { AICompleteResult } from '@/lib/ai/types';
 import type { JobBudgetLimits, JobClaimResult } from '@/lib/acquisition/jobTypes';
+import type { PersistedDiscoveryCacheEntry, TopicCandidateCheckpointEntry } from '@/lib/acquisition/jobService';
 import { mapUnderstandingCodesToIds } from '@/lib/acquisition/coverage';
 import { runBoundedCoverageAttempts } from '@/lib/acquisition/coverage';
 import { createWorkerDeadline, WorkerYieldRequested } from '@/lib/acquisition/workerDeadline';
@@ -54,6 +55,13 @@ class ResourcePersistenceError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'ResourcePersistenceError';
+  }
+}
+
+class WorkerClaimLostError extends Error {
+  constructor() {
+    super('The fenced topic-discovery checkpoint was rejected');
+    this.name = 'WorkerClaimLostError';
   }
 }
 
@@ -475,6 +483,69 @@ interface DiscoveredSource {
   best_for: string;
 }
 
+type TopicCandidateCheckpoint = TopicCandidateCheckpointEntry['__topic_candidate_checkpoint'];
+
+export function serializeDiscoveryCache(
+  sources: DiscoveredSource[],
+  checkpoint: TopicCandidateCheckpoint
+): PersistedDiscoveryCacheEntry[] {
+  return [...sources, { __topic_candidate_checkpoint: checkpoint }];
+}
+
+export function readDiscoveryCache(value: unknown): {
+  sources: DiscoveredSource[];
+  topicCheckpoint: TopicCandidateCheckpoint | null;
+} {
+  if (!Array.isArray(value)) return { sources: [], topicCheckpoint: null };
+  const sources = value.filter((entry): entry is DiscoveredSource =>
+    typeof entry === 'object' && entry !== null && typeof (entry as DiscoveredSource).domain === 'string'
+  );
+  const marker = value.find((entry) => typeof entry === 'object' && entry !== null &&
+    '__topic_candidate_checkpoint' in entry) as TopicCandidateCheckpointEntry | undefined;
+  const checkpoint = marker?.__topic_candidate_checkpoint;
+  if (!checkpoint || typeof checkpoint.topicId !== 'string' ||
+      !Number.isSafeInteger(checkpoint.attemptIndex) || checkpoint.attemptIndex < 0 ||
+      typeof checkpoint.promptHash !== 'string' || !/^[a-f0-9]{64}$/.test(checkpoint.promptHash) ||
+      typeof checkpoint.responseText !== 'string' ||
+      !Number.isSafeInteger(checkpoint.nextCandidateIndex) || checkpoint.nextCandidateIndex < 0) {
+    return { sources, topicCheckpoint: null };
+  }
+  let candidateCount: number;
+  try {
+    const parsedResponse = extractJSON(checkpoint.responseText);
+    if (!Array.isArray(parsedResponse)) return { sources, topicCheckpoint: null };
+    candidateCount = parsedResponse.length;
+  } catch {
+    return { sources, topicCheckpoint: null };
+  }
+  if (checkpoint.nextCandidateIndex > candidateCount) return { sources, topicCheckpoint: null };
+  return { sources, topicCheckpoint: checkpoint };
+}
+
+export function getResumableTopicDiscovery(
+  checkpoint: TopicCandidateCheckpoint | null,
+  topicId: string,
+  attemptIndex: number,
+  promptHash: string
+): TopicCandidateCheckpoint | null {
+  return checkpoint?.topicId === topicId && checkpoint.attemptIndex === attemptIndex &&
+    checkpoint.promptHash === promptHash ? checkpoint : null;
+}
+
+export async function processCandidatesFromCheckpoint<T>(input: {
+  candidates: T[];
+  startAt: number;
+  checkBeforeCandidate: () => void;
+  processCandidate: (candidate: T, index: number) => Promise<void>;
+  saveNextCandidateIndex: (nextCandidateIndex: number) => Promise<void>;
+}): Promise<void> {
+  for (let index = input.startAt; index < input.candidates.length; index++) {
+    input.checkBeforeCandidate();
+    await input.processCandidate(input.candidates[index], index);
+    await input.saveNextCandidateIndex(index + 1);
+  }
+}
+
 function parseSources(text: string): DiscoveredSource[] {
   try {
     const match = text.match(/\[[\s\S]*\]/);
@@ -830,12 +901,9 @@ export async function processJob(
 
     // Source discovery cache remains independent of the structural checkpoint.
     const persistedSources = (jobState.result_data as { discoveredSources?: unknown } | null)?.discoveredSources;
-    const cachedSources: DiscoveredSource[] = Array.isArray(persistedSources)
-      ? persistedSources.filter(
-          (s): s is DiscoveredSource =>
-            typeof s === "object" && s !== null && typeof (s as DiscoveredSource).domain === "string"
-        )
-      : [];
+    const discoveryCache = readDiscoveryCache(persistedSources);
+    const cachedSources = discoveryCache.sources;
+    let topicCandidateCheckpoint = discoveryCache.topicCheckpoint;
 
     const nodeIds: Array<{ nodeId: string; node: SkeletonNode }> = [];
     // Title used in discovery prompts. On a fresh run this is the AI-generated
@@ -968,6 +1036,18 @@ export async function processJob(
       console.log(`[worker] Reusing ${discoveredSources.length} cached sources (source AI call skipped)`);
     }
 
+    // The existing fenced source-cache RPC stores arbitrary JSON in
+    // result_data.discoveredSources. Keep its legacy array shape and append a
+    // marker entry so web-search output and the candidate cursor survive yield.
+    const persistTopicCandidateCheckpoint = async (checkpoint: TopicCandidateCheckpoint) => {
+      const cache = serializeDiscoveryCache(discoveredSources, checkpoint);
+      const saved = await saveJobSources(
+        job.id, job.claim_token!, job.claim_version, cache, deadline.cleanupSignal()
+      );
+      if (!saved) throw new WorkerClaimLostError();
+      topicCandidateCheckpoint = checkpoint;
+    };
+
     // Step 5: Topic-level resource discovery
     // Bounded work: at most MAX_TOPICS_PER_INVOCATION new topics per invocation.
     // Topics already recorded in the checkpoint are skipped, so a resumed
@@ -1049,20 +1129,41 @@ export async function processJob(
           if (!reservation.reserved) {
             return reservation.reason === "budget_exhausted" ? "budget_exhausted" : "ownership_lost";
           }
-          deadline.checkBeforeExpensiveOperation();
-          const responseText = await callAIDiscover(topicPrompt, {
-            curriculumId,
-            jobId: job.id,
-            topicId: nodeId,
-          }, deadline.signal);
+          const promptHash = createHash('sha256').update(topicPrompt).digest('hex');
+          const savedTopicCheckpoint = getResumableTopicDiscovery(topicCandidateCheckpoint, nodeId, attemptIndex, promptHash);
+          let responseText: string;
+          let startCandidateAt = 0;
+          if (savedTopicCheckpoint) {
+            responseText = savedTopicCheckpoint.responseText;
+            startCandidateAt = savedTopicCheckpoint.nextCandidateIndex;
+            console.log(`[worker] Resuming ${nodeId} candidates at ${startCandidateAt}`);
+          } else {
+            deadline.checkBeforeExpensiveOperation();
+            responseText = await callAIDiscover(topicPrompt, {
+              curriculumId,
+              jobId: job.id,
+              topicId: nodeId,
+            }, deadline.signal);
+            await persistTopicCandidateCheckpoint({
+              topicId: nodeId,
+              attemptIndex,
+              promptHash,
+              responseText,
+              nextCandidateIndex: 0,
+            });
+          }
           discoveryMetrics.responseTextChars += responseText.length;
           const candidates: ResourceCandidate[] = parseCandidates(responseText);
           discoveryMetrics.parsedCandidates += candidates.length;
-          for (const candidate of candidates) {
+          await processCandidatesFromCheckpoint({
+            candidates,
+            startAt: startCandidateAt,
+            checkBeforeCandidate: () => deadline.checkBeforeExpensiveOperation(),
+            processCandidate: async (candidate) => {
             if (!candidate || typeof candidate.url !== 'string' || !candidate.url.trim() ||
                 typeof candidate.title !== 'string' || !candidate.title.trim()) {
               discoveryMetrics.rejectedUrlOrTitle++;
-              continue;
+              return;
             }
             const resourceType = normalizeResourceType(candidate.resource_type);
             let mappedCandidate: ReturnType<typeof mapToDiscoveryCandidate>;
@@ -1070,9 +1171,8 @@ export async function processJob(
               mappedCandidate = mapToDiscoveryCandidate({ ...candidate, resource_type: resourceType }, []);
             } catch {
               discoveryMetrics.rejectedUrlOrTitle++;
-              continue;
+              return;
             }
-            deadline.checkBeforeExpensiveOperation();
             const acquisitionResult = await acquireCandidate(
               { url: mappedCandidate.url, title: mappedCandidate.title, sourceDomain: mappedCandidate.sourceDomain, resourceType: mappedCandidate.resourceType, aiNote: mappedCandidate.aiNote },
               { ...DEFAULT_ACQUISITION_OPTIONS, timeoutMs: 8000, signal: deadline.signal },
@@ -1086,11 +1186,11 @@ export async function processJob(
               }
               else if (code && URL_VALIDATION_FAILURES.has(code)) discoveryMetrics.rejectedUrlOrTitle++;
               else discoveryMetrics.fetchFailures++;
-              continue;
+              return;
             }
             if (!acquisitionResult.acquiredPage || !acquisitionResult.structuredContent) {
               discoveryMetrics.contentExtractionFailures++;
-              continue;
+              return;
             }
             const { acquiredPage, structuredContent } = acquisitionResult;
             let educationalEvidence: ReturnType<typeof extractEducationalEvidence>;
@@ -1114,7 +1214,7 @@ export async function processJob(
               });
             } catch {
               discoveryMetrics.verificationRejections++;
-              continue;
+              return;
             }
             if (verificationResult.status !== 'verified') discoveryMetrics.verificationRejections++;
             try {
@@ -1138,7 +1238,15 @@ export async function processJob(
               discoveryMetrics.persistenceFailures++;
               throw error;
             }
-          }
+            },
+            saveNextCandidateIndex: async (nextCandidateIndex) => persistTopicCandidateCheckpoint({
+              topicId: nodeId,
+              attemptIndex,
+              promptHash,
+              responseText,
+              nextCandidateIndex,
+            }),
+          });
           return "attempted";
         },
         measureEligibleResources: async () => {
@@ -1205,6 +1313,7 @@ export async function processJob(
     return 'completed';
 
   } catch (error) {
+    if (error instanceof WorkerClaimLostError) return 'ownership_lost';
     if (error instanceof WorkerYieldRequested || deadline.signal.aborted) {
       console.info('[worker] Invocation budget reached; releasing claim for checkpoint resume', { job_id: job.id });
       return releaseDeadlineYield(job, releaseJobClaim, deadline.cleanupSignal());
