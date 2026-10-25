@@ -115,6 +115,8 @@ function setupExistingVerifiedResource(mockClient: MockSupabaseClient, overrides
   contentHash?: string;
   title?: string;
   jobId?: string;
+  status?: "draft" | "approved" | "rejected";
+  statusReviewedBy?: string | null;
 } = {}) {
   const resourceId = overrides.resourceId ?? "existing-resource-1";
   const canonicalUrl = overrides.canonicalUrl ?? "https://example.com/page";
@@ -135,7 +137,8 @@ function setupExistingVerifiedResource(mockClient: MockSupabaseClient, overrides
     embed_allowed: false,
     content_type_verified: true,
     ai_note: "Test note",
-    status: "draft",
+    status: overrides.status ?? "draft",
+    status_reviewed_by: overrides.statusReviewedBy ?? null,
     created_at: "2024-01-15T10:00:00.000Z",
   });
 
@@ -223,6 +226,49 @@ describe("Production persistVerifiedResource - Regression Tests", () => {
     expect(vrRows[0].status).toBe("verified");
   });
 
+  it("approves a short verified page when explicit educational evidence is present", async () => {
+    const input = makePersistenceInput({
+      structuredContent: makeStructuredContent({
+        statistics: {
+          wordCount: 42,
+          headingCount: 1,
+          headingCountsByLevel: { 1: 1, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 },
+          paragraphCount: 1,
+          linkCount: 0,
+          externalLinkCount: 0,
+        },
+        blocks: [{ text: "Learning objectives: solve initial value problems.", tagName: "p" }],
+      }),
+      educationalEvidence: makeEducationalEvidence({
+        interpreted: {
+          explicitLearningObjectives: [{
+            text: "Learning objectives: solve initial value problems.",
+            blockIndex: 0,
+            pattern: "^learning objectives?:",
+            confidence: "high",
+          }],
+          explicitDefinitions: [],
+          explicitExercises: [],
+        },
+      }),
+      verificationResult: makeVerificationResult({
+        advisorySignals: {
+          titlePresent: true,
+          educationalEvidencePresent: true,
+          wordCount: 42,
+          headingCount: 1,
+          paragraphCount: 1,
+        },
+      }),
+    });
+
+    await persistVerifiedResource(input);
+
+    const [resource] = mockClient.getRows("resources");
+    expect(resource.status).toBe("approved");
+    expect(resource.content_type_verified).toBe(true);
+  });
+
   it("Existing verified resource + failed verification → no resource update; state unchanged", async () => {
     // Pre-populate with an existing verified resource
     setupExistingVerifiedResource(mockClient, {
@@ -302,6 +348,60 @@ describe("Production persistVerifiedResource - Regression Tests", () => {
     expect(vrRows[0].resource_id).toBe(vrRows[1].resource_id);
   });
 
+  it.each([
+    ["rejected", null],
+    ["approved", null],
+    ["draft", "admin-1"],
+  ] as const)("preserves a protected %s resource and its representation on a new-content retry", async (status, statusReviewedBy) => {
+    setupExistingVerifiedResource(mockClient, {
+      resourceId: `protected-${status}`,
+      canonicalUrl: "https://example.com/page",
+      contentHash: "hash-old",
+      title: "Admin-reviewed title",
+      jobId: "job-old",
+      status,
+      statusReviewedBy,
+    });
+
+    const input = makePersistenceInput({
+      acquiredPage: makeAcquiredPage({
+        finalUrl: "https://example.com/new-representation",
+        canonicalUrl: makeCanonicalUrl("https://example.com/page"),
+        contentHash: "hash-new",
+      }),
+      structuredContent: makeStructuredContent({ metadata: {
+        title: "Automated replacement title",
+        description: "New description",
+        author: "New author",
+        datePublished: "2026-10-24",
+        language: "en",
+      } }),
+      verificationResult: makeVerificationResult({
+        contentHash: "hash-new",
+        advisorySignals: {
+          titlePresent: true,
+          educationalEvidencePresent: true,
+          wordCount: 400,
+          headingCount: 3,
+          paragraphCount: 12,
+        },
+      }),
+      acquisitionJobId: "job-new",
+    });
+
+    const result = await persistVerifiedResource(input);
+
+    expect(result.resource.id).toBe(`protected-${status}`);
+    expect(result.resource.status).toBe(status);
+    expect(result.resource.title).toBe("Admin-reviewed title");
+    expect(result.resource.url).toBe("https://example.com/page");
+    const [resource] = mockClient.getRows("resources");
+    expect(resource.status).toBe(status);
+    expect(resource.title).toBe("Admin-reviewed title");
+    expect(resource.url).toBe("https://example.com/page");
+    expect(mockClient.getRows("verification_records")).toHaveLength(2);
+  });
+
   it("Exact retry → no unintended resource mutation", async () => {
     // Pre-populate with an existing resource and verification record for exact retry
     setupExistingVerifiedResource(mockClient, {
@@ -331,5 +431,24 @@ describe("Production persistVerifiedResource - Regression Tests", () => {
 
     const vrRows = mockClient.getRows("verification_records");
     expect(vrRows).toHaveLength(1); // Exact retry reuses existing VR
+  });
+
+  it("exact retry preserves its concept association without duplicating records", async () => {
+    const input = makePersistenceInput({
+      target: { understandingId: "mu-exact-retry" },
+      acquisitionJobId: "job-mu-exact-retry",
+    });
+
+    const first = await persistVerifiedResource(input);
+    const retried = await persistVerifiedResource(input);
+
+    expect(retried.verificationRecord.isExactRetry).toBe(true);
+    expect(retried.resource.id).toBe(first.resource.id);
+    expect(mockClient.getRows("resources")).toHaveLength(1);
+    expect(mockClient.getRows("verification_records")).toHaveLength(1);
+    const mappings = mockClient.getRows("resource_mappings");
+    expect(mappings).toHaveLength(1);
+    expect(mappings[0].resource_id).toBe(first.resource.id);
+    expect(mappings[0].understanding_id).toBe("mu-exact-retry");
   });
 });

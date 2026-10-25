@@ -65,6 +65,11 @@ class MockQueryBuilder<TRow extends RowShape = DbRow> {
     return this;
   }
 
+  is(col: string, val: unknown): this {
+    this.eqFilters.push({ col, val });
+    return this;
+  }
+
   in(col: string, vals: unknown[]): this {
     this.inFilters.push({ col, vals });
     return this;

@@ -24,7 +24,9 @@ export async function PATCH(
 
   const { data, error } = await auth.supabase
     .from("resources")
-    .update({ status })
+    // Persist every admin-selected status, including an intentional draft, so
+    // later automated upserts cannot reinterpret it as an unreviewed default.
+    .update({ status, status_reviewed_by: auth.user.id })
     .eq("id", id)
     .select()
     .single();

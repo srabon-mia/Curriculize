@@ -230,7 +230,7 @@ export function CurriculumBuilder({
     setRefreshKey((k) => k + 1);
   }, [targetKey]);
 
-  async function updateResourceStatus(id: string, status: "approved" | "rejected") {
+  async function updateResourceStatus(id: string, status: "draft" | "approved" | "rejected") {
     await fetch(`/api/resources/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -410,6 +410,7 @@ export function CurriculumBuilder({
                   resource={r}
                   onApprove={(id) => updateResourceStatus(id, "approved")}
                   onReject={(id) => updateResourceStatus(id, "rejected")}
+                  onKeepDraft={(id) => updateResourceStatus(id, "draft")}
                   onDelete={(id) => handleDelete(id)}
                 />
               ))}

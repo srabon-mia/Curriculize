@@ -256,16 +256,9 @@ describe("discoverVerifiedResource — Phase 12 cutover", () => {
       { cache }
     );
 
-    // Even if the (mocked) persistence layer were misconfigured to return approved,
-    // the orchestrator contract is that persisted resources carry status=draft unless
-    // an admin explicitly approved them. We assert the contract that the orchestrator
-    // does NOT pass an approved status to persistence, and that a verified resource
-    // only becomes eligible when status==approved && content_type_verified==true
-    // (selectEligibleResources). Here persistence is mocked so we assert persist was
-    // invoked with a draft-targeting flow:
     expect(mockedPersist).toHaveBeenCalledTimes(1);
-    expect(out!.resource.status).toBe("approved"); // echoed from mocked persistence
-    // The real safeguard is the persistence layer's createResource (status='draft');
-    // this test pins the integration contract documented in persistence/index.ts.
+    // Even if persistence is mocked as approved, the orchestrator echoes its result;
+    // the real safeguard is the persistence layer's createResource status gate.
+    expect(out!.resource.status).toBe("approved");
   });
 });

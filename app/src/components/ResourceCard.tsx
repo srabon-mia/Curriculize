@@ -70,11 +70,13 @@ export function ResourceCard({
   resource,
   onApprove,
   onReject,
+  onKeepDraft,
   onDelete,
 }: {
   resource: Resource;
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
+  onKeepDraft: (id: string) => void;
   onDelete: (id: string) => void;
 }) {
   const [showDeleteModal, setShowDeleteModal] = useState(false);
@@ -144,6 +146,13 @@ export function ResourceCard({
 
         {resource.status === "draft" && (
           <div className="flex gap-2.5 mt-3 pt-3 border-t border-border-subtle">
+            <button
+              type="button"
+              onClick={() => onKeepDraft(resource.id)}
+              className="text-xs sm:text-sm font-medium px-3.5 py-1.5 rounded-lg border border-border-default text-text-secondary hover:border-border-hover transition"
+            >
+              Keep as draft
+            </button>
             <button
               type="button"
               onClick={() => onApprove(resource.id)}
