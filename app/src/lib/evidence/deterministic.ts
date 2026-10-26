@@ -228,21 +228,27 @@ function extractTargetRelevantInstructionalContent(
           MECHANISTIC_EXPLANATION.test(block.text);
         return !contributesSignal || termsByBlock[index].length > 0;
       });
-      const hasMathBackedExplanation = INSTRUCTIONAL_LANGUAGE.test(text) &&
-        MATHEMATICAL_CONTENT.test(text);
+      const hasInstructionalExplanation = INSTRUCTIONAL_LANGUAGE.test(text);
       const hasMechanisticExplanation = MECHANISTIC_EXPLANATION.test(text);
       if (!signalsAreTargetBound ||
-          (!hasMathBackedExplanation && !hasMechanisticExplanation)) continue;
+          (!hasInstructionalExplanation && !hasMechanisticExplanation)) continue;
+
+      // Keep worked-example classification math-specific. Other accepted
+      // target-relevant instructional prose remains an explanation.
+      const isWorkedMathExample = MATHEMATICAL_CONTENT.test(text) &&
+        WORKED_STEP_LANGUAGE.test(text);
 
       const match: PatternMatch = {
         text: truncateForEvidence(text),
         blockIndex: i,
         pattern: hasMechanisticExplanation
           ? "target-relevant-mechanistic-explanation"
-          : "target-relevant-instructional-math-content",
+          : isWorkedMathExample
+            ? "target-relevant-instructional-math-content"
+            : "target-relevant-instructional-explanation",
         confidence: "medium",
       };
-      if (WORKED_STEP_LANGUAGE.test(text)) workedExamples.push(match);
+      if (isWorkedMathExample) workedExamples.push(match);
       else explanations.push(match);
     }
   }

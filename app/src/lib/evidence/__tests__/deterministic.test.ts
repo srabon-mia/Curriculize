@@ -711,6 +711,23 @@ describe("extractEducationalEvidence", () => {
       expect(evidence.interpreted.instructionalExplanations?.length).toBeGreaterThan(0);
     });
 
+    test("recognizes target-relevant hydroponics explanations without mathematical content", () => {
+      const content = makeStructuredContent({
+        blocks: [makeTextBlock(
+          "In hydroponics, plants grow without soil because their roots absorb dissolved nutrients directly from circulating water, allowing growers to control mineral delivery."
+        )],
+      });
+
+      const evidence = extractEducationalEvidence(content, {
+        topicTitle: "Hydroponics",
+        conceptDescription: "Plant nutrition and nutrient delivery in hydroponic systems",
+      });
+
+      expect(evidence.interpreted.workedExamples).toHaveLength(0);
+      expect(evidence.interpreted.instructionalExplanations?.length).toBeGreaterThan(0);
+      expect(evidence.interpreted.targetRelevantEvidence?.length).toBeGreaterThan(0);
+    });
+
     test("recognizes a detailed future-mission explanation, not merely a mission mention", () => {
       const content = makeStructuredContent({
         blocks: [makeTextBlock(
