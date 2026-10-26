@@ -33,6 +33,7 @@ const FIELDS = {
 };
 
 const topic = "AP Chemistry";
+let originalServiceRoleKey: string | undefined;
 
 function bodyFor(topicValue: string, overrides: Partial<typeof FIELDS> = {}) {
   return {
@@ -67,11 +68,15 @@ function seededCurriculumCount() {
 
 describe("POST /api/generate warm-path cache lookup", () => {
   beforeEach(() => {
+    originalServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "test-result-cookie-signing-key";
     mockClient.reset();
     vi.clearAllMocks();
   });
 
   afterEach(() => {
+    if (originalServiceRoleKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = originalServiceRoleKey;
     vi.clearAllMocks();
   });
 
@@ -114,6 +119,8 @@ describe("POST /api/generate warm-path cache lookup", () => {
     expect(response.status).toBe(200);
     expect(json.cached).toBe(false);
     expect(json.curriculum_id).toBeDefined();
+    expect(response.headers.get("set-cookie")).toContain(`curriculum_result_${json.curriculum_id}=`);
+    expect(response.headers.get("set-cookie")).toContain("HttpOnly");
     expect(typeof json.curriculum_id).toBe("string");
 
     // A new draft was created for the new request.

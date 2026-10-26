@@ -1,6 +1,7 @@
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 import { notesMatchRequest } from "@/lib/curriculum/finder";
+import { createResultAccessToken, resultAccessCookieName } from "@/lib/generation/resultAccess";
 
 const supabase = createServiceClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -86,8 +87,18 @@ export async function POST(request: Request) {
   // Return without a job_id — the SSE stream claims/creates the job at stream
   // start. Frontend navigates to /generate/${id}, which opens the SSE stream
   // and triggers job registration + pipeline execution.
-  return NextResponse.json({
+  const response = NextResponse.json({
     curriculum_id: draft.id,
     cached: false,
   });
+  response.cookies.set({
+    name: resultAccessCookieName(draft.id),
+    value: createResultAccessToken(draft.id, process.env.SUPABASE_SERVICE_ROLE_KEY!),
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    path: `/results/${draft.id}`,
+    maxAge: 60 * 60 * 24 * 7,
+  });
+  return response;
 }

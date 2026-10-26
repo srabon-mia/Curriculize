@@ -53,6 +53,7 @@ export default function GeneratePage({
   const [skeletonTitle, setSkeletonTitle] = useState<string | null>(null);
   const [terminalState, setTerminalState] = useState<"none" | "complete" | "failed">("none");
   const terminalStateRef = useRef(terminalState);
+  const savedStructureRef = useRef(false);
   const esRef = useRef<EventSource | null>(null);
   const yieldedHandledRef = useRef(false);
   const connectRef = useRef<() => void>(() => {});
@@ -92,6 +93,7 @@ export default function GeneratePage({
 
     es.addEventListener("status", (e) => {
       const data = JSON.parse(e.data) as Status;
+      if (data.step === "resume" && (data.current ?? 0) > 0) savedStructureRef.current = true;
       setStatus(data);
       setLog((prev) => [...prev, { message: data.message, done: false }]);
 
@@ -128,6 +130,7 @@ export default function GeneratePage({
         topic_count: number;
         resumed?: boolean;
       };
+      savedStructureRef.current = data.topic_count > 0;
       setSkeletonTitle(data.title);
       setLog((prev) => [
         ...prev.slice(0, -1),
@@ -151,12 +154,13 @@ export default function GeneratePage({
         setCompletedCurriculumId(completedId);
         es.close();
         esRef.current = null;
-        if (completedId && data.coverage_status === "complete") {
-          router.push(`/curriculum/${encodeURIComponent(completedId)}`);
-        } else if (completedId && data.coverage_status === "insufficient") {
-          router.push(`/admin/curriculum/${encodeURIComponent(completedId)}`);
+        if (completedId) {
+          router.push(`/results/${encodeURIComponent(completedId)}`);
         } else {
-          setLog((prev) => [...prev, { message: "Generation processing finished.", done: true }]);
+          setError("Generation finished without a saved curriculum ID. Please retry generation.");
+          setCanRetryPaused(true);
+          terminalStateRef.current = "failed";
+          setTerminalState("failed");
         }
       } else if (data.phase === "topics") {
         setLog((prev) => [
@@ -184,9 +188,15 @@ export default function GeneratePage({
       esRef.current = null;
       continuationAttemptsRef.current += 1;
       if (continuationAttemptsRef.current >= MAX_CONTINUATION_ATTEMPTS) {
-        setError("Generation needs another continuation, but the retry limit was reached. Please return to the curriculum and try again.");
-        terminalStateRef.current = "failed";
-        setTerminalState("failed");
+        if (savedStructureRef.current) {
+          terminalStateRef.current = "complete";
+          router.push(`/results/${encodeURIComponent(id)}`);
+        } else {
+          setError("Generation needs another continuation, but the retry limit was reached before a curriculum outline was saved. Please retry generation.");
+          setCanRetryPaused(true);
+          terminalStateRef.current = "failed";
+          setTerminalState("failed");
+        }
       } else if (reconnectTimerRef.current === null) {
         reconnectTimerRef.current = setTimeout(() => {
           reconnectTimerRef.current = null;
@@ -212,12 +222,17 @@ export default function GeneratePage({
     // an automatic retry loop. The user can explicitly retry the saved job.
     es.addEventListener("paused", (e) => {
       const data = JSON.parse(e.data) as PausedEvent;
-      setError(data.message);
-      setCanRetryPaused(true);
-      terminalStateRef.current = "failed";
-      setTerminalState("failed");
       es.close();
       esRef.current = null;
+      if (savedStructureRef.current) {
+        terminalStateRef.current = "complete";
+        router.push(`/results/${encodeURIComponent(id)}`);
+      } else {
+        setError(data.message);
+        setCanRetryPaused(true);
+        terminalStateRef.current = "failed";
+        setTerminalState("failed");
+      }
     });
 
     // Handle explicit "error" events from server (event type = "error", has data)
@@ -225,18 +240,24 @@ export default function GeneratePage({
       const event = e as MessageEvent;
       // Only handle explicit error events with data
       if (event.type === "error" && event.data) {
+        let message = "Something went wrong — please try again";
         try {
           const data = JSON.parse(event.data) as { message: string };
-          setError(data.message);
-          terminalStateRef.current = "failed";
-          setTerminalState("failed");
+          message = data.message;
         } catch {
-          setError("Something went wrong — please try again");
-          terminalStateRef.current = "failed";
-          setTerminalState("failed");
+          // Keep a readable error even if the server response is malformed.
         }
         es.close();
         esRef.current = null;
+        if (savedStructureRef.current) {
+          terminalStateRef.current = "complete";
+          router.push(`/results/${encodeURIComponent(id)}`);
+        } else {
+          setError(message);
+          setCanRetryPaused(true);
+          terminalStateRef.current = "failed";
+          setTerminalState("failed");
+        }
       }
       // Transport errors without data are handled by the bounded reconnect listener.
     });
@@ -250,8 +271,15 @@ export default function GeneratePage({
       if (esRef.current === es) esRef.current = null;
       reconnectAttemptsRef.current += 1;
       if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
-        setError("The generation connection could not make progress after several attempts. Please return to the curriculum and try again.");
-        setTerminalState("failed");
+        if (savedStructureRef.current) {
+          terminalStateRef.current = "complete";
+          router.push(`/results/${encodeURIComponent(id)}`);
+        } else {
+          setError("The generation connection could not make progress before a curriculum outline was saved. Please retry generation.");
+          setCanRetryPaused(true);
+          terminalStateRef.current = "failed";
+          setTerminalState("failed");
+        }
         return;
       }
       if (reconnectTimerRef.current === null) {
@@ -382,12 +410,10 @@ export default function GeneratePage({
                   : coverageStatus === "complete"
                     ? "Resource coverage is complete for all topic and concept targets."
                     : "Resource coverage could not be confirmed."}
-                {completedCurriculumId && (coverageStatus === "complete" || coverageStatus === "insufficient") && (
+                {completedCurriculumId && (
                   <div className="mt-3">
                     <Link
-                      href={coverageStatus === "complete"
-                        ? `/curriculum/${encodeURIComponent(completedCurriculumId)}`
-                        : `/admin/curriculum/${encodeURIComponent(completedCurriculumId)}`}
+                      href={`/results/${encodeURIComponent(completedCurriculumId)}`}
                       className="font-medium text-brand-forest underline"
                     >
                       View curriculum

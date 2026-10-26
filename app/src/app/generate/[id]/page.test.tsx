@@ -29,7 +29,12 @@ class MockEventSourceClass {
   constructor(url: string) {
     const listeners = new Map<string, (event: Event) => void>();
     const instance = {
-      addEventListener: vi.fn((type: string, listener: (event: Event) => void) => listeners.set(type, listener)),
+      addEventListener: vi.fn((type: string, listener: (event: Event) => void) => {
+        const previous = listeners.get(type);
+        listeners.set(type, previous
+          ? (event) => { previous(event); listener(event); }
+          : listener);
+      }),
       close: vi.fn(),
       readyState: 1, // EventSource.OPEN = 1
       listeners,
@@ -144,7 +149,7 @@ describe("GeneratePage - EventSource connection", () => {
     }
 
     expect(eventSourceInstances).toHaveLength(5);
-    expect(getByText(/could not make progress after several attempts/i)).toBeTruthy();
+    expect(getByText(/before a curriculum outline was saved/i)).toBeTruthy();
     unmount();
     vi.useRealTimers();
   });
@@ -188,9 +193,9 @@ describe("GeneratePage - EventSource connection", () => {
 
     expect(getByRole("status").textContent).toMatch(/resource coverage is insufficient/i);
     expect(queryByText(/retry limit was reached/i)).toBeNull();
-    expect(mockRouter.push).toHaveBeenCalledWith("/admin/curriculum/test-curriculum-id");
+    expect(mockRouter.push).toHaveBeenCalledWith("/results/test-curriculum-id");
     expect(getByRole("link", { name: "View curriculum" }).getAttribute("href"))
-      .toBe("/admin/curriculum/test-curriculum-id");
+      .toBe("/results/test-curriculum-id");
     unmount();
     vi.useRealTimers();
   });
@@ -206,9 +211,9 @@ describe("GeneratePage - EventSource connection", () => {
     act(() => eventSourceInstances[0].listeners.get("complete")?.(completed));
 
     expect(mockRouter.push).toHaveBeenCalledTimes(1);
-    expect(mockRouter.push).toHaveBeenCalledWith("/curriculum/persisted-curriculum-id");
+    expect(mockRouter.push).toHaveBeenCalledWith("/results/persisted-curriculum-id");
     expect(getByRole("link", { name: "View curriculum" }).getAttribute("href"))
-      .toBe("/curriculum/persisted-curriculum-id");
+      .toBe("/results/persisted-curriculum-id");
     unmount();
   });
 
@@ -228,6 +233,7 @@ describe("GeneratePage - EventSource connection", () => {
       data: JSON.stringify({ curriculum_id: "persisted-curriculum-id", phase: "topics", coverage_status: "pending" }),
     } as MessageEvent));
     act(() => resumed.listeners.get("error")?.({
+      type: "error",
       data: JSON.stringify({ message: "Generation failed" }),
     } as MessageEvent));
 
@@ -236,7 +242,7 @@ describe("GeneratePage - EventSource connection", () => {
     vi.useRealTimers();
   });
 
-  it("does not navigate or offer a curriculum link when final coverage is unconfirmed", async () => {
+  it("still opens saved results when the job completed but coverage could not be confirmed", async () => {
     const { queryByRole, getByRole, unmount } = render(
       <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
     );
@@ -244,9 +250,40 @@ describe("GeneratePage - EventSource connection", () => {
       data: JSON.stringify({ curriculum_id: "persisted-curriculum-id", phase: "background", coverage_status: "pending" }),
     } as MessageEvent));
 
-    expect(mockRouter.push).not.toHaveBeenCalled();
+    expect(mockRouter.push).toHaveBeenCalledWith("/results/persisted-curriculum-id");
     expect(getByRole("status").textContent).toMatch(/could not be confirmed/i);
-    expect(queryByRole("link", { name: "View curriculum" })).toBeNull();
+    expect(queryByRole("link", { name: "View curriculum" })?.getAttribute("href"))
+      .toBe("/results/persisted-curriculum-id");
+    unmount();
+  });
+
+  it("opens the saved results after a failure that follows a persisted structure", async () => {
+    const { unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+    act(() => eventSourceInstances[0].listeners.get("skeleton")?.({
+      data: JSON.stringify({ title: "Saved Geometry", topic_count: 2 }),
+    } as MessageEvent));
+    act(() => eventSourceInstances[0].listeners.get("error")?.({
+      type: "error",
+      data: JSON.stringify({ message: "Resource discovery failed" }),
+    } as MessageEvent));
+
+    expect(mockRouter.push).toHaveBeenCalledWith("/results/test-curriculum-id");
+    unmount();
+  });
+
+  it("shows a retry option instead of navigating when failure occurs before a curriculum structure is saved", async () => {
+    const { getByText, unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+    act(() => eventSourceInstances[0].listeners.get("error")?.({
+      type: "error",
+      data: JSON.stringify({ message: "Skeleton generation failed" }),
+    } as MessageEvent));
+
+    expect(mockRouter.push).not.toHaveBeenCalled();
+    expect(getByText("Retry saved generation")).toBeTruthy();
     unmount();
   });
 

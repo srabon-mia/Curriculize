@@ -2063,7 +2063,7 @@ describe("Durable generation stream observer", () => {
     });
   }
 
-  async function startInlineObserver(signal?: AbortSignal): Promise<Response> {
+  async function startInlineObserver(signal?: AbortSignal, includeSavedSkeleton = false): Promise<Response> {
     setRpcSequence("claim_next_job", [
       { data: null, error: null },
       { data: null, error: null },
@@ -2077,6 +2077,7 @@ describe("Durable generation stream observer", () => {
       result_data: {
         checkpoint: { completedTopicIds: ["topic-1"] },
         batchCheckpoint: { completedTopicIds: [] },
+        ...(includeSavedSkeleton ? { skeleton: { title: "Saved Geometry", nodes: [{ title: "Triangles" }] } } : {}),
       },
       curricula: { status: "draft" },
     };
@@ -2109,6 +2110,19 @@ describe("Durable generation stream observer", () => {
     expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("reserve_ai_call", expect.anything());
     expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.filter(([name]) => name === "claim_next_job")).toHaveLength(2);
     expect(allResourceInserts()).toHaveLength(0);
+    await reader.cancel();
+  });
+
+  it("reports an already-saved skeleton to a reconnecting observer", async () => {
+    vi.useFakeTimers();
+    const response = await startInlineObserver(undefined, true);
+    const reader = response.body!.getReader();
+    const events = [await readNextEvent(reader), await readNextEvent(reader), await readNextEvent(reader), await readNextEvent(reader)];
+    expect(events.find((event) => event?.event === "skeleton")?.data).toMatchObject({
+      title: "Saved Geometry",
+      topic_count: 1,
+      resumed: true,
+    });
     await reader.cancel();
   });
 

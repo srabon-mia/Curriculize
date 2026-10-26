@@ -398,6 +398,7 @@ type ClaimResult =
         completedTopicIds: string[];
         batchCompletedTopicIds: string[];
       };
+      savedSkeleton?: { title: string; topic_count: number };
     }
   | null; // Could not obtain job (should not happen with current logic)
 
@@ -537,6 +538,7 @@ async function attachAsObserver(curriculumId: string): Promise<ClaimResult> {
     | {
         checkpoint?: { completedTopicIds: string[] };
         batchCheckpoint?: { completedTopicIds: string[] };
+        skeleton?: { title?: string; nodes?: unknown[] };
       }
     | null
     | undefined;
@@ -558,6 +560,9 @@ async function attachAsObserver(curriculumId: string): Promise<ClaimResult> {
       completedTopicIds: resultData?.checkpoint?.completedTopicIds ?? [],
       batchCompletedTopicIds: resultData?.batchCheckpoint?.completedTopicIds ?? [],
     },
+    ...(resultData?.skeleton?.nodes?.length
+      ? { savedSkeleton: { title: resultData.skeleton.title ?? "Saved curriculum", topic_count: resultData.skeleton.nodes.length } }
+      : {}),
   };
 }
 
@@ -1091,7 +1096,11 @@ export async function legacyGenerationGet(
             is_reconnect: true,
           });
 
-          // Send skeleton event if we have topic checkpoints (means skeleton was already generated)
+          if (jobRecord.savedSkeleton) {
+            safeSend("skeleton", { ...jobRecord.savedSkeleton, resumed: true });
+          }
+
+          // Send progress if topic checkpoints exist.
           if (jobRecord.checkpoints.completedTopicIds.length > 0) {
             // We can't know the exact title, but we can report progress
             safeSend("status", {
