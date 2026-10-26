@@ -1086,31 +1086,27 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
   });
 
   // ============================================================
-  // Lifecycle RPC: complete_job called on success
+  // Lifecycle RPC: atomic publication and completion on success
   // ============================================================
 
-  describe("job finalization: complete_job on success", () => {
-    it("calls complete_job after successful background batch completion", async () => {
+  describe("job finalization: publish and complete on success", () => {
+    it("publishes even when background resource coverage is insufficient", async () => {
       await runStreamAndCapture();
 
       const rpcCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls;
-      const completeCalls = rpcCalls.filter((c: any) => c[0] === "complete_job");
-      expect(completeCalls.length).toBeGreaterThanOrEqual(1);
-
-      // complete_job should be called with has_progress=true
-      const completeCall = completeCalls[0];
-      expect(completeCall[1]).toMatchObject({
-        p_has_progress: true,
-      });
-      expect(rpcCalls.some((call: any) => call[0] === "publish_and_complete_job")).toBe(false);
-      expect(capturedCurriculumUpdates.some((update) => update.status === "published")).toBe(false);
+      const publishCalls = rpcCalls.filter((c: any) => c[0] === "publish_and_complete_job");
+      expect(publishCalls.length).toBeGreaterThanOrEqual(1);
+      expect(publishCalls[0][1]).toMatchObject({ p_job_id: "job-1" });
+      expect(typeof publishCalls[0][1].p_claim_token).toBe("string");
+      expect(typeof publishCalls[0][1].p_expected_claim_version).toBe("number");
+      expect(rpcCalls.some((call: any) => call[0] === "complete_job")).toBe(false);
     });
 
     it("all lifecycle RPCs receive the job id and claim_token", async () => {
       await runStreamAndCapture();
 
       const rpcCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls;
-      const jobLifecycleRPCs = ["record_resource_coverage_attempt", "complete_job", "renew_lease"];
+      const jobLifecycleRPCs = ["record_resource_coverage_attempt", "publish_and_complete_job", "renew_lease"];
 
       for (const rpcName of jobLifecycleRPCs) {
         const calls = rpcCalls.filter((c: any) => c[0] === rpcName);
@@ -1560,14 +1556,14 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       expect(backgroundComplete?.data.coverage_status).toBe("insufficient");
 
       const rpcCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls;
-      const completeCalls = rpcCalls.filter((c: any) => c[0] === "complete_job");
-      expect(completeCalls.length).toBeGreaterThan(0);
-
-      // complete_job should be called with has_progress=true
-      const completeCall = completeCalls[0];
-      expect(completeCall[1]).toMatchObject({
-        p_has_progress: true,
+      const publishCalls = rpcCalls.filter((c: any) => c[0] === "publish_and_complete_job");
+      expect(publishCalls.length).toBeGreaterThan(0);
+      expect(publishCalls[0][1]).toMatchObject({
+        p_job_id: "job-1",
+        p_claim_token: expect.any(String),
+        p_expected_claim_version: expect.any(Number),
       });
+      expect(rpcCalls.some((c: any) => c[0] === "complete_job")).toBe(false);
     });
 
     it("handles background batch failure gracefully", async () => {

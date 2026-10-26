@@ -21,21 +21,22 @@ describe('atomic job publication finalization', () => {
       .rejects.toThrow('publication failed');
   });
 
-  it('completes insufficient processing without publishing the curriculum', async () => {
-    const publish = vi.fn();
-    const complete = vi.fn().mockResolvedValue(true);
+  it('publishes a curriculum even when resource coverage is insufficient', async () => {
+    const publish = vi.fn().mockResolvedValue('completed');
 
-    await expect(finalizeJobForCoverage(job, 'insufficient', publish, complete)).resolves.toBe('completed');
-    expect(publish).not.toHaveBeenCalled();
-    expect(complete).toHaveBeenCalledWith('job-1', 'token-1', 4, true);
+    await expect(finalizeJobForCoverage(job, 'insufficient', publish)).resolves.toBe('completed');
+    expect(publish).toHaveBeenCalledWith({ jobId: 'job-1', claimToken: 'token-1', claimVersion: 4 });
   });
 
-  it('uses atomic publication only for coverage-complete curricula', async () => {
+  it('uses atomic publication after successful processing regardless of coverage state', async () => {
     const publish = vi.fn().mockResolvedValue('completed');
-    const complete = vi.fn();
 
-    await expect(finalizeJobForCoverage(job, 'complete', publish, complete)).resolves.toBe('completed');
+    await expect(finalizeJobForCoverage(job, 'complete', publish)).resolves.toBe('completed');
     expect(publish).toHaveBeenCalledWith({ jobId: 'job-1', claimToken: 'token-1', claimVersion: 4 });
-    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('does not turn a publication failure into successful job completion', async () => {
+    await expect(finalizeJobForCoverage(job, 'insufficient', vi.fn().mockResolvedValue('ownership_lost')))
+      .resolves.toBe('ownership_lost');
   });
 });

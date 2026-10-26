@@ -2333,21 +2333,17 @@ export async function legacyGenerationGet(
           } catch (coverageReadError) {
             console.warn("[stream] Could not read final coverage checkpoint:", coverageReadError);
           }
-          const ok = coverageStatus === "complete"
-            ? (await publishAndCompleteJob({
-                jobId: ownerJobRecord.id,
-                claimToken: ownerJobRecord.claim_token,
-                claimVersion: ownerJobRecord.claim_version,
-              })) === "completed"
-            : await completeJob(
-                ownerJobRecord.id,
-                ownerJobRecord.claim_token,
-                ownerJobRecord.claim_version,
-                true
-              );
+          // Curriculum publication is independent of resource coverage. The
+          // atomic RPC publishes the saved structure and completes this fenced
+          // job; resource rows retain their own approval/verification states.
+          const ok = (await publishAndCompleteJob({
+            jobId: ownerJobRecord.id,
+            claimToken: ownerJobRecord.claim_token,
+            claimVersion: ownerJobRecord.claim_version,
+          })) === "completed";
           if (!ok) {
             console.error(
-              `[stream] complete_job returned false — job ${ownerJobRecord.id} may have been reclaimed by cron worker during background batch`
+              `[stream] atomic publication/completion failed — job ${ownerJobRecord.id} may have been reclaimed by cron worker during background batch`
             );
             // Do not send background complete event if job finalization failed
             send(controller, "error", {
@@ -2357,8 +2353,6 @@ export async function legacyGenerationGet(
             controller.close();
             return;
           }
-          // A job can finish processing with insufficient resource coverage;
-          // only the coverage-complete path atomically publishes the curriculum.
           send(controller, "complete", {
             curriculum_id: id,
             phase: "background",

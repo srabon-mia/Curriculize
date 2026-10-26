@@ -593,19 +593,17 @@ export async function finalizeJobPublication(
   });
 }
 
-/** Publish only after every persisted topic and concept target meets coverage. */
+/** Publish a successfully processed curriculum regardless of resource coverage. */
 export async function finalizeJobForCoverage(
   job: JobClaimResult,
   coverageStatus: 'complete' | 'insufficient' | 'pending' | 'failed',
   publish: typeof publishAndCompleteJob = publishAndCompleteJob,
-  complete: typeof completeJob = completeJob,
   signal?: AbortSignal
 ): Promise<ProcessJobOutcome> {
-  if (coverageStatus === 'complete') {
-    return finalizeJobPublication(job, publish, signal);
-  }
-  const completed = await complete(job.id, job.claim_token!, job.claim_version, true);
-  return completed ? 'completed' : 'ownership_lost';
+  // Resource coverage is diagnostic; it must not gate curriculum catalog
+  // publication. Resource records still retain their independent safeguards.
+  void coverageStatus;
+  return finalizeJobPublication(job, publish, signal);
 }
 
 export async function processJob(
@@ -1036,7 +1034,6 @@ export async function processJob(
       job,
       coverageStatus,
       publishAndCompleteJob,
-      completeJob,
       deadline.signal
     );
 
