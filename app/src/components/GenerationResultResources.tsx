@@ -20,10 +20,10 @@ export function GenerationResultResources({
         )}
       </div>
       {candidates.length > 0 && (
-        <div className="mt-4 rounded-lg border border-status-warning/30 bg-status-warning-bg p-3">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-amber-900">Discovered candidates · Not approved</h3>
+        <div className="mt-4 rounded-xl border border-border-default bg-surface-card p-4">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-text-secondary">More learning resources</h3>
           <ul className="mt-2 space-y-2 text-sm">
-            {candidates.map((resource) => <li key={resource.id}><a className="underline" href={resource.url} target="_blank" rel="noreferrer">{resource.title}</a><span className="ml-2 text-amber-900">Not approved</span></li>)}
+            {candidates.filter((resource) => resource.title?.trim() && /^https?:\/\//i.test(resource.url)).map((resource) => <li key={resource.id}><a className="text-brand-forest underline" href={resource.url} target="_blank" rel="noreferrer">{resource.title}</a></li>)}
           </ul>
         </div>
       )}

@@ -4,8 +4,8 @@ import { cookies } from "next/headers";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/server";
 import { canReadCurriculumResult, resultAccessCookieName, splitResultResources, verifyResultAccessToken } from "@/lib/generation/resultAccess";
-import { getStoredCoverageStatus } from "@/lib/acquisition/coverage";
-import { GenerationResultResources } from "@/components/GenerationResultResources";
+import { CurriculumViewer } from "@/components/CurriculumViewer";
+import type { NodeWithChildren, Resource } from "@/lib/curriculum-data";
 
 export const dynamic = "force-dynamic";
 
@@ -96,13 +96,13 @@ export default async function GenerationResultsPage({
   const resourceRows: any[] = [];
   if (nodeIds.length) {
     const { data } = await service.from("resources")
-      .select("id, node_id, major_understanding_id, url, title, source_domain, ai_note, status, content_type_verified")
+      .select("*")
       .in("node_id", nodeIds);
     resourceRows.push(...(data ?? []));
   }
   if (muIds.length) {
     const { data } = await service.from("resources")
-      .select("id, node_id, major_understanding_id, url, title, source_domain, ai_note, status, content_type_verified")
+      .select("*")
       .in("major_understanding_id", muIds);
     resourceRows.push(...(data ?? []));
   }
@@ -112,75 +112,50 @@ export default async function GenerationResultsPage({
     const target = resource.node_id ? `node:${resource.node_id}` : `mu:${resource.major_understanding_id}`;
     groupedResources.set(target, [...(groupedResources.get(target) ?? []), resource]);
   }
-  const resourcesByTarget = new Map(
-    [...groupedResources.entries()].map(([target, resources]) => [target, splitResultResources(resources)])
-  );
-
-  const coverageStatus = getStoredCoverageStatus({
-    jobStatus: job?.status ?? "pending",
-    coverage: resultData?.resourceCoverage,
-    expectedTargets: topics.length * 2,
+  const resourcesByTarget: Record<string, Resource[]> = {};
+  const candidateResourcesByTarget: Record<string, Resource[]> = {};
+  for (const [target, resources] of groupedResources) {
+    const split = splitResultResources(resources);
+    resourcesByTarget[target] = split.approved.filter((resource) => resource.title?.trim() && /^https?:\/\//i.test(resource.url));
+    candidateResourcesByTarget[target] = split.candidates.filter((resource) => resource.title?.trim() && /^https?:\/\//i.test(resource.url));
+  }
+  const viewerNodes: NodeWithChildren[] = topics.map((topic, index) => {
+    const nodeId = topic.id ?? `saved-topic-${index + 1}`;
+    return {
+      id: nodeId,
+      curriculum_id: id,
+      external_key: `topic-${topic.order_index ?? index + 1}`,
+      title: topic.title,
+      order_index: topic.order_index ?? index + 1,
+      exam_weight_pct: null,
+      claim_statement: null,
+      major_understandings: topic.major_understandings.map((mu, muIndex) => ({
+        id: mu.id ?? `saved-${nodeId}-concept-${muIndex + 1}`,
+        node_id: nodeId,
+        external_key: mu.code ?? null,
+        code: mu.code ?? null,
+        description: mu.description,
+        order_index: mu.order_index ?? muIndex + 1,
+      })),
+    };
   });
-  const headline = job?.status === "failed"
-    ? "Generation stopped; these saved results are still available."
-    : job?.status === "completed" && coverageStatus === "insufficient"
-      ? "Generation finished with insufficient resource coverage."
-      : job?.status === "completed"
-        ? "Generation complete."
-        : "Generation is not complete; these partial results are saved.";
 
   return (
-    <main className="min-h-screen bg-canvas-default text-text-primary px-6 py-10">
-      <div className="mx-auto max-w-4xl">
-        <p className="text-sm font-semibold text-brand-forest">{headline}</p>
-        <h1 className="mt-2 font-display text-3xl font-bold text-brand-navy">{curriculum.title}</h1>
-        <p className="mt-2 text-sm text-text-secondary">{curriculum.subject}</p>
-        {topics.length === 0 ? (
+    <div className="min-h-screen bg-canvas-default text-text-primary flex flex-col">
+      <header className="border-b border-border-default bg-surface-card/95 px-6 py-3.5 sticky top-0 z-30">
+        <div className="max-w-7xl mx-auto">
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-brand-forest">{curriculum.subject}</p>
+          <h1 className="font-display text-lg sm:text-xl font-bold text-brand-navy leading-tight">{curriculum.title}</h1>
+        </div>
+      </header>
+      {viewerNodes.length === 0 ? (
+        <main className="mx-auto max-w-3xl px-6 py-10">
           <section className="mt-8 rounded-xl border border-status-warning/30 bg-status-warning-bg p-5" role="status">
             <p>No curriculum structure was saved yet. Retry generation to create the curriculum outline.</p>
             <Link className="mt-3 inline-block font-medium underline" href={`/generate/${encodeURIComponent(id)}`}>Retry generation</Link>
           </section>
-        ) : (
-          <>
-            {job?.status !== "completed" && (
-              <p className="mt-6 rounded-lg border border-status-warning/30 bg-status-warning-bg p-4 text-sm" role="status">
-                This is a partial result. Continue generation to add more saved topics and resources.
-                <Link className="ml-2 font-medium underline" href={`/generate/${encodeURIComponent(id)}`}>Continue generation</Link>
-              </p>
-            )}
-            {coverageStatus === "insufficient" && (
-              <p className="mt-6 rounded-lg border border-status-warning/30 bg-status-warning-bg p-4 text-sm" role="status">
-                Some topic or concept targets did not meet their resource minimums. Available approved resources and candidates are shown below.
-              </p>
-            )}
-            {coverageStatus === "failed" && (
-              <p className="mt-6 rounded-lg border border-status-error/30 bg-status-error-bg p-4 text-sm" role="status">Resource coverage could not be confirmed.</p>
-            )}
-            <div className="mt-8 space-y-8">
-              {topics.map((topic, index) => (
-                <section key={`${topic.id ?? "saved"}-${index}`} className="rounded-xl border border-border-default bg-surface-card p-5">
-                  <h2 className="text-xl font-semibold text-brand-navy">{topic.title}</h2>
-                  <GenerationResultResources
-                    approved={topic.id ? resourcesByTarget.get(`node:${topic.id}`)?.approved ?? [] : []}
-                    candidates={topic.id ? resourcesByTarget.get(`node:${topic.id}`)?.candidates ?? [] : []}
-                  />
-                  <div className="mt-5 space-y-4">
-                    {topic.major_understandings.map((mu, muIndex) => (
-                      <div key={`${mu.id ?? "saved-mu"}-${muIndex}`} className="border-t border-border-subtle pt-4">
-                        <h3 className="font-medium">{mu.code ? `${mu.code} · ` : ""}{mu.description}</h3>
-                        <GenerationResultResources
-                          approved={mu.id ? resourcesByTarget.get(`mu:${mu.id}`)?.approved ?? [] : []}
-                          candidates={mu.id ? resourcesByTarget.get(`mu:${mu.id}`)?.candidates ?? [] : []}
-                        />
-                      </div>
-                    ))}
-                  </div>
-                </section>
-              ))}
-            </div>
-          </>
-        )}
-      </div>
-    </main>
+        </main>
+      ) : <CurriculumViewer nodes={viewerNodes} resourcesByTarget={resourcesByTarget} candidateResourcesByTarget={candidateResourcesByTarget} />}
+    </div>
   );
 }

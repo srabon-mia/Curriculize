@@ -23,8 +23,6 @@ const RESOURCE_TYPE_COLOR: Record<string, string> = {
   other: "bg-canvas-subtle text-text-secondary border border-border-default",
 };
 
-type CoverageSummary = { topicShortfalls: number; understandingShortfalls: number };
-
 function ResourceLink({ resource }: { resource: Resource }) {
   const typeLabel =
     RESOURCE_TYPE_LABEL[resource.resource_type] ?? "Resource";
@@ -82,8 +80,6 @@ export function CurriculumViewer({
     nodes[0]?.id ?? ""
   );
   const [generationFinished, setGenerationFinished] = useState(false);
-  const [coverageStatus, setCoverageStatus] = useState<"pending" | "complete" | "insufficient" | "failed">("pending");
-  const [coverageSummary, setCoverageSummary] = useState<CoverageSummary | null>(null);
 
   // Poll for background resource updates every 30 seconds
   // Stops only after quality targets are met or generation reaches a terminal state.
@@ -103,26 +99,15 @@ export function CurriculumViewer({
         complete: boolean;
         generation_finished?: boolean;
         coverage_status?: "pending" | "complete" | "insufficient" | "failed";
-        topics?: Array<{ sufficient: boolean }>;
-        understandings?: Array<{ sufficient: boolean }>;
       };
-
-      if (Array.isArray(data.topics) && Array.isArray(data.understandings)) {
-        setCoverageSummary({
-          topicShortfalls: data.topics.filter((topic) => !topic.sufficient).length,
-          understandingShortfalls: data.understandings.filter((understanding) => !understanding.sufficient).length,
-        });
-      }
 
       const terminal = data.complete || data.generation_finished === true;
       if (data.complete) {
         stopped = true;
         setGenerationFinished(true);
-        setCoverageStatus("complete");
       } else if (data.generation_finished) {
         stopped = true;
         setGenerationFinished(true);
-        setCoverageStatus(data.coverage_status ?? "failed");
       }
 
       // The public assembly endpoint returns every displayed target and applies
@@ -177,7 +162,6 @@ export function CurriculumViewer({
   const nodeResources = selectedNode
     ? resourcesByTarget[`node:${selectedNode.id}`] ?? []
     : [];
-  const selectedTopicResourceCount = nodeResources.length;
 
   return (
     <div className="flex flex-col md:flex-row flex-1 min-h-[calc(100vh-65px)]">
@@ -279,16 +263,6 @@ export function CurriculumViewer({
       <div className="flex-1 overflow-y-auto">
         {selectedNode && (
           <div className="max-w-3xl mx-auto px-6 sm:px-10 py-8 sm:py-10">
-            {generationFinished && coverageStatus === "insufficient" && (
-              <div className="mb-6 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900" role="status">
-                <p className="font-semibold">Generation finished, but resource coverage is incomplete.</p>
-                <p className="mt-1">
-                  {coverageSummary
-                    ? `${coverageSummary.topicShortfalls} topic(s) are below 3 resources and ${coverageSummary.understandingShortfalls} concept(s) are below 2.`
-                    : "Some topics or concepts have fewer verified resources than the quality targets."} Available verified resources remain listed; sections below show the gaps.
-                </p>
-              </div>
-            )}
             {/* Topic header */}
             <div className="mb-8 pb-6 border-b border-border-subtle">
               <p className="text-xs font-display font-semibold uppercase tracking-[0.18em] text-brand-forest mb-2">
@@ -302,16 +276,6 @@ export function CurriculumViewer({
               {selectedNode.claim_statement && (
                 <p className="text-sm text-text-secondary mt-2.5 leading-relaxed italic">
                   {selectedNode.claim_statement}
-                </p>
-              )}
-              {coverageStatus === "insufficient" && selectedTopicResourceCount < 3 && (
-                <p className="mt-3 text-sm text-amber-800" role="status">
-                  Topic-wide resource coverage is incomplete: {selectedTopicResourceCount} topic-wide verified resource{selectedTopicResourceCount === 1 ? " is" : "s are"} attached directly to this topic; the target is at least 3. Resources attached to understandings are counted separately.
-                </p>
-              )}
-              {coverageStatus === "failed" && (
-                <p className="mt-3 text-sm text-red-800" role="status">
-                  Resource discovery failed before coverage could be confirmed.
                 </p>
               )}
             </div>
@@ -362,15 +326,11 @@ export function CurriculumViewer({
               })()}
 
             {(candidateResourcesByTarget[`node:${selectedNodeId}`] ?? []).length > 0 && (
-              <div className="mb-8 rounded-xl border border-amber-300 bg-amber-50/60 p-5">
-                <p className="text-xs font-semibold uppercase tracking-wider text-amber-900 mb-1">Discovered candidates · not approved</p>
-                <p className="text-xs text-amber-900/80 mb-3">These links are saved for review and are not included among verified learning resources.</p>
-                <div className="divide-y divide-amber-200">
+              <div className="mb-8 rounded-xl border border-border-default bg-surface-card p-5 shadow-xs">
+                <p className="text-xs font-semibold uppercase tracking-wider text-text-secondary mb-3">More learning resources</p>
+                <div className="divide-y divide-border-subtle">
                   {(candidateResourcesByTarget[`node:${selectedNodeId}`] ?? []).map((resource) => (
-                    <div key={resource.id}>
-                      <ResourceLink resource={resource} />
-                      <p className="text-[11px] text-amber-900 pb-2">{resource.content_type_verified ? "Content check passed; awaiting approval." : "Unverified candidate; review before use."}</p>
-                    </div>
+                    <ResourceLink key={resource.id} resource={resource} />
                   ))}
                 </div>
               </div>
@@ -441,13 +401,10 @@ export function CurriculumViewer({
                       })()}
 
                     {muCandidates.length > 0 && (
-                      <div className="mt-3.5 pt-3 border-t border-amber-200">
-                        <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-900 mb-1">Discovered candidates · not approved</p>
+                      <div className="mt-3.5 pt-3 border-t border-border-subtle">
+                        <p className="text-[11px] font-semibold uppercase tracking-wider text-text-secondary mb-1">More learning resources</p>
                         {muCandidates.map((resource) => (
-                          <div key={resource.id}>
-                            <ResourceLink resource={resource} />
-                            <p className="text-[11px] text-amber-900 pb-2">{resource.content_type_verified ? "Content check passed; awaiting approval." : "Unverified candidate; review before use."}</p>
-                          </div>
+                          <ResourceLink key={resource.id} resource={resource} />
                         ))}
                       </div>
                     )}
@@ -457,7 +414,7 @@ export function CurriculumViewer({
                         <p className="text-xs text-text-tertiary mt-2.5 italic flex items-center gap-1.5">
                           <span>⚠</span>
                           <span>
-                            No verified resources were found for this concept.
+                            No resources are available for this concept yet.
                           </span>
                         </p>
                       ) : (
@@ -466,11 +423,6 @@ export function CurriculumViewer({
                           <span>Finding verified resources…</span>
                         </p>
                       )
-                    )}
-                    {generationFinished && coverageStatus === "insufficient" && muResources.length > 0 && muResources.length < 2 && (
-                      <p className="mt-2 text-xs text-amber-800" role="status">
-                        Coverage is incomplete: {muResources.length} verified resource{muResources.length === 1 ? " is" : "s are"} available; the quality target is at least 2.
-                      </p>
                     )}
                   </div>
                 );
@@ -485,13 +437,11 @@ export function CurriculumViewer({
                 <div className="mt-8 rounded-xl border border-dashed border-border-default bg-surface-card px-6 py-10 text-center">
                   {generationFinished ? (
                     <p className="text-sm text-text-secondary">
-                      {coverageStatus === "failed"
-                        ? "Resource discovery failed before verified resources could be confirmed."
-                        : "No verified resources were found for this topic. Coverage is insufficient."}
+                      "No resources are available for this topic yet."
                     </p>
                   ) : (
                     <p className="text-sm text-text-secondary">
-                      No resources verified for this topic yet. The discovery process runs in the background.
+                      Resources for this topic are still being gathered.
                     </p>
                   )}
                 </div>

@@ -8,8 +8,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("CurriculumViewer coverage status", () => {
-  it("shows an honest insufficient-coverage message after retries are exhausted", async () => {
+describe("CurriculumViewer partial resource coverage", () => {
+  it("keeps the curriculum structure without showing internal coverage thresholds", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -40,13 +40,13 @@ describe("CurriculumViewer coverage status", () => {
         description: "Compare fractions", order_index: 0,
       }],
     }]} resourcesByTarget={{ "mu:mu-1": conceptResources }} />);
-    await waitFor(() => expect(screen.getByText(/Topic-wide resource coverage is incomplete/i)).toBeTruthy());
-    expect(screen.getByText(/0 topic-wide verified resources are attached directly to this topic/i)).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("Compare fractions")).toBeTruthy());
+    expect(screen.queryByText(/coverage is incomplete/i)).toBeNull();
     expect(screen.getByText("0 topic-wide")).toBeTruthy();
     expect(screen.getByText("3 concept-level")).toBeTruthy();
   });
 
-  it("shows curriculum-wide shortfalls even when the selected topic is fully covered", async () => {
+  it("does not show curriculum-wide shortfalls when resources are below thresholds", async () => {
     const progress = {
       complete: false,
       generation_finished: true,
@@ -105,8 +105,8 @@ describe("CurriculumViewer coverage status", () => {
       "mu:mu-1": selectedUnderstandingResources,
     }} />);
 
-    expect(await screen.findByText(/Generation finished, but resource coverage is incomplete/i)).toBeTruthy();
-    expect(screen.getByText(/1 topic\(s\) are below 3 resources and 1 concept\(s\) are below 2/i)).toBeTruthy();
+    expect(await screen.findByText("Compare fractions")).toBeTruthy();
+    expect(screen.queryByText(/below 3 resources/i)).toBeNull();
     expect(screen.getByText("3 topic-wide")).toBeTruthy();
     expect(screen.getByText("2 concept-level")).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith("/api/curricula/curriculum-1/assemble");
@@ -166,8 +166,9 @@ describe("CurriculumViewer coverage status", () => {
 
     expect(await screen.findByText("2 topic-wide")).toBeTruthy();
     await waitFor(() => expect(screen.getByText("2 concept-level")).toBeTruthy());
-    expect(screen.getByText("Discovered candidates · not approved")).toBeTruthy();
-    expect(screen.getByText("Unverified candidate; review before use.")).toBeTruthy();
+    expect(screen.getByText("More learning resources")).toBeTruthy();
+    expect(screen.queryByText(/not approved/i)).toBeNull();
+    expect(screen.queryByText(/unverified candidate/i)).toBeNull();
     expect(screen.getByRole("link", { name: "candidate-concept" })).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith("/api/curricula/curriculum-1/assemble");
     expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith("/api/resources"))).toBe(false);
