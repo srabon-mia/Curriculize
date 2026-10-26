@@ -983,20 +983,7 @@ export async function legacyGenerationGet(
   let abortObserverRequest: (() => void) | null = null;
   const stream = new ReadableStream({
     async start(controller) {
-      let jobRecord: {
-        mode: "owner";
-        id: string;
-        claim_token: string;
-        claim_version: number;
-      } | {
-        mode: "observer";
-        jobId: string;
-        curriculumStatus: "draft" | "published";
-        checkpoints: {
-          completedTopicIds: string[];
-          batchCompletedTopicIds: string[];
-        };
-      } | null = null;
+      let jobRecord: ClaimResult = null;
       let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
       let ownershipLost = false;
 
