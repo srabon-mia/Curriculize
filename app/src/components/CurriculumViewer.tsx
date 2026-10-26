@@ -2,6 +2,7 @@
 
 import { useState, useMemo, useEffect } from "react";
 import type { NodeWithChildren, Resource } from "@/lib/curriculum-data";
+import { normalizeDisplayedResources } from "@/lib/curriculum/displayResources";
 
 const RESOURCE_TYPE_LABEL: Record<string, string> = {
   video: "Video",
@@ -76,6 +77,10 @@ export function CurriculumViewer({
 }) {
   const [resourcesByTarget, setResourcesByTarget] = useState(initialResourcesByTarget);
   const [candidateResourcesByTarget, setCandidateResourcesByTarget] = useState(initialCandidateResourcesByTarget);
+  const displayed = useMemo(
+    () => normalizeDisplayedResources(resourcesByTarget, candidateResourcesByTarget),
+    [resourcesByTarget, candidateResourcesByTarget]
+  );
   const [selectedNodeId, setSelectedNodeId] = useState<string>(
     nodes[0]?.id ?? ""
   );
@@ -160,7 +165,10 @@ export function CurriculumViewer({
   // Collect all resources for the selected node: node-level ones first,
   // then per-understanding ones (shown inline beneath each understanding).
   const nodeResources = selectedNode
-    ? resourcesByTarget[`node:${selectedNode.id}`] ?? []
+    ? displayed.approved[`node:${selectedNode.id}`] ?? []
+    : [];
+  const nodeCandidates = selectedNode
+    ? displayed.candidates[`node:${selectedNode.id}`] ?? []
     : [];
 
   return (
@@ -207,9 +215,13 @@ export function CurriculumViewer({
           {nodes.map((node) => {
             const isSelected = node.id === selectedNodeId;
             const muCount = node.major_understandings.length;
-            const topicResourceCount = (resourcesByTarget[`node:${node.id}`] ?? []).length;
+            const topicResourceCount =
+              (displayed.approved[`node:${node.id}`] ?? []).length +
+              (displayed.candidates[`node:${node.id}`] ?? []).length;
             const conceptResourceCount = node.major_understandings.reduce(
-              (sum, mu) => sum + (resourcesByTarget[`mu:${mu.id}`] ?? []).length,
+              (sum, mu) => sum +
+                (displayed.approved[`mu:${mu.id}`] ?? []).length +
+                (displayed.candidates[`mu:${mu.id}`] ?? []).length,
               0
             );
 
@@ -325,11 +337,14 @@ export function CurriculumViewer({
                 );
               })()}
 
-            {(candidateResourcesByTarget[`node:${selectedNodeId}`] ?? []).length > 0 && (
+            {nodeCandidates.length > 0 && (
               <div className="mb-8 rounded-xl border border-border-default bg-surface-card p-5 shadow-xs">
                 <p className="text-xs font-semibold uppercase tracking-wider text-text-secondary mb-3">More learning resources</p>
+                <p className="-mt-2 mb-2 text-[11px] leading-relaxed text-text-tertiary">
+                  Discovered resources — not yet formally reviewed; relevance and quality may vary.
+                </p>
                 <div className="divide-y divide-border-subtle">
-                  {(candidateResourcesByTarget[`node:${selectedNodeId}`] ?? []).map((resource) => (
+                  {nodeCandidates.map((resource) => (
                     <ResourceLink key={resource.id} resource={resource} />
                   ))}
                 </div>
@@ -345,8 +360,8 @@ export function CurriculumViewer({
               </div>
 
               {selectedNode.major_understandings.map((mu) => {
-                const muResources = resourcesByTarget[`mu:${mu.id}`] ?? [];
-                const muCandidates = candidateResourcesByTarget[`mu:${mu.id}`] ?? [];
+                const muResources = displayed.approved[`mu:${mu.id}`] ?? [];
+                const muCandidates = displayed.candidates[`mu:${mu.id}`] ?? [];
 
                 return (
                   <div
@@ -403,13 +418,16 @@ export function CurriculumViewer({
                     {muCandidates.length > 0 && (
                       <div className="mt-3.5 pt-3 border-t border-border-subtle">
                         <p className="text-[11px] font-semibold uppercase tracking-wider text-text-secondary mb-1">More learning resources</p>
+                        <p className="mb-2 text-[11px] leading-relaxed text-text-tertiary">
+                          Discovered resources — not yet formally reviewed; relevance and quality may vary.
+                        </p>
                         {muCandidates.map((resource) => (
                           <ResourceLink key={resource.id} resource={resource} />
                         ))}
                       </div>
                     )}
 
-                    {muResources.length === 0 && (
+                    {muResources.length === 0 && muCandidates.length === 0 && (
                       generationFinished ? (
                         <p className="text-xs text-text-tertiary mt-2.5 italic flex items-center gap-1.5">
                           <span>⚠</span>
@@ -430,9 +448,11 @@ export function CurriculumViewer({
             </div>
 
             {/* Empty state if no resources anywhere on this topic yet */}
-            {nodeResources.length === 0 &&
+            {nodeResources.length === 0 && nodeCandidates.length === 0 &&
               selectedNode.major_understandings.every(
-                (mu) => (resourcesByTarget[`mu:${mu.id}`] ?? []).length === 0
+                (mu) =>
+                  (displayed.approved[`mu:${mu.id}`] ?? []).length === 0 &&
+                  (displayed.candidates[`mu:${mu.id}`] ?? []).length === 0
               ) && (
                 <div className="mt-8 rounded-xl border border-dashed border-border-default bg-surface-card px-6 py-10 text-center">
                   {generationFinished ? (

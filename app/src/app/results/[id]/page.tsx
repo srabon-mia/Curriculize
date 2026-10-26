@@ -5,6 +5,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/server";
 import { canReadCurriculumResult, resultAccessCookieName, splitResultResources, verifyResultAccessToken } from "@/lib/generation/resultAccess";
 import { CurriculumViewer } from "@/components/CurriculumViewer";
+import { CurriculumHeader } from "@/components/CurriculumHeader";
 import type { NodeWithChildren, Resource } from "@/lib/curriculum-data";
 
 export const dynamic = "force-dynamic";
@@ -24,7 +25,7 @@ export default async function GenerationResultsPage({
 }) {
   const { id } = await params;
   const [{ data: curriculum }, userClient, cookieStore] = await Promise.all([
-    service.from("curricula").select("id, title, subject, status, created_by").eq("id", id).maybeSingle(),
+    service.from("curricula").select("id, title, subject, status, created_by, source_type, source_attribution, source_url").eq("id", id).maybeSingle(),
     createClient(),
     cookies(),
   ]);
@@ -142,12 +143,13 @@ export default async function GenerationResultsPage({
 
   return (
     <div className="min-h-screen bg-canvas-default text-text-primary flex flex-col">
-      <header className="border-b border-border-default bg-surface-card/95 px-6 py-3.5 sticky top-0 z-30">
-        <div className="max-w-7xl mx-auto">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-brand-forest">{curriculum.subject}</p>
-          <h1 className="font-display text-lg sm:text-xl font-bold text-brand-navy leading-tight">{curriculum.title}</h1>
-        </div>
-      </header>
+      <CurriculumHeader
+        title={curriculum.title}
+        subject={curriculum.subject}
+        source_type={curriculum.source_type}
+        source_attribution={curriculum.source_attribution}
+        source_url={curriculum.source_url}
+      />
       {viewerNodes.length === 0 ? (
         <main className="mx-auto max-w-3xl px-6 py-10">
           <section className="mt-8 rounded-xl border border-status-warning/30 bg-status-warning-bg p-5" role="status">

@@ -41,6 +41,7 @@ const capturedInserts: Array<{ table: string; resources: any[] }> = [];
 const capturedNodeInserts: Array<any> = [];
 const capturedMuInserts: Array<any> = [];
 const capturedCurriculumUpdates: Array<any> = [];
+const capturedSourceRows: Array<any> = [];
 const structureLifecycleOrder: string[] = [];
 const capturedSseEvents: string[] = [];
 let resumeScenario = false;
@@ -151,6 +152,22 @@ function createMockSupabaseClient() {
           return ({
           eq: vi.fn().mockResolvedValue({ data: null, error: null }),
           });
+        });
+      }
+
+      if (table === "curriculum_sources") {
+        tableChain.select.mockImplementation(() => {
+          const selectChain: any = { ...chain };
+          selectChain.maybeSingle.mockResolvedValue({ data: null, error: null });
+          return selectChain;
+        });
+        tableChain.insert = vi.fn().mockImplementation((row: any) => {
+          capturedSourceRows.push(row);
+          return Promise.resolve({ data: null, error: null });
+        });
+        tableChain.update = vi.fn().mockImplementation((row: any) => {
+          capturedSourceRows.push(row);
+          return { eq: vi.fn().mockResolvedValue({ data: null, error: null }) };
         });
       }
 
@@ -677,6 +694,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     capturedNodeInserts.length = 0;
     capturedMuInserts.length = 0;
     capturedCurriculumUpdates.length = 0;
+    capturedSourceRows.length = 0;
     structureLifecycleOrder.length = 0;
     capturedSseEvents.length = 0;
     resetRpcOverrides();
@@ -830,6 +848,16 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     expect(topicLevel.length).toBeGreaterThan(0);
     expect(batchLevel.length).toBeGreaterThan(0);
     expect(durableJobRow.result_data.skeleton.nodes).toHaveLength(1);
+    expect(capturedCurriculumUpdates[0]).toMatchObject({
+      source_type: "ai_organized",
+      source_attribution: null,
+      source_url: null,
+    });
+    expect(capturedSourceRows[0]).toMatchObject({
+      source_type: "ai_generated",
+      verification_state: "not_applicable",
+      source_url: null,
+    });
     expect(structureLifecycleOrder.indexOf("skeleton-checkpoint")).toBeLessThan(structureLifecycleOrder.indexOf("topic-row"));
     expect(structureLifecycleOrder.indexOf("skeleton-checkpoint")).toBeLessThan(structureLifecycleOrder.indexOf("understanding-row"));
   }, 15000);

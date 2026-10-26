@@ -165,12 +165,53 @@ describe("CurriculumViewer partial resource coverage", () => {
     ]} resourcesByTarget={{}} />);
 
     expect(await screen.findByText("2 topic-wide")).toBeTruthy();
-    await waitFor(() => expect(screen.getByText("2 concept-level")).toBeTruthy());
-    expect(screen.getByText("More learning resources")).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("3 concept-level")).toBeTruthy());
+    const disclosure = "Discovered resources — not yet formally reviewed; relevance and quality may vary.";
+    const candidateHeading = screen.getByText("More learning resources");
+    expect(candidateHeading.parentElement?.textContent).toContain(disclosure);
+    const approvedHeading = screen.getByText("Learning resources");
+    expect(approvedHeading.parentElement?.textContent).not.toContain(disclosure);
     expect(screen.queryByText(/not approved/i)).toBeNull();
     expect(screen.queryByText(/unverified candidate/i)).toBeNull();
     expect(screen.getByRole("link", { name: "candidate-concept" })).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith("/api/curricula/curriculum-1/assemble");
     expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith("/api/resources"))).toBe(false);
+  });
+
+  it("counts approved and candidate links rendered at topic and concept levels", () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false }));
+    const makeResource = (id: string, nodeId: string | null, muId: string | null, url: string, status: "approved" | "draft" = "approved", type = "text") => ({
+      id, node_id: nodeId, major_understanding_id: muId, url, title: id, source_domain: "example.org",
+      resource_type: type, license_status: "link_only" as const, embed_allowed: false, ai_note: null,
+      status, created_at: "2026-01-01T00:00:00.000Z", content_type_verified: status === "approved",
+    });
+    const node = {
+      id: "node-1", curriculum_id: "curriculum-1", external_key: null,
+      title: "Fractions", order_index: 1, exam_weight_pct: null, claim_statement: null,
+      major_understandings: [{ id: "mu-1", node_id: "node-1", external_key: "1.1", code: "1.1", description: "Compare fractions", order_index: 0 }],
+    };
+
+    render(<CurriculumViewer
+      nodes={[node]}
+      resourcesByTarget={{
+        "node:node-1": [makeResource("topic-approved", "node-1", null, "https://example.org/topic")],
+        "mu:mu-1": [makeResource("concept-approved", null, "mu-1", "https://example.org/concept")],
+      }}
+      candidateResourcesByTarget={{
+        "node:node-1": [
+          makeResource("topic-candidate", "node-1", null, "https://example.org/topic-candidate", "draft"),
+          makeResource("duplicate-topic", "node-1", null, "https://example.org/topic#duplicate", "draft"),
+        ],
+        "mu:mu-1": [makeResource("concept-practice", null, "mu-1", "https://example.org/practice", "draft", "problem_set")],
+      }}
+    />);
+
+    expect(screen.getByText("2 topic-wide")).toBeTruthy();
+    expect(screen.getByText("2 concept-level")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "topic-approved" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "topic-candidate" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "concept-approved" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "concept-practice" })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "duplicate-topic" })).toBeNull();
   });
 });

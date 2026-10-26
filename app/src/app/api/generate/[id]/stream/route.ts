@@ -22,6 +22,9 @@ import {
 import { getStoredCoverageStatus, runBoundedCoverageAttempts, mapUnderstandingCodesToIds } from "@/lib/acquisition/coverage";
 import { PersistenceError } from "@/lib/persistence";
 import { z } from "zod";
+import type { AISearchCitation, AIStructuredResult } from "@/lib/ai/types";
+import { acquireCandidate } from "@/lib/acquisition/engine";
+import { applyVerifiedCurriculumSource, persistGeneratedCurriculumSource, verifyCurriculumSource, type VerifiedCurriculumSource } from "@/lib/curriculum/sourceProvenance";
 
 export const maxDuration = 300;
 
@@ -260,7 +263,8 @@ async function callAIStructured<T>(
     jobId?: string;
     streamId?: string;
     topicId?: string;
-  }
+  },
+  captureResult?: (result: AIStructuredResult<T>) => void
 ): Promise<T> {
   const startTime = Date.now();
   const provider = getAI(operation);
@@ -285,6 +289,7 @@ async function callAIStructured<T>(
   }
 
   const durationMs = Date.now() - startTime;
+  captureResult?.(result);
 
   // Verify web search completed when requested (Priority 2)
   // Note: structured() doesn't return searchCompleted, but the underlying
@@ -1306,6 +1311,8 @@ export async function legacyGenerationGet(
         }
 
         const resumingSkeleton = skeletonParsed !== null;
+        let verifiedSource: VerifiedCurriculumSource | null = null;
+        let provenanceNeedsRefresh = false;
         send(controller, "status", {
           message: resumingSkeleton ? "Loading the saved curriculum structure…" : "Finding the best curriculum structure…",
           step: "skeleton",
@@ -1355,7 +1362,21 @@ export async function legacyGenerationGet(
           try {
           // Use structured output for guaranteed valid JSON (Priority 1 fix)
           console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=skeleton_ai`);
-          skeletonParsed = await callAIStructured(skeletonPrompt, SkeletonSchema, true, "skeleton_ai");
+          let skeletonCitations: AISearchCitation[] = [];
+          skeletonParsed = await callAIStructured(
+            skeletonPrompt,
+            SkeletonSchema,
+            true,
+            "skeleton_ai",
+            { curriculumId: id, jobId: ownerJobRecord.id, streamId },
+            (result) => { skeletonCitations = result.searchCitations ?? []; }
+          );
+          verifiedSource = await verifyCurriculumSource(
+            skeletonParsed,
+            skeletonCitations,
+            async (url) => acquireCandidate({ url })
+          );
+          skeletonParsed = applyVerifiedCurriculumSource(skeletonParsed, verifiedSource);
           console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=skeleton_ai, topic_count=${skeletonParsed.nodes.length}`);
         } catch (err) {
           if (err instanceof AITimeoutError) {
@@ -1520,6 +1541,33 @@ export async function legacyGenerationGet(
           return;
         }
 
+        if (resumingSkeleton && skeletonParsed.source_type === "adapted" && skeletonParsed.source_url) {
+          const { data: savedSource } = await supabase.from("curriculum_sources")
+            .select("source_url, source_title, source_author, source_institution, verification_state, structure_match_info")
+            .eq("curriculum_id", id)
+            .eq("source_url", skeletonParsed.source_url)
+            .eq("verification_state", "verified")
+            .limit(1)
+            .maybeSingle();
+          const matchInfo = savedSource?.structure_match_info as { word_count?: number } | null;
+          if (savedSource?.source_title && savedSource?.source_institution && savedSource.source_url) {
+            verifiedSource = {
+              source_title: savedSource.source_title,
+              source_author: savedSource.source_author ?? null,
+              source_institution: savedSource.source_institution,
+              source_url: savedSource.source_url,
+              word_count: matchInfo?.word_count ?? 0,
+            };
+          } else {
+            skeletonParsed = applyVerifiedCurriculumSource(skeletonParsed, null);
+            provenanceNeedsRefresh = true;
+          }
+        }
+        if (!verifiedSource && skeletonParsed.source_type === "adapted") {
+          skeletonParsed = applyVerifiedCurriculumSource(skeletonParsed, null);
+          provenanceNeedsRefresh = true;
+        }
+
         // Save the complete, validated structure through the job's immutable,
         // claim-fenced checkpoint before writing any topic or understanding row.
         const skeletonSave = await saveJobSkeleton({
@@ -1535,9 +1583,10 @@ export async function legacyGenerationGet(
           controller.close();
           return;
         }
-        if (!existingNodes || existingNodes.length === 0) {
+        const shouldPersistMetadata = !existingNodes?.length || !resumingSkeleton || provenanceNeedsRefresh;
+        if (shouldPersistMetadata) {
           console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=curriculum_skeleton_update`);
-          await supabase
+          const { error: curriculumUpdateError } = await supabase
             .from("curricula")
             .update({
               title: skeletonParsed.title,
@@ -1546,7 +1595,13 @@ export async function legacyGenerationGet(
               source_url: skeletonParsed.source_url,
             })
             .eq("id", id);
+          if (curriculumUpdateError) throw new Error(`Failed to save curriculum source metadata: ${curriculumUpdateError.message}`);
           console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=curriculum_skeleton_update`);
+
+          const sourceWrite = await persistGeneratedCurriculumSource(supabase, id, skeletonParsed, verifiedSource);
+          if (sourceWrite.error) {
+            console.warn("[stream] Curriculum provenance record could not be saved:", sourceWrite.error.message);
+          }
         }
 
         updatedCurriculumTitle = skeletonParsed.title;

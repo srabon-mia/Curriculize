@@ -24,7 +24,7 @@ First, search the web for existing curricula from reputable sources:
 - University course syllabi (MIT OCW, Stanford, etc.)
 - Established educational organizations (Khan Academy, College Board, etc.)
 
-If you find a reputable existing curriculum, adapt its structure. If not, create a logical topic sequence yourself. Use the student's learning goal and time available to calibrate depth — someone with 1 week preparing for an exam needs a different structure than someone with a semester exploring out of curiosity.
+If you find a reputable existing human-written curriculum or syllabus, adapt its actual topic sequence and use its exact consulted page URL as source_url. The source_url must be one of the pages returned by web search. Do not claim a source based on memory, a generic homepage, or an uncited URL. If no suitable source is found, create a logical topic sequence and set source_type to "ai_organized" with null source_attribution and source_url. Use the student's learning goal and time available to calibrate depth — someone with 1 week preparing for an exam needs a different structure than someone with a semester exploring out of curiosity.
 
 Return ONLY a JSON object, no other text, no markdown backticks:
 {
