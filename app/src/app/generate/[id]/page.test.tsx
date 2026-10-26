@@ -176,6 +176,7 @@ describe("GeneratePage - EventSource connection", () => {
       act(() => current.listeners.get("yielded")?.({
         data: JSON.stringify({ message: "Concept batch checkpointed", topicsCompleted: 1, totalTopics: 9 }),
       } as MessageEvent));
+      expect(mockRouter.push).not.toHaveBeenCalled();
       if (continuation < 8) await act(async () => vi.advanceTimersByTimeAsync(2000));
     }
 
@@ -187,20 +188,65 @@ describe("GeneratePage - EventSource connection", () => {
 
     expect(getByRole("status").textContent).toMatch(/resource coverage is insufficient/i);
     expect(queryByText(/retry limit was reached/i)).toBeNull();
-    expect(mockRouter.push).not.toHaveBeenCalled();
+    expect(mockRouter.push).toHaveBeenCalledWith("/admin/curriculum/test-curriculum-id");
+    expect(getByRole("link", { name: "View curriculum" }).getAttribute("href"))
+      .toBe("/admin/curriculum/test-curriculum-id");
     unmount();
     vi.useRealTimers();
   });
 
   it("navigates to the curriculum only when terminal coverage is complete", async () => {
+    const { getByRole, unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+    const completed = {
+      data: JSON.stringify({ curriculum_id: "persisted-curriculum-id", phase: "background", coverage_status: "complete" }),
+    } as MessageEvent;
+    act(() => eventSourceInstances[0].listeners.get("complete")?.(completed));
+    act(() => eventSourceInstances[0].listeners.get("complete")?.(completed));
+
+    expect(mockRouter.push).toHaveBeenCalledTimes(1);
+    expect(mockRouter.push).toHaveBeenCalledWith("/curriculum/persisted-curriculum-id");
+    expect(getByRole("link", { name: "View curriculum" }).getAttribute("href"))
+      .toBe("/curriculum/persisted-curriculum-id");
+    unmount();
+  });
+
+  it("does not navigate on failed, yielded, or nonterminal completion events", async () => {
+    vi.useFakeTimers();
     const { unmount } = render(
       <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
     );
-    act(() => eventSourceInstances[0].listeners.get("complete")?.({
-      data: JSON.stringify({ curriculum_id: "test-curriculum-id", phase: "background", coverage_status: "complete" }),
+    const first = eventSourceInstances[0];
+    act(() => first.listeners.get("yielded")?.({
+      data: JSON.stringify({ message: "Resuming…", topicsCompleted: 2, totalTopics: 4 }),
+    } as MessageEvent));
+    expect(mockRouter.push).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    const resumed = eventSourceInstances[1];
+    act(() => resumed.listeners.get("complete")?.({
+      data: JSON.stringify({ curriculum_id: "persisted-curriculum-id", phase: "topics", coverage_status: "pending" }),
+    } as MessageEvent));
+    act(() => resumed.listeners.get("error")?.({
+      data: JSON.stringify({ message: "Generation failed" }),
     } as MessageEvent));
 
-    expect(mockRouter.push).toHaveBeenCalledWith("/curriculum/test-curriculum-id");
+    expect(mockRouter.push).not.toHaveBeenCalled();
+    unmount();
+    vi.useRealTimers();
+  });
+
+  it("does not navigate or offer a curriculum link when final coverage is unconfirmed", async () => {
+    const { queryByRole, getByRole, unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+    act(() => eventSourceInstances[0].listeners.get("complete")?.({
+      data: JSON.stringify({ curriculum_id: "persisted-curriculum-id", phase: "background", coverage_status: "pending" }),
+    } as MessageEvent));
+
+    expect(mockRouter.push).not.toHaveBeenCalled();
+    expect(getByRole("status").textContent).toMatch(/could not be confirmed/i);
+    expect(queryByRole("link", { name: "View curriculum" })).toBeNull();
     unmount();
   });
 

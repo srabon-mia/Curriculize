@@ -49,6 +49,7 @@ export default function GeneratePage({
   const [error, setError] = useState<string | null>(null);
   const [canRetryPaused, setCanRetryPaused] = useState(false);
   const [coverageStatus, setCoverageStatus] = useState<CompleteEvent["coverage_status"]>();
+  const [completedCurriculumId, setCompletedCurriculumId] = useState<string | null>(null);
   const [skeletonTitle, setSkeletonTitle] = useState<string | null>(null);
   const [terminalState, setTerminalState] = useState<"none" | "complete" | "failed">("none");
   const terminalStateRef = useRef(terminalState);
@@ -110,11 +111,6 @@ export default function GeneratePage({
         reconnectAttemptsRef.current = 0;
       }
 
-      if (data.step === "already_claimed") {
-        es.close();
-        router.push(`/curriculum/${id}`);
-      }
-
       if (data.step === "waiting") {
         setLog((prev) => [
           ...prev.slice(0, -1),
@@ -145,13 +141,20 @@ export default function GeneratePage({
     es.addEventListener("complete", (e) => {
       const data = JSON.parse(e.data) as CompleteEvent;
       if (data.phase === "background") {
+        if (terminalStateRef.current !== "none") return;
         terminalStateRef.current = "complete";
         setTerminalState("complete");
         setCoverageStatus(data.coverage_status ?? "pending");
+        const completedId = typeof data.curriculum_id === "string" && data.curriculum_id.length > 0
+          ? data.curriculum_id
+          : null;
+        setCompletedCurriculumId(completedId);
         es.close();
         esRef.current = null;
-        if (data.coverage_status === "complete") {
-          router.push(`/curriculum/${id}`);
+        if (completedId && data.coverage_status === "complete") {
+          router.push(`/curriculum/${encodeURIComponent(completedId)}`);
+        } else if (completedId && data.coverage_status === "insufficient") {
+          router.push(`/admin/curriculum/${encodeURIComponent(completedId)}`);
         } else {
           setLog((prev) => [...prev, { message: "Generation processing finished.", done: true }]);
         }
@@ -379,11 +382,18 @@ export default function GeneratePage({
                   : coverageStatus === "complete"
                     ? "Resource coverage is complete for all topic and concept targets."
                     : "Resource coverage could not be confirmed."}
-                <div className="mt-3">
-                  <Link href={`/curriculum/${id}`} className="font-medium text-brand-forest underline">
-                    View curriculum
-                  </Link>
-                </div>
+                {completedCurriculumId && (coverageStatus === "complete" || coverageStatus === "insufficient") && (
+                  <div className="mt-3">
+                    <Link
+                      href={coverageStatus === "complete"
+                        ? `/curriculum/${encodeURIComponent(completedCurriculumId)}`
+                        : `/admin/curriculum/${encodeURIComponent(completedCurriculumId)}`}
+                      className="font-medium text-brand-forest underline"
+                    >
+                      View curriculum
+                    </Link>
+                  </div>
+                )}
               </div>
             )}
 
