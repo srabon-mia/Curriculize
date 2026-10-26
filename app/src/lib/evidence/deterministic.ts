@@ -98,6 +98,8 @@ const INSTRUCTIONAL_LANGUAGE =
   /\b(?:because|therefore|thus|hence|substitut\w*|differentiat\w*|integrat\w*|rearrang\w*|simplif\w*|factor\w*|expand\w*|isolat\w*|derive\w*|solv\w*|we obtain|which gives|it follows|satisf\w*|relat\w*|represent\w*|model\w*|describ\w*|consider|initial condition|general solution|particular solution)\b/i;
 const MATHEMATICAL_CONTENT =
   /(?:[=≈≠≤≥∫∑√∂∇]|\b(?:equation|derivative|integral|function|matrix|matrices|vector|eigenvalue|polynomial|variable|initial condition|boundary condition|differential)\b)/i;
+const MECHANISTIC_EXPLANATION =
+  /\b(?:works|operates|functions) by\s+[a-z-]+ing\b|\bby\s+[a-z-]+ing\b[^.!?]{0,100}\b(?:allowing|enabling)\b/i;
 const WORKED_STEP_LANGUAGE =
   /\b(?:substitut(?:e|ed|ing)|differentiat(?:e|ed|ing)|integrat(?:e|ed|ing\s+(?:both sides|the equation|to|gives))|rearrang(?:e|ed|ing)|simplif(?:y|ied|ying)|factor\s+(?:the|both)|expand(?:ed|ing)?|isolat(?:e|ed|ing)|deriv(?:e|ed|ing)|solv(?:e|ed|ing)|we obtain|which gives|it follows|therefore|thus|hence)\b/i;
 
@@ -188,21 +190,27 @@ function extractTargetRelevantInstructionalContent(
       const matchedTerms = Array.from(new Set(termsByBlock.flat()));
       if (matchedTerms.length < requiredTargetTermMatches(targetTerms)) continue;
 
-      // Every block that supplies instructional or mathematical signals must
-      // itself mention a target term. A topical introduction may provide
-      // context for subsequent derivation steps, but cannot bless generic math.
+      // Every block that supplies instructional, mathematical, or mechanistic
+      // signals must itself mention a target term. A topical introduction may
+      // provide context for subsequent derivation steps, but cannot bless generic math.
       const signalsAreTargetBound = range.every((block, index) => {
         const contributesSignal = INSTRUCTIONAL_LANGUAGE.test(block.text) ||
-          MATHEMATICAL_CONTENT.test(block.text);
+          MATHEMATICAL_CONTENT.test(block.text) ||
+          MECHANISTIC_EXPLANATION.test(block.text);
         return !contributesSignal || termsByBlock[index].length > 0;
       });
-      if (!signalsAreTargetBound || !INSTRUCTIONAL_LANGUAGE.test(text) ||
-          !MATHEMATICAL_CONTENT.test(text)) continue;
+      const hasMathBackedExplanation = INSTRUCTIONAL_LANGUAGE.test(text) &&
+        MATHEMATICAL_CONTENT.test(text);
+      const hasMechanisticExplanation = MECHANISTIC_EXPLANATION.test(text);
+      if (!signalsAreTargetBound ||
+          (!hasMathBackedExplanation && !hasMechanisticExplanation)) continue;
 
       const match: PatternMatch = {
         text: truncateForEvidence(text),
         blockIndex: i,
-        pattern: "target-relevant-instructional-math-content",
+        pattern: hasMechanisticExplanation
+          ? "target-relevant-mechanistic-explanation"
+          : "target-relevant-instructional-math-content",
         confidence: "medium",
       };
       if (WORKED_STEP_LANGUAGE.test(text)) workedExamples.push(match);

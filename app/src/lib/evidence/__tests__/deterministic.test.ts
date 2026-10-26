@@ -695,6 +695,82 @@ describe("extractEducationalEvidence", () => {
       expect(evidence.interpreted.targetRelevantEvidence?.length).toBeGreaterThan(0);
     });
 
+    test("recognizes substantive target-relevant non-mathematical technology explanations", () => {
+      const content = makeStructuredContent({
+        blocks: [makeTextBlock(
+          "Modern space exploration uses infrared instruments to reveal distant galaxies; the telescope works by collecting wavelengths that ordinary optical cameras cannot detect."
+        )],
+      });
+
+      const evidence = extractEducationalEvidence(content, {
+        topicTitle: "Space Exploration Technologies",
+        conceptDescription: "Modern space exploration and astronomical research",
+      });
+
+      expect(evidence.interpreted.targetRelevantEvidence?.length).toBeGreaterThan(0);
+      expect(evidence.interpreted.instructionalExplanations?.length).toBeGreaterThan(0);
+    });
+
+    test("recognizes a detailed future-mission explanation, not merely a mission mention", () => {
+      const content = makeStructuredContent({
+        blocks: [makeTextBlock(
+          "For future space exploration, NASA's Dragonfly mission studies Titan because its rotorcraft works by flying between landing sites, allowing scientists to sample different environments across the moon."
+        )],
+      });
+
+      const evidence = extractEducationalEvidence(content, {
+        topicTitle: "Future Space Exploration Missions",
+        conceptDescription: "Future directions and missions in space exploration",
+      });
+
+      expect(evidence.interpreted.targetRelevantEvidence?.length).toBeGreaterThan(0);
+      expect(evidence.interpreted.instructionalExplanations?.length).toBeGreaterThan(0);
+    });
+
+    test.each([
+      ["event listing", "Future space exploration missions: Dragonfly launch window, 2028; Europa Clipper briefing, Thursday at 2 p.m."],
+      ["promotional tagline", "Explore the future of space exploration with NASA's exciting technology today."],
+      ["mechanism-like promotional tagline", "Discover future space exploration technology that works by your side."],
+      ["keyword-only paragraph", "Future space exploration missions, astronomical research, and modern space technology."],
+    ])("does not qualify a %s as instructional evidence", (_kind, text) => {
+      const evidence = extractEducationalEvidence(makeStructuredContent({
+        blocks: [makeTextBlock(text)],
+      }), {
+        topicTitle: "Future Space Exploration Missions",
+        conceptDescription: "Future directions and missions in space exploration",
+      });
+
+      expect(evidence.interpreted.targetRelevantEvidence).toEqual([]);
+    });
+
+    test("does not borrow a mechanism signal from a neighboring block", () => {
+      const evidence = extractEducationalEvidence(makeStructuredContent({
+        blocks: [
+          makeTextBlock("Modern space exploration telescope"),
+          makeTextBlock("The instrument works by collecting light and processing signals for the team."),
+        ],
+      }), {
+        topicTitle: "Space Exploration Technologies",
+        conceptDescription: "Modern space exploration and astronomical research",
+      });
+
+      expect(evidence.interpreted.targetRelevantEvidence).toEqual([]);
+    });
+
+    test("does not qualify target-matched navigation or menu text", () => {
+      const evidence = extractEducationalEvidence(makeStructuredContent({
+        blocks: [makeTextBlock(
+          "Future space exploration missions and astronomical research menu: overview, technologies, events, and contact.",
+          "nav"
+        )],
+      }), {
+        topicTitle: "Future Space Exploration Missions",
+        conceptDescription: "Future directions and missions in space exploration",
+      });
+
+      expect(evidence.interpreted.targetRelevantEvidence).toEqual([]);
+    });
+
     test("recognizes a genuine derivation when the target is named in its instructional block", () => {
       const content = makeStructuredContent({
         blocks: [
