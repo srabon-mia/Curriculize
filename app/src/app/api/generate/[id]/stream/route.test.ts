@@ -1303,6 +1303,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     expect(new Set(topicTrackers).size).toBe(18);
     const topicCaches = topicOptions.map((options) => options!.cache);
     expect(new Set(topicCaches).size).toBe(topicCaches.length); // cache lifetime is scoped to one invocation
+    expect(global.setTimeout).not.toHaveBeenCalledWith(expect.any(Function), 15_000);
   }, 120_000);
 
   it("records an empty topic as terminally insufficient after bounded retries", async () => {

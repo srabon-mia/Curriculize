@@ -2044,9 +2044,6 @@ export async function legacyGenerationGet(
             return;
           }
 
-          if (i < nodeIds.length - 1) {
-            await new Promise((r) => setTimeout(r, 15000));
-          }
         }
 
         // If ownership was lost during topic-level discovery, fail the job
@@ -2291,9 +2288,6 @@ export async function legacyGenerationGet(
               console.warn(`[stream] Understanding coverage in topic ${nodeId} is insufficient after ${MAX_COVERAGE_ATTEMPTS} attempts`);
             }
 
-            if (i < nodeIds.length - 1) {
-              await new Promise((r) => setTimeout(r, 15000));
-            }
           }
         }
         const backgroundBatch = runBackgroundBatch();
