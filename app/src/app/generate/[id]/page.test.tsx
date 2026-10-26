@@ -170,6 +170,28 @@ describe("GeneratePage - EventSource connection", () => {
     vi.useRealTimers();
   });
 
+  it("bounds repeated observer handoffs and opens the saved curriculum", async () => {
+    vi.useFakeTimers();
+    const { unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+    act(() => eventSourceInstances[0].listeners.get("skeleton")?.({
+      data: JSON.stringify({ title: "Saved curriculum", topic_count: 6 }),
+    } as MessageEvent));
+
+    for (let handoff = 0; handoff < 60; handoff++) {
+      const current = eventSourceInstances[eventSourceInstances.length - 1];
+      act(() => current.listeners.get("continue")?.({} as MessageEvent));
+      if (handoff < 59) await act(async () => vi.advanceTimersByTimeAsync(1000));
+    }
+
+    expect(eventSourceInstances).toHaveLength(60);
+    expect(mockRouter.push).toHaveBeenCalledTimes(1);
+    expect(mockRouter.push).toHaveBeenCalledWith("/results/test-curriculum-id");
+    unmount();
+    vi.useRealTimers();
+  });
+
   it("continues through nine concept-batch yields and reports terminal insufficient coverage", async () => {
     vi.useFakeTimers();
     const { getByRole, queryByText, unmount } = render(

@@ -1166,6 +1166,15 @@ export async function legacyGenerationGet(
                 });
                 closeObserverStream();
                 return;
+              } else if (currentJob.status === "pending") {
+                // The former owner may have safely yielded while this duplicate
+                // stream was observing it. Reconnect through the normal atomic
+                // claim path so pending work cannot remain idle behind an
+                // observer. A competing processor may win the claim; in that
+                // case this request will simply attach as an observer again.
+                safeSend("continue", { job_id: jobRecord.jobId });
+                closeObserverStream();
+                return;
               } else {
                 const resultData = currentJob.result_data as {
                   checkpoint?: { completedTopicIds?: unknown[] };

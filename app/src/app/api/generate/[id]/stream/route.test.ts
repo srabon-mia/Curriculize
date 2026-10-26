@@ -2137,6 +2137,28 @@ describe("Durable generation stream observer", () => {
     await reader.cancel();
   });
 
+  it("reconnects through the atomic claim path when an observed owner yields the job to pending", async () => {
+    vi.useFakeTimers();
+    const response = await startInlineObserver();
+    const reader = response.body!.getReader();
+    await readNextEvent(reader);
+    await readNextEvent(reader);
+    await readNextEvent(reader);
+
+    // A duplicate stream can outlive the owner that was doing the work.
+    // Once that owner releases its lease, the observer must hand control back
+    // to GET so claim_next_job can atomically resume the saved job.
+    observerRunningJob.status = "pending";
+    const continuationPromise = readNextEvent(reader);
+    await vi.advanceTimersByTimeAsync(10_000);
+    const continuation = await continuationPromise;
+
+    expect(continuation?.event).toBe("continue");
+    expect(continuation?.data).toMatchObject({ job_id: "running-job-id" });
+    expect((await reader.read()).done).toBe(true);
+    expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("fail_job", expect.anything());
+  });
+
   it("reports an already-saved skeleton to a reconnecting observer", async () => {
     vi.useFakeTimers();
     const response = await startInlineObserver(undefined, true);

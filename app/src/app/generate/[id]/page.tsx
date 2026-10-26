@@ -210,7 +210,18 @@ export default function GeneratePage({
     es.addEventListener("continue", () => {
       es.close();
       if (esRef.current === es) esRef.current = null;
-      if (reconnectTimerRef.current === null) {
+      continuationAttemptsRef.current += 1;
+      if (continuationAttemptsRef.current >= MAX_CONTINUATION_ATTEMPTS) {
+        if (savedStructureRef.current) {
+          terminalStateRef.current = "complete";
+          router.push(`/results/${encodeURIComponent(id)}`);
+        } else {
+          setError("Generation could not reconnect to its saved job after repeated attempts. Please retry generation.");
+          setCanRetryPaused(true);
+          terminalStateRef.current = "failed";
+          setTerminalState("failed");
+        }
+      } else if (reconnectTimerRef.current === null) {
         reconnectTimerRef.current = setTimeout(() => {
           reconnectTimerRef.current = null;
           connectRef.current?.();
