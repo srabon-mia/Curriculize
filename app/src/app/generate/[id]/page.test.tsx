@@ -224,4 +224,22 @@ describe("GeneratePage - EventSource connection", () => {
     await waitFor(() => expect(eventSourceInstances).toHaveLength(2));
     unmount();
   });
+
+  it("treats an observer timeout as a terminal pause instead of reconnecting automatically", async () => {
+    vi.useFakeTimers();
+    const { getByText, unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+    const observer = eventSourceInstances[0];
+    act(() => observer.listeners.get("paused")?.({
+      data: JSON.stringify({ message: "Generation is still in progress. This page stopped waiting." }),
+    } as MessageEvent));
+
+    expect(getByText(/still in progress\. this page stopped waiting/i)).toBeTruthy();
+    expect(observer.close).toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+    expect(eventSourceInstances).toHaveLength(1);
+    unmount();
+    vi.useRealTimers();
+  });
 });

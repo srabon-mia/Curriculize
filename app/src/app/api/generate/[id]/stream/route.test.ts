@@ -121,6 +121,7 @@ function createMockSupabaseClient() {
     order: vi.fn().mockReturnThis(),
     limit: vi.fn().mockReturnThis(),
     in: vi.fn().mockReturnThis(),
+    abortSignal: vi.fn().mockReturnThis(),
     update: vi.fn().mockReturnThis(),
     then: vi.fn().mockImplementation((cb: any) =>
       Promise.resolve({ data: [], error: null }).then(cb)
@@ -968,11 +969,12 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       const reader = response.body?.getReader();
       const events: string[] = [];
       if (reader) {
-        while (true) {
+        for (let i = 0; i < 3; i++) {
           const { done, value } = await reader.read();
           if (done) break;
           events.push(new TextDecoder().decode(value));
         }
+        await reader.cancel();
       }
 
       // Observer mode reports reconnect/waiting and does not start generation.
@@ -1210,7 +1212,14 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     const duplicateResponse = await GET(createMockRequest("test-curriculum-id"), {
       params: Promise.resolve({ id: "test-curriculum-id" }),
     });
-    const duplicateEvents = (await consumeSseEvents(duplicateResponse, 10_000, originalSetTimeout)).map(parseSseEvent);
+    const duplicateReader = duplicateResponse.body!.getReader();
+    const duplicateEvents = [];
+    for (let i = 0; i < 3; i++) {
+      const { done, value } = await duplicateReader.read();
+      if (done) break;
+      duplicateEvents.push(parseSseEvent(new TextDecoder().decode(value)));
+    }
+    await duplicateReader.cancel();
     expect(duplicateEvents.some((event) => event.data?.step === "waiting")).toBe(true);
     expect(capturedInserts.filter((entry) => entry.table === "acquisition_jobs")).toHaveLength(2); // second insert rejected by the active-job unique constraint mock
     expect(simulatedResumeJob.status).toBe("running");
@@ -1910,11 +1919,164 @@ describe("Durable generation stream observer", () => {
     return events;
   }
 
-  function request(): Request {
+  function request(signal?: AbortSignal): Request {
     return new Request("http://localhost/api/generate/test-curriculum-id/stream", {
       headers: { Accept: "text/event-stream" },
+      signal,
     });
   }
+
+  async function startInlineObserver(signal?: AbortSignal): Promise<Response> {
+    setRpcSequence("claim_next_job", [
+      { data: null, error: null },
+      { data: null, error: null },
+    ]);
+    jobInsertMockError = { code: "23505", message: "active generation already exists" };
+    observerRunningJob = {
+      id: "running-job-id",
+      curriculum_id: "test-curriculum-id",
+      status: "running",
+      error: null,
+      result_data: {
+        checkpoint: { completedTopicIds: ["topic-1"] },
+        batchCheckpoint: { completedTopicIds: [] },
+      },
+      curricula: { status: "draft" },
+    };
+    return GET(request(signal), { params: Promise.resolve({ id: "test-curriculum-id" }) });
+  }
+
+  async function readNextEvent(reader: ReadableStreamDefaultReader<Uint8Array>) {
+    const { done, value } = await reader.read();
+    return done ? null : parseSseEvent(new TextDecoder().decode(value!));
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("streams changed persisted checkpoints without claiming or running generation", async () => {
+    vi.useFakeTimers();
+    const response = await startInlineObserver();
+    const reader = response.body!.getReader();
+    const initialEvents = [await readNextEvent(reader), await readNextEvent(reader), await readNextEvent(reader)];
+    expect(initialEvents.some((event) => event?.data?.step === "waiting")).toBe(true);
+
+    observerRunningJob.result_data.batchCheckpoint.completedTopicIds.push("topic-1");
+    const updatedEventPromise = readNextEvent(reader);
+    await vi.advanceTimersByTimeAsync(10_000);
+    const updatedEvent = await updatedEventPromise;
+
+    expect(updatedEvent?.event).toBe("status");
+    expect(updatedEvent?.data).toMatchObject({ step: "running", current: 2, job_id: "running-job-id" });
+    expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("reserve_ai_call", expect.anything());
+    expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.filter(([name]) => name === "claim_next_job")).toHaveLength(2);
+    expect(allResourceInserts()).toHaveLength(0);
+    await reader.cancel();
+  });
+
+  it.each([
+    ["completed", "complete"],
+    ["failed", "error"],
+    ["cancelled", "error"],
+    ["canceled", "error"],
+  ])("terminates observer streaming when the job becomes %s", async (status, expectedEvent) => {
+    vi.useFakeTimers();
+    const response = await startInlineObserver();
+    const reader = response.body!.getReader();
+    await readNextEvent(reader);
+    await readNextEvent(reader);
+    await readNextEvent(reader);
+
+    observerRunningJob.status = status;
+    observerRunningJob.error = status === "failed" ? "saved failure" : null;
+    const terminalEventPromise = readNextEvent(reader);
+    await vi.advanceTimersByTimeAsync(10_000);
+    const terminalEvent = await terminalEventPromise;
+
+    expect(terminalEvent?.event).toBe(expectedEvent);
+    const end = await reader.read();
+    expect(end.done).toBe(true);
+  });
+
+  it("stops polling and clears the pending poll when the reader disconnects", async () => {
+    vi.useFakeTimers();
+    const response = await startInlineObserver();
+    const reader = response.body!.getReader();
+    await readNextEvent(reader);
+    await readNextEvent(reader);
+    await readNextEvent(reader);
+    const readsBeforeDisconnect = mockSupabaseClient.from.mock.calls.filter(([table]) => table === "acquisition_jobs").length;
+
+    await reader.cancel();
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(mockSupabaseClient.from.mock.calls.filter(([table]) => table === "acquisition_jobs")).toHaveLength(readsBeforeDisconnect);
+    expect(mockSupabaseClient.rpc).not.toHaveBeenCalledWith("fail_job", expect.anything());
+  });
+
+  it("stops the active observation when the request signal is aborted", async () => {
+    vi.useFakeTimers();
+    const abortController = new AbortController();
+    const response = await startInlineObserver(abortController.signal);
+    const reader = response.body!.getReader();
+    await readNextEvent(reader);
+    await readNextEvent(reader);
+    await readNextEvent(reader);
+    const readsBeforeAbort = mockSupabaseClient.from.mock.calls.filter(([table]) => table === "acquisition_jobs").length;
+
+    abortController.abort();
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(mockSupabaseClient.from.mock.calls.filter(([table]) => table === "acquisition_jobs")).toHaveLength(readsBeforeAbort);
+    expect((await reader.read()).done).toBe(true);
+  });
+
+  it("does not repeat unchanged checkpoint progress at each poll", async () => {
+    vi.useFakeTimers();
+    const response = await startInlineObserver();
+    const reader = response.body!.getReader();
+    await readNextEvent(reader);
+    await readNextEvent(reader);
+    await readNextEvent(reader);
+
+    let nextEventResolved = false;
+    const nextEventPromise = readNextEvent(reader).then((event) => {
+      nextEventResolved = true;
+      return event;
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(nextEventResolved).toBe(false);
+    await reader.cancel();
+    await nextEventPromise;
+  });
+
+  it("ends at the observation timeout with a pausing event instead of an auto-reconnect close", async () => {
+    vi.useFakeTimers();
+    const response = await startInlineObserver();
+    const reader = response.body!.getReader();
+    await readNextEvent(reader);
+    await readNextEvent(reader);
+    await readNextEvent(reader);
+
+    const eventsPromise = (async () => {
+      const events: Array<{ event: string | undefined; data: any }> = [];
+      while (true) {
+        const event = await readNextEvent(reader);
+        if (!event) break;
+        events.push(event);
+        if (event.event === "paused") break;
+      }
+      return events;
+    })();
+    await vi.advanceTimersByTimeAsync(210_000);
+    const events = await eventsPromise;
+
+    expect(events.at(-1)?.event).toBe("paused");
+    expect(events.at(-1)?.data.message).toMatch(/still in progress/i);
+    expect(events.some((event) => event.event === "continue")).toBe(false);
+    expect((await reader.read()).done).toBe(true);
+  });
 
   it("observes a running job after the prior stream owner disappeared, without doing discovery", async () => {
     durableJobRow = {

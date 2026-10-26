@@ -669,6 +669,7 @@ export async function failJob(
 
 const OBSERVER_POLL_MS = 10_000;
 const OBSERVER_WINDOW_MS = 3.5 * 60_000;
+const OBSERVER_CHECKPOINT_HEARTBEAT_MS = 30_000;
 
 /**
  * Run generation in the request that the student opens. The durable processor
@@ -905,6 +906,9 @@ export async function legacyGenerationGet(
     );
   }
 
+  let observerCancelled = false;
+  let cancelObserverPoll: (() => void) | null = null;
+  let abortObserverRequest: (() => void) | null = null;
   const stream = new ReadableStream({
     async start(controller) {
       let jobRecord: {
@@ -969,7 +973,31 @@ export async function legacyGenerationGet(
         if (jobRecord.mode === "observer") {
           console.log(`[stream] Observer mode: attached to job ${jobRecord.jobId}`);
 
-          send(controller, "status", {
+          const observerController = new AbortController();
+          const stopObserving = () => {
+            observerCancelled = true;
+            observerController.abort();
+            cancelObserverPoll?.();
+          };
+          abortObserverRequest = stopObserving;
+          request.signal.addEventListener("abort", stopObserving, { once: true });
+          const safeSend = (event: string, data: unknown) => {
+            if (observerCancelled || request.signal.aborted) return;
+            try {
+              send(controller, event, data);
+            } catch {
+              stopObserving();
+            }
+          };
+          const closeObserverStream = () => {
+            try {
+              controller.close();
+            } catch {
+              // The client may already have cancelled its reader.
+            }
+          };
+
+          safeSend("status", {
             message: "Reconnected to existing generation…",
             step: "reconnect",
             job_id: jobRecord.jobId,
@@ -979,7 +1007,7 @@ export async function legacyGenerationGet(
           // Send skeleton event if we have topic checkpoints (means skeleton was already generated)
           if (jobRecord.checkpoints.completedTopicIds.length > 0) {
             // We can't know the exact title, but we can report progress
-            send(controller, "status", {
+            safeSend("status", {
               message: `Resuming… ${jobRecord.checkpoints.completedTopicIds.length} topic(s) already processed`,
               step: "resume",
               current: jobRecord.checkpoints.completedTopicIds.length,
@@ -987,19 +1015,123 @@ export async function legacyGenerationGet(
             });
           }
 
-          // In observer mode, we just wait and periodically report status
-          // The owner stream will do the actual work and send events
-          // We close after sending initial status - the client will reconnect
-          // and eventually the owner will complete and send 'complete' event
-          send(controller, "status", {
+          safeSend("status", {
             message: "Waiting for generation to complete…",
             step: "waiting",
             job_id: jobRecord.jobId,
           });
 
-          // Close the stream - the client will reconnect via EventSource
-          // and eventually receive events from the owner stream
-          controller.close();
+          const observerStartedAt = Date.now();
+          const initialSignature = [
+            "running",
+            jobRecord.checkpoints.completedTopicIds.length,
+            jobRecord.checkpoints.batchCompletedTopicIds.length,
+            "",
+          ].join(":");
+          let lastStateSignature = initialSignature;
+          let lastCheckpointHeartbeatAt = observerStartedAt;
+
+          try {
+            while (
+              !observerCancelled &&
+              !request.signal.aborted &&
+              Date.now() - observerStartedAt < OBSERVER_WINDOW_MS
+            ) {
+              let currentJob: { status: string; error: string | null; result_data: unknown } | null = null;
+              let statusError: unknown = null;
+              try {
+                const result = await supabase
+                  .from("acquisition_jobs")
+                  .select("status, error, result_data")
+                  .eq("id", jobRecord.jobId)
+                  .abortSignal(observerController.signal)
+                  .single();
+                currentJob = result.data;
+                statusError = result.error;
+              } catch (error) {
+                statusError = error;
+              }
+
+              if (observerCancelled || request.signal.aborted) break;
+
+              if (statusError || !currentJob) {
+                const signature = "status_unavailable";
+                if (signature !== lastStateSignature) {
+                  safeSend("status", {
+                    message: "Generation is saved; checking its latest status…",
+                    step: "status_unavailable",
+                    job_id: jobRecord.jobId,
+                  });
+                  lastStateSignature = signature;
+                }
+              } else if (currentJob.status === "completed") {
+                safeSend("complete", { curriculum_id: id, phase: "background" });
+                closeObserverStream();
+                return;
+              } else if (["failed", "cancelled", "canceled"].includes(currentJob.status)) {
+                safeSend("error", {
+                  message: currentJob.error || (currentJob.status === "failed" ? "Generation failed." : "Generation was cancelled."),
+                });
+                closeObserverStream();
+                return;
+              } else {
+                const resultData = currentJob.result_data as {
+                  checkpoint?: { completedTopicIds?: unknown[] };
+                  batchCheckpoint?: { completedTopicIds?: unknown[] };
+                } | null;
+                const topicCount = resultData?.checkpoint?.completedTopicIds?.length ?? 0;
+                const batchCount = resultData?.batchCheckpoint?.completedTopicIds?.length ?? 0;
+                const signature = [currentJob.status, topicCount, batchCount, currentJob.error ?? ""].join(":");
+                if (signature !== lastStateSignature) {
+                  safeSend("status", {
+                    message: currentJob.status === "pending"
+                      ? `Generation is queued. ${topicCount} topic(s) and ${batchCount} understanding batch(es) are checkpointed.`
+                      : `Generation is running. ${topicCount} topic(s) and ${batchCount} understanding batch(es) are checkpointed.`,
+                    step: currentJob.status === "pending" ? "pending" : "running",
+                    current: topicCount + batchCount,
+                    total: -1,
+                    job_id: jobRecord.jobId,
+                  });
+                  lastStateSignature = signature;
+                  lastCheckpointHeartbeatAt = Date.now();
+                } else if (Date.now() - lastCheckpointHeartbeatAt >= OBSERVER_CHECKPOINT_HEARTBEAT_MS) {
+                  safeSend("status", {
+                    message: "Still waiting for generation to make progress…",
+                    step: "waiting",
+                    job_id: jobRecord.jobId,
+                  });
+                  lastCheckpointHeartbeatAt = Date.now();
+                }
+              }
+
+              await new Promise<void>((resolve) => {
+                const timer = setTimeout(() => {
+                  cancelObserverPoll = null;
+                  request.signal.removeEventListener("abort", cancelWait);
+                  resolve();
+                }, OBSERVER_POLL_MS);
+                const cancelWait = () => {
+                  clearTimeout(timer);
+                  cancelObserverPoll = null;
+                  request.signal.removeEventListener("abort", cancelWait);
+                  resolve();
+                };
+                cancelObserverPoll = cancelWait;
+                request.signal.addEventListener("abort", cancelWait, { once: true });
+              });
+            }
+
+            if (!observerCancelled && !request.signal.aborted) {
+              safeSend("paused", {
+                message: "Generation is still in progress. This page stopped waiting; return later or retry to check its saved status.",
+              });
+            }
+          } finally {
+            request.signal.removeEventListener("abort", stopObserving);
+            cancelObserverPoll?.();
+            abortObserverRequest = null;
+          }
+          closeObserverStream();
           return;
         }
 
@@ -2054,6 +2186,9 @@ export async function legacyGenerationGet(
       }
       clearHeartbeat();
     }
+    },
+    cancel() {
+      abortObserverRequest?.();
     },
   });
 
