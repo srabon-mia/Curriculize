@@ -25,9 +25,9 @@ import { z } from "zod";
 
 export const maxDuration = 300;
 
-// Keep each SSE invocation to one expensive resource target. A topic target
-// may itself span multiple persisted coverage attempts across invocations.
-const MAX_TOPICS_PER_SSE_INVOCATION = 1;
+// Process a small batch of resource targets per SSE invocation; the deadline
+// and durable checkpoints still bound work and make interruption resumable.
+const MAX_TOPICS_PER_SSE_INVOCATION = 3;
 const MAX_COVERAGE_ATTEMPTS = 2;
 const INVOCATION_WORK_BUDGET_MS = 240_000;
 const INVOCATION_CLEANUP_RESERVE_MS = 30_000;
@@ -189,7 +189,7 @@ function extractSkeletonJson(text: string): Skeleton | null {
 }
 
 // Leave time inside this route's 300s execution limit for cleanup and checkpointing.
-const AI_CALL_TIMEOUT_MS = 3 * 60 * 1000;
+const AI_CALL_TIMEOUT_MS = 60 * 1000;
 const STALL_TIMEOUT_MS = 4 * 60 * 1000;
 
 class AITimeoutError extends Error {

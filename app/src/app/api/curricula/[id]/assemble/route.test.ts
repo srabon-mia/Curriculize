@@ -100,6 +100,8 @@ describe("GET /api/curricula/[id]/assemble (warm-path assembly)", () => {
     // content_type_verified but DRAFT → excluded (not admin-approved)
     resource({ id: "draft-verified", node_id: nodeA, source_domain: "nysed.gov", status: "draft", content_type_verified: true });
     verifiedVr("draft-verified", "2026-09-01T00:00:00Z");
+    resource({ id: "draft-unverified", node_id: nodeA, status: "draft", content_type_verified: false });
+    resource({ id: "rejected-candidate", node_id: nodeA, status: "rejected", content_type_verified: false });
 
     const res = await callAssemble();
     const json = await res.json();
@@ -114,6 +116,11 @@ describe("GET /api/curricula/[id]/assemble (warm-path assembly)", () => {
     const allReturned = Object.values(json.resourcesByTarget).flat() as any[];
     expect(allReturned.map((r) => r.id)).not.toContain("draft-verified");
     expect(allReturned.map((r) => r.id)).not.toContain("seed-yet-unverified");
+    expect(json.candidateResourcesByTarget[`node:${nodeA}`].map((r: any) => r.id)).toEqual(["draft-verified", "draft-unverified"]);
+    expect(json.candidateResourcesByTarget[`node:${nodeA}`].map((r: any) => r.content_type_verified)).toEqual([true, false]);
+    expect(json.candidateResourcesByTarget[`mu:${muA1}`]).toEqual([]);
+    expect(json.candidateResourcesByTarget[`node:${nodeB}`]).toEqual([]);
+    expect(json.candidateResourcesByTarget[`mu:${muB1}`]).toEqual([]);
   });
 
   it("ranks eligible resources by domain score (primary), then recency", async () => {

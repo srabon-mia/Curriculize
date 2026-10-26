@@ -1267,13 +1267,14 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       .map((event) => event.data);
     expect(resumedDiscoveryStatuses.map((status) => status.message)).toEqual([
       "Finding resources for: Geometry Topic 1",
+      "Finding resources for: Geometry Topic 2",
     ]);
     expect(resumedDiscoveryStatuses[0].current).toBe(1);
     expect(secondEvents.filter((event) => event.event === "yielded")[0]?.data.topicsCompleted).toBe(1);
     expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual([
       "node-topic-1",
     ]);
-    expect(allResourceInserts()).toHaveLength(1); // the first attempt's resource survived resume without duplication
+    expect(allResourceInserts()).toHaveLength(2); // the first attempt survived resume and the next topic progressed
 
     // Continue each bounded topic and concept-batch attempt
     // until the same persisted job reaches its terminal state.
@@ -1302,7 +1303,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     expect(topicTrackers).toHaveLength(18); // two bounded discovery attempts for each topic
     expect(new Set(topicTrackers).size).toBe(18);
     const topicCaches = topicOptions.map((options) => options!.cache);
-    expect(new Set(topicCaches).size).toBe(topicCaches.length); // cache lifetime is scoped to one invocation
+    expect(new Set(topicCaches).size).toBeLessThan(topicCaches.length); // each invocation shares one cache across its bounded topic batch
     expect(global.setTimeout).not.toHaveBeenCalledWith(expect.any(Function), 15_000);
   }, 120_000);
 
@@ -1367,7 +1368,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
 
     expect(Object.values(simulatedResumeJob.result_data.resourceCoverage).some((target: any) => target.status === "insufficient")).toBe(true);
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "skeleton prompt")).toHaveLength(1);
-    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(2);
+    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(3);
 
     const releaseCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls
       .filter((call: any) => call[0] === "release_job_claim");

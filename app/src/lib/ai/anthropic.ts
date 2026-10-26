@@ -317,7 +317,7 @@ export class AnthropicProvider implements AIProvider {
     const structuredPrompt = `${prompt}\n\nReturn ONLY valid JSON. No markdown, no explanation, no additional text.`;
 
     const request = this.buildRequest(structuredPrompt, completeOptions);
-    const response = await this.requestWithRetry<AnthropicResponse>(request);
+    const response = await this.requestWithRetry<AnthropicResponse>(request, 4, completeOptions.signal);
 
     const rawText = this.extractText(response);
 

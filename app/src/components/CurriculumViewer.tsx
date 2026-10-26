@@ -70,11 +70,14 @@ function ResourceLink({ resource }: { resource: Resource }) {
 export function CurriculumViewer({
   nodes,
   resourcesByTarget: initialResourcesByTarget,
+  candidateResourcesByTarget: initialCandidateResourcesByTarget = {},
 }: {
   nodes: NodeWithChildren[];
   resourcesByTarget: Record<string, Resource[]>;
+  candidateResourcesByTarget?: Record<string, Resource[]>;
 }) {
   const [resourcesByTarget, setResourcesByTarget] = useState(initialResourcesByTarget);
+  const [candidateResourcesByTarget, setCandidateResourcesByTarget] = useState(initialCandidateResourcesByTarget);
   const [selectedNodeId, setSelectedNodeId] = useState<string>(
     nodes[0]?.id ?? ""
   );
@@ -131,6 +134,9 @@ export function CurriculumViewer({
           const assemblyData = await assemblyRes.json();
           if (assemblyData.resourcesByTarget && typeof assemblyData.resourcesByTarget === "object") {
             setResourcesByTarget(assemblyData.resourcesByTarget as Record<string, Resource[]>);
+          }
+          if (assemblyData.candidateResourcesByTarget && typeof assemblyData.candidateResourcesByTarget === "object") {
+            setCandidateResourcesByTarget(assemblyData.candidateResourcesByTarget as Record<string, Resource[]>);
           }
         }
       }
@@ -355,6 +361,21 @@ export function CurriculumViewer({
                 );
               })()}
 
+            {(candidateResourcesByTarget[`node:${selectedNodeId}`] ?? []).length > 0 && (
+              <div className="mb-8 rounded-xl border border-amber-300 bg-amber-50/60 p-5">
+                <p className="text-xs font-semibold uppercase tracking-wider text-amber-900 mb-1">Discovered candidates · not approved</p>
+                <p className="text-xs text-amber-900/80 mb-3">These links are saved for review and are not included among verified learning resources.</p>
+                <div className="divide-y divide-amber-200">
+                  {(candidateResourcesByTarget[`node:${selectedNodeId}`] ?? []).map((resource) => (
+                    <div key={resource.id}>
+                      <ResourceLink resource={resource} />
+                      <p className="text-[11px] text-amber-900 pb-2">{resource.content_type_verified ? "Content check passed; awaiting approval." : "Unverified candidate; review before use."}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Major understandings, each with their own resources */}
             <div className="space-y-4">
               <div className="mb-2">
@@ -365,6 +386,7 @@ export function CurriculumViewer({
 
               {selectedNode.major_understandings.map((mu) => {
                 const muResources = resourcesByTarget[`mu:${mu.id}`] ?? [];
+                const muCandidates = candidateResourcesByTarget[`mu:${mu.id}`] ?? [];
 
                 return (
                   <div
@@ -417,6 +439,18 @@ export function CurriculumViewer({
                           </div>
                         );
                       })()}
+
+                    {muCandidates.length > 0 && (
+                      <div className="mt-3.5 pt-3 border-t border-amber-200">
+                        <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-900 mb-1">Discovered candidates · not approved</p>
+                        {muCandidates.map((resource) => (
+                          <div key={resource.id}>
+                            <ResourceLink resource={resource} />
+                            <p className="text-[11px] text-amber-900 pb-2">{resource.content_type_verified ? "Content check passed; awaiting approval." : "Unverified candidate; review before use."}</p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
 
                     {muResources.length === 0 && (
                       generationFinished ? (

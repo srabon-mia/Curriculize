@@ -81,6 +81,18 @@ const createMockResponse = (overrides: Partial<MockResponseOverrides> = {}) => {
     expect(body.tools).toBeUndefined();
   });
 
+  test("structured() forwards its abort signal to the provider request", async () => {
+    mockFetch.mockResolvedValue(createMockResponse({ json: {
+      id: "msg_test", type: "message", role: "assistant",
+      content: [{ type: "text", text: '{"result":"success"}' }],
+      model: "claude-haiku-4-5-20251001", stop_reason: "end_turn", stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    } }));
+    const controller = new AbortController();
+    await provider.structured("Test prompt", { schema: (await import("zod")).z.object({ result: (await import("zod")).z.string() }), signal: controller.signal });
+    expect(mockFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
   test("includes web search tool when useSearch=true", async () => {
     mockFetch.mockResolvedValue(createMockResponse());
 

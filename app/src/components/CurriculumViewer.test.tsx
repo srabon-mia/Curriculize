@@ -136,9 +136,17 @@ describe("CurriculumViewer coverage status", () => {
       "node:node-2": [resource("topic-2a", "node-2", null), resource("topic-2b", "node-2", null)],
       "mu:mu-2": [resource("concept-3", null, "mu-2")],
     };
+    const candidateResource = {
+      ...resource("candidate-concept", null, "mu-1"),
+      status: "draft" as const,
+      content_type_verified: false,
+    };
     const fetchMock = vi.fn().mockImplementation(async (url: string) => {
       if (url.includes("/progress")) return { ok: true, json: async () => progress };
-      if (url.endsWith("/assemble")) return { ok: true, json: async () => ({ resourcesByTarget: fetchedResources }) };
+      if (url.endsWith("/assemble")) return { ok: true, json: async () => ({
+        resourcesByTarget: fetchedResources,
+        candidateResourcesByTarget: { "mu:mu-1": [candidateResource] },
+      }) };
       return { ok: false, json: async () => ({}) };
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -158,6 +166,9 @@ describe("CurriculumViewer coverage status", () => {
 
     expect(await screen.findByText("2 topic-wide")).toBeTruthy();
     await waitFor(() => expect(screen.getByText("2 concept-level")).toBeTruthy());
+    expect(screen.getByText("Discovered candidates · not approved")).toBeTruthy();
+    expect(screen.getByText("Unverified candidate; review before use.")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "candidate-concept" })).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith("/api/curricula/curriculum-1/assemble");
     expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith("/api/resources"))).toBe(false);
   });

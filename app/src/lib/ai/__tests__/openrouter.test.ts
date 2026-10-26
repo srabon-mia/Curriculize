@@ -293,6 +293,16 @@ describe("OpenRouterProvider", () => {
     expect(body.temperature).toBe(0); // Should default to 0 for structured output
   });
 
+  test("structured() forwards its abort signal to the provider request", async () => {
+    mockFetch.mockResolvedValue(createMockResponse({ json: {
+      id: "chatcmpl_test", object: "chat.completion", created: Date.now(), model: "openrouter/free",
+      choices: [{ index: 0, message: { role: "assistant", content: '{"result":"success"}' }, finish_reason: "stop" }],
+    } }));
+    const controller = new AbortController();
+    await provider.structured("Test prompt", { schema: z.object({ result: z.string() }), signal: controller.signal });
+    expect(mockFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
   test("structured() validates against Zod schema", async () => {
     const schema = z.object({
       name: z.string(),

@@ -492,7 +492,7 @@ export class OpenRouterProvider implements AIProvider {
     const { schema, ...completeOptions } = options;
 
     const request = this.buildStructuredRequest(prompt, schema, completeOptions);
-    const response = await this.requestWithRetry<OpenRouterResponse>(request);
+    const response = await this.requestWithRetry<OpenRouterResponse>(request, 4, completeOptions.signal);
 
     const rawText = this.extractText(response);
 

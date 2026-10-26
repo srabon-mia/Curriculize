@@ -99,6 +99,7 @@ export async function GET(
   // zero resources — this lets the frontend render the full topic tree and
   // show an honest "no resources yet" state instead of a missing key.
   const resourcesByTarget: Record<string, Resource[]> = {};
+  const candidateResourcesByTarget: Record<string, Resource[]> = {};
   const grouped: Record<string, Resource[]> = {};
   for (const r of allResources) {
     const key =
@@ -109,14 +110,26 @@ export async function GET(
   }
 
   for (const n of nodes) {
+    const topicKey = `node:${n.id}`;
     resourcesByTarget[`node:${n.id}`] = rankResourcesV1(
       selectEligibleResources(grouped[`node:${n.id}`] ?? []),
       domainScores,
       fetchedAtByResourceId
     );
+    candidateResourcesByTarget[topicKey] = rankResourcesV1(
+      (grouped[topicKey] ?? []).filter((resource) => resource.status === "draft"),
+      domainScores,
+      fetchedAtByResourceId
+    );
     for (const mu of n.major_understandings) {
+      const muKey = `mu:${mu.id}`;
       resourcesByTarget[`mu:${mu.id}`] = rankResourcesV1(
         selectEligibleResources(grouped[`mu:${mu.id}`] ?? []),
+        domainScores,
+        fetchedAtByResourceId
+      );
+      candidateResourcesByTarget[muKey] = rankResourcesV1(
+        (grouped[muKey] ?? []).filter((resource) => resource.status === "draft"),
         domainScores,
         fetchedAtByResourceId
       );
@@ -149,6 +162,7 @@ export async function GET(
       major_understandings: n.major_understandings,
     })),
     resourcesByTarget,
+    candidateResourcesByTarget,
     coverage: {
       eligible_targets: eligibleCount,
       total_targets: nodes.reduce(
