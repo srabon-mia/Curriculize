@@ -1199,6 +1199,87 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     });
   });
 
+  it("records a completed AI batch when its candidate fetch budget is exhausted and advances on resume", async () => {
+    resumeScenario = true;
+    const topicId = "node-topic-1";
+    const skeleton = {
+      title: "Geometry Curriculum",
+      source_type: "ai_organized",
+      source_attribution: null,
+      source_url: null,
+      nodes: [{
+        title: "Triangles",
+        order_index: 1,
+        major_understandings: [{ code: "G1", description: "Triangle angle relationships" }],
+      }],
+    };
+    simulatedResumeJob = {
+      id: "job-batch-budget",
+      curriculum_id: "test-curriculum-id",
+      status: "pending",
+      claim_token: "tok-real-uuid",
+      claim_version: 1,
+      result_data: {
+        skeleton,
+        discoveredSources: [],
+        checkpoint: { completedTopicIds: [topicId] },
+        resourceCoverage: { [`topic:${topicId}`]: { attempts: 2, status: "insufficient" } },
+        batchCheckpoint: { completedTopicIds: [] },
+      },
+    };
+    simulatedCurriculum = createMockCurriculum();
+    persistedResumeNodes = [{ id: topicId, title: "Triangles", order_index: 1, external_key: "topic-1" }];
+    persistedResumeMus = [{
+      id: `mu-${topicId}-G1`, node_id: topicId, code: "G1", external_key: "G1",
+      description: "Triangle angle relationships", order_index: 0,
+    }];
+    mockAIInstance.setResponse("batch prompt", {
+      structuredData: { topic_resources: [{
+        url: "https://example.org/triangle-lesson", title: "Triangle lesson",
+        resource_type: "text", source_domain: "example.org", ai_note: "Triangle instruction",
+        license_status: "link_only", understanding_codes: ["G1"],
+      }] },
+      completeText: '{"topic_resources":[]}',
+    });
+
+    // Let the batch AI call start inside the work budget, then exhaust the
+    // candidate-acquisition reserve before its returned candidate is fetched.
+    let clockMs = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => clockMs);
+    const originalStructured = mockAIInstance.structured.bind(mockAIInstance);
+    const structured = vi.spyOn(mockAIInstance, "structured");
+    structured.mockImplementation(async (prompt: string, options: any) => {
+      const result = await originalStructured(prompt, options);
+      if (prompt === "batch prompt") clockMs = 200_000;
+      return result;
+    });
+
+    const runInvocation = async () => {
+      const response = await GET(createMockRequest("test-curriculum-id"), {
+        params: Promise.resolve({ id: "test-curriculum-id" }),
+      });
+      return (await consumeSseEvents(response, 10_000, originalSetTimeout)).map(parseSseEvent);
+    };
+    const firstEvents = await runInvocation();
+    expect(firstEvents.find((event) => event.event === "yielded")?.data.message)
+      .toBe("Concept resource attempt saved. Resuming…");
+    expect(simulatedResumeJob.result_data.resourceCoverage["batch:node-topic-1"])
+      .toMatchObject({ attempts: 1, status: "retrying" });
+    expect(simulatedResumeJob.result_data.batchCheckpoint.completedTopicIds).toEqual([]);
+    expect(simulatedResumeJob.status).toBe("pending");
+
+    // A fresh claim resumes the same bounded attempt once. It then records a
+    // terminal insufficient result and durably marks the batch complete.
+    clockMs = 0;
+    const secondEvents = await runInvocation();
+    expect(secondEvents.some((event) => event.event === "complete")).toBe(true);
+    expect(simulatedResumeJob.result_data.resourceCoverage["batch:node-topic-1"])
+      .toMatchObject({ attempts: 2, status: "insufficient" });
+    expect(simulatedResumeJob.result_data.batchCheckpoint.completedTopicIds).toEqual([topicId]);
+    expect(simulatedResumeJob.status).toBe("completed");
+    expect(structured.mock.calls.filter(([prompt]) => prompt === "batch prompt")).toHaveLength(2);
+  });
+
   it("resumes the same nine-topic skeleton after persisted coverage attempts and skips completed topics", async () => {
     resumeScenario = true;
     const skeleton = {
@@ -1278,15 +1359,38 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
 
     // Continue each bounded topic and concept-batch attempt
     // until the same persisted job reaches its terminal state.
+    const conceptYieldSnapshots: Array<{ topicsCompleted: number; completedBatchTopics: string[]; coverage: Record<string, { attempts: number; status: string }> }> = [];
     for (let continuation = 0; continuation < 40 && simulatedResumeJob.status !== "completed"; continuation++) {
       const continuationResponse = await GET(createMockRequest("test-curriculum-id"), {
         params: Promise.resolve({ id: "test-curriculum-id" }),
       });
-      await consumeSseEvents(continuationResponse, 10_000, originalSetTimeout);
+      const continuationEvents = (await consumeSseEvents(continuationResponse, 10_000, originalSetTimeout)).map(parseSseEvent);
+      const conceptYield = continuationEvents.find((event) =>
+        event.event === "yielded" && event.data.message === "Concept resource attempt saved. Resuming…"
+      );
+      if (conceptYield) {
+        const resultData = simulatedResumeJob.result_data;
+        conceptYieldSnapshots.push({
+          topicsCompleted: conceptYield.data.topicsCompleted,
+          completedBatchTopics: [...(resultData.batchCheckpoint?.completedTopicIds ?? [])],
+          coverage: Object.fromEntries(Object.entries(resultData.resourceCoverage ?? {})
+            .filter(([key]) => key.startsWith("batch:"))
+            .map(([key, value]) => [key, { attempts: (value as any).attempts, status: (value as any).status }])),
+        });
+      }
     }
     expect(simulatedResumeJob.status).toBe("completed");
     expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toHaveLength(9);
     expect(simulatedResumeJob.result_data.batchCheckpoint.completedTopicIds).toHaveLength(9);
+    expect(conceptYieldSnapshots.length).toBeGreaterThan(1);
+    for (let i = 0; i < conceptYieldSnapshots.length; i++) {
+      expect(conceptYieldSnapshots[i].topicsCompleted)
+        .toBe(conceptYieldSnapshots[i].completedBatchTopics.length);
+      if (i > 0) {
+        expect(conceptYieldSnapshots[i].completedBatchTopics.length)
+          .toBeGreaterThanOrEqual(conceptYieldSnapshots[i - 1].completedBatchTopics.length);
+      }
+    }
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "skeleton prompt")).toHaveLength(1);
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "sources prompt")).toHaveLength(1);
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(18);

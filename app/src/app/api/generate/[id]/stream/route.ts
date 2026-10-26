@@ -2181,7 +2181,7 @@ export async function legacyGenerationGet(
               // Send yielded event so client knows to reconnect
               send(controller, "yielded", {
                 message: "Background batch quota reached. Resuming…",
-                topicsCompleted: batchTopicsProcessedThisInvocation,
+                topicsCompleted: completedBatchTopics.size,
                 totalTopics: nodeIds.length,
               });
               backgroundYielded = true;
@@ -2229,7 +2229,12 @@ export async function legacyGenerationGet(
                   );
                   if (!candidate.url || !candidate.title || targetMuIds.length === 0) continue;
                   for (const muId of targetMuIds) {
-                    if (!canStartCandidateAcquisition()) return "yield";
+                    // The AI discovery attempt has completed. If there is no
+                    // time left to acquire every candidate, record the
+                    // eligible resources saved so far as this bounded attempt;
+                    // yielding without recording it would replay the same
+                    // batch indefinitely with unchanged attempt/checkpoint data.
+                    if (!canStartCandidateAcquisition()) return "attempted";
                     try {
                       await discoverVerifiedResource(toLearnParams(
                         candidate as Record<string, unknown>, { understandingId: muId },
@@ -2276,7 +2281,7 @@ export async function legacyGenerationGet(
               } else {
                 send(controller, "yielded", {
                   message: "Concept resource attempt saved. Resuming…",
-                  topicsCompleted: batchTopicsProcessedThisInvocation,
+                  topicsCompleted: completedBatchTopics.size,
                   totalTopics: nodeIds.length,
                 });
               }
@@ -2284,6 +2289,10 @@ export async function legacyGenerationGet(
               controller.close();
               return;
             }
+            // The fenced coverage RPC adds terminal outcomes to the durable
+            // batch checkpoint. Mirror that state for later yields in this
+            // invocation, so progress counts completed batches, not starts.
+            completedBatchTopics.add(nodeId);
             if (batchOutcome === "insufficient") {
               console.warn(`[stream] Understanding coverage in topic ${nodeId} is insufficient after ${MAX_COVERAGE_ATTEMPTS} attempts`);
             }
