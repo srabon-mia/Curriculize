@@ -165,6 +165,45 @@ describe("GeneratePage - EventSource connection", () => {
     vi.useRealTimers();
   });
 
+  it("continues through nine concept-batch yields and reports terminal insufficient coverage", async () => {
+    vi.useFakeTimers();
+    const { getByRole, queryByText, unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+
+    for (let continuation = 0; continuation < 9; continuation++) {
+      const current = eventSourceInstances[eventSourceInstances.length - 1];
+      act(() => current.listeners.get("yielded")?.({
+        data: JSON.stringify({ message: "Concept batch checkpointed", topicsCompleted: 1, totalTopics: 9 }),
+      } as MessageEvent));
+      if (continuation < 8) await act(async () => vi.advanceTimersByTimeAsync(2000));
+    }
+
+    expect(eventSourceInstances).toHaveLength(9);
+    expect(queryByText(/retry limit was reached/i)).toBeNull();
+    act(() => eventSourceInstances[8].listeners.get("complete")?.({
+      data: JSON.stringify({ curriculum_id: "test-curriculum-id", phase: "background", coverage_status: "insufficient" }),
+    } as MessageEvent));
+
+    expect(getByRole("status").textContent).toMatch(/resource coverage is insufficient/i);
+    expect(queryByText(/retry limit was reached/i)).toBeNull();
+    expect(mockRouter.push).not.toHaveBeenCalled();
+    unmount();
+    vi.useRealTimers();
+  });
+
+  it("navigates to the curriculum only when terminal coverage is complete", async () => {
+    const { unmount } = render(
+      <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
+    );
+    act(() => eventSourceInstances[0].listeners.get("complete")?.({
+      data: JSON.stringify({ curriculum_id: "test-curriculum-id", phase: "background", coverage_status: "complete" }),
+    } as MessageEvent));
+
+    expect(mockRouter.push).toHaveBeenCalledWith("/curriculum/test-curriculum-id");
+    unmount();
+  });
+
   it("does not exhaust retries while durable status is observable and reconnects after an observer window", async () => {
     vi.useFakeTimers();
     const { queryByText, unmount } = render(
@@ -187,13 +226,13 @@ describe("GeneratePage - EventSource connection", () => {
     vi.useRealTimers();
   });
 
-  it("does not reset the retry limit when the same unfinished topic reports discovery again", async () => {
+  it("keeps a finite limit when intentional continuations repeat without progress", async () => {
     vi.useFakeTimers();
     const { getByText, unmount } = render(
       <GeneratePage params={Promise.resolve({ id: "test-curriculum-id" })} />
     );
 
-    for (let attempt = 0; attempt < 5; attempt++) {
+    for (let attempt = 0; attempt < 60; attempt++) {
       const current = eventSourceInstances[eventSourceInstances.length - 1];
       act(() => current.listeners.get("status")?.({
         data: JSON.stringify({ message: "Finding resources", step: "discovery", current: 3, total: 9 }),
@@ -201,10 +240,10 @@ describe("GeneratePage - EventSource connection", () => {
       act(() => current.listeners.get("yielded")?.({
         data: JSON.stringify({ message: "Retrying topic", topicsCompleted: 0, totalTopics: 9 }),
       } as MessageEvent));
-      if (attempt < 4) await act(async () => vi.advanceTimersByTimeAsync(2000));
+      if (attempt < 59) await act(async () => vi.advanceTimersByTimeAsync(2000));
     }
 
-    expect(eventSourceInstances).toHaveLength(5);
+    expect(eventSourceInstances).toHaveLength(60);
     expect(getByText(/retry limit was reached/i)).toBeTruthy();
     unmount();
     vi.useRealTimers();

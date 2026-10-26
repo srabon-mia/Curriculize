@@ -41,6 +41,8 @@ const capturedInserts: Array<{ table: string; resources: any[] }> = [];
 const capturedNodeInserts: Array<any> = [];
 const capturedMuInserts: Array<any> = [];
 const capturedCurriculumUpdates: Array<any> = [];
+const structureLifecycleOrder: string[] = [];
+const capturedSseEvents: string[] = [];
 let resumeScenario = false;
 let persistedResumeNodes: Array<any> = [];
 let persistedResumeMus: Array<any> = [];
@@ -161,6 +163,7 @@ function createMockSupabaseClient() {
           return selectChain;
         });
         const nodeInsertMock = vi.fn().mockImplementation((data: any) => {
+          structureLifecycleOrder.push("topic-row");
           capturedNodeInserts.push(data);
           const nodeId = `node-${data.external_key}`;
           if (resumeScenario) {
@@ -180,6 +183,7 @@ function createMockSupabaseClient() {
 
       if (table === "major_understandings") {
         const muInsertMock = vi.fn().mockImplementation((data: any) => {
+          structureLifecycleOrder.push("understanding-row");
           capturedMuInserts.push(data);
           if (resumeScenario) {
             const rows = Array.isArray(data) ? data : [data];
@@ -311,10 +315,11 @@ function createMockSupabaseClient() {
           : args.p_budget_exhausted || attemptCount >= args.p_max_attempts
             ? "insufficient"
             : "retrying";
-        if (resumeScenario && simulatedResumeJob) {
+        const checkpointJob = resumeScenario ? simulatedResumeJob : durableJobRow;
+        if (checkpointJob) {
           const phaseCheckpoint = args.p_phase === "topic" ? "checkpoint" : "batchCheckpoint";
-          const completed = simulatedResumeJob.result_data[phaseCheckpoint]?.completedTopicIds ?? [];
-          const resultData = simulatedResumeJob.result_data;
+          const completed = checkpointJob.result_data?.[phaseCheckpoint]?.completedTopicIds ?? [];
+          const resultData = checkpointJob.result_data ?? (checkpointJob.result_data = {});
           resultData.resourceCoverage ??= {};
           resultData.resourceCoverage[key] = { attempts: attemptCount, status, resourcesFound: args.p_resources_found };
           if (status !== "retrying") {
@@ -326,6 +331,17 @@ function createMockSupabaseClient() {
         }
         return Promise.resolve({ data: { attempts: attemptCount, status, retry: status === "retrying" }, error: null });
       }
+      if (name === "save_job_skeleton") {
+        structureLifecycleOrder.push("skeleton-checkpoint");
+        const checkpointJob = resumeScenario ? simulatedResumeJob : durableJobRow;
+        if (!checkpointJob) return Promise.resolve({ data: { status: "ownership_lost_or_expired" }, error: null });
+        checkpointJob.result_data ??= {};
+        if (checkpointJob.result_data.skeleton) {
+          return Promise.resolve({ data: { status: "already_saved" }, error: null });
+        }
+        checkpointJob.result_data.skeleton = args.p_skeleton;
+        return Promise.resolve({ data: { status: "saved" }, error: null });
+      }
       if (resumeScenario && name === "release_job_claim") {
         simulatedResumeJob.status = "pending";
         return Promise.resolve({ data: true, error: null });
@@ -335,13 +351,22 @@ function createMockSupabaseClient() {
         durableJobRow.claim_token = null;
         return Promise.resolve({ data: true, error: null });
       }
-      if (resumeScenario && name === "save_job_sources") {
-        simulatedResumeJob.result_data.discoveredSources = args.p_sources;
+      if (name === "save_job_sources") {
+        const checkpointJob = resumeScenario ? simulatedResumeJob : durableJobRow;
+        if (checkpointJob) {
+          checkpointJob.result_data ??= {};
+          checkpointJob.result_data.discoveredSources = args.p_sources;
+        }
         return Promise.resolve({ data: true, error: null });
       }
       if (resumeScenario && name === "complete_job") {
         simulatedResumeJob.status = "completed";
         return Promise.resolve({ data: true, error: null });
+      }
+      if (name === "publish_and_complete_job") {
+        const checkpointJob = resumeScenario ? simulatedResumeJob : durableJobRow;
+        if (checkpointJob) checkpointJob.status = "completed";
+        return Promise.resolve({ data: { status: "completed" }, error: null });
       }
 
       // Default: reserve_ai_call returns reserved (success)
@@ -402,7 +427,7 @@ vi.mock("@/lib/acquisition/jobTypes", () => ({
 // Import the route AFTER all mocks are registered
 // Exercise the production inline generation path and retain direct coverage of
 // the read-only observer used to inspect durable job state.
-const { GET, observeGeneration } = await import("./route");
+const { GET, observeGeneration, hasSufficientInvocationBudget } = await import("./route");
 
 // ============================================================
 // Test data factories
@@ -652,6 +677,8 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     capturedNodeInserts.length = 0;
     capturedMuInserts.length = 0;
     capturedCurriculumUpdates.length = 0;
+    structureLifecycleOrder.length = 0;
+    capturedSseEvents.length = 0;
     resetRpcOverrides();
     resumeScenario = false;
     persistedResumeNodes = [];
@@ -685,6 +712,32 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     }) as typeof global.setInterval;
   });
 
+  it("reserves request time for checkpoint cleanup before starting long work", () => {
+    expect(hasSufficientInvocationBudget(0, 30_000, 180_000)).toBe(true);
+    expect(hasSufficientInvocationBudget(0, 30_001, 180_000)).toBe(false);
+    expect(hasSufficientInvocationBudget(0, 195_000, 15_000)).toBe(true);
+    expect(hasSufficientInvocationBudget(0, 195_001, 15_000)).toBe(false);
+  });
+
+  it("refuses to infer a complete skeleton from legacy topic rows", async () => {
+    resumeScenario = true;
+    simulatedResumeJob = {
+      id: "job-legacy", status: "pending", claim_token: "legacy-token", claim_version: 4,
+      result_data: {}, curriculum_id: "test-curriculum-id",
+    };
+    persistedResumeNodes = [
+      { id: "legacy-topic-1", title: "A partial saved topic", order_index: 1 },
+    ];
+
+    const events = (await runStreamAndCaptureEvents()).map(parseSseEvent);
+
+    expect(events.find((event) => event.event === "error")?.data.message).toMatch(/operator recovery is required/i);
+    expect(capturedNodeInserts).toHaveLength(0);
+    expect(capturedMuInserts).toHaveLength(0);
+    expect(mockAIInstance.getCalls((call) => call.prompt === "skeleton prompt")).toHaveLength(0);
+    expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.some((call: any) => call[0] === "fail_job")).toBe(true);
+  });
+
   afterEach(() => {
     global.setTimeout = originalSetTimeout;
     global.setInterval = originalSetInterval;
@@ -693,6 +746,8 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     capturedNodeInserts.length = 0;
     capturedMuInserts.length = 0;
     capturedCurriculumUpdates.length = 0;
+    structureLifecycleOrder.length = 0;
+    capturedSseEvents.length = 0;
     resetRpcOverrides();
     resetRpcSequences();
     jobInsertMockError = null;
@@ -707,7 +762,8 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
 
   async function runStreamAndCapture(
     curriculumId: string = "test-curriculum-id",
-    assertSkeletonEvent = false
+    assertSkeletonEvent = false,
+    followYields = true
   ): Promise<any[]> {
     mockAIInstance.setDefaultResponse({
       completeText: createMockSkeletonResponse(),
@@ -731,11 +787,16 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     });
 
     const request = createMockRequest(curriculumId);
-    const response = await GET(request, {
-      params: Promise.resolve({ id: curriculumId }),
-    });
-
-    const events = await consumeSseEvents(response, 10_000, originalSetTimeout);
+    let events: string[] = [];
+    for (let invocation = 0; invocation < (followYields ? 60 : 1); invocation++) {
+      const response = await GET(invocation === 0 ? request : createMockRequest(curriculumId), {
+        params: Promise.resolve({ id: curriculumId }),
+      });
+      const current = await consumeSseEvents(response, 10_000, originalSetTimeout);
+      events.push(...current);
+      capturedSseEvents.push(...current);
+      if (!current.some((event) => parseSseEvent(event).event === "yielded")) break;
+    }
     if (assertSkeletonEvent) {
       expect(events.map(parseSseEvent).some((event) => event.event === "skeleton")).toBe(true);
     }
@@ -768,6 +829,9 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
 
     expect(topicLevel.length).toBeGreaterThan(0);
     expect(batchLevel.length).toBeGreaterThan(0);
+    expect(durableJobRow.result_data.skeleton.nodes).toHaveLength(1);
+    expect(structureLifecycleOrder.indexOf("skeleton-checkpoint")).toBeLessThan(structureLifecycleOrder.indexOf("topic-row"));
+    expect(structureLifecycleOrder.indexOf("skeleton-checkpoint")).toBeLessThan(structureLifecycleOrder.indexOf("understanding-row"));
   }, 15000);
 
   it("every persisted resource is status='draft' and never 'approved' (Phase 12 invariant)", async () => {
@@ -812,7 +876,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
 
   describe("claimOrRegisterJob: atomic claim-first protocol", () => {
     it("calls claim_next_job RPC before attempting INSERT", async () => {
-      await runStreamAndCapture();
+      await runStreamAndCapture("test-curriculum-id", false, false);
 
       // claim_next_job is called; since it returns null (no pending job),
       // the route attempts INSERT
@@ -822,7 +886,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     });
 
     it("INSERTs a 'running' job with a real claim_token (not NULL)", async () => {
-      await runStreamAndCapture();
+      await runStreamAndCapture("test-curriculum-id", false, false);
 
       const jobInserts = capturedJobInserts();
       expect(jobInserts.length).toBe(1);
@@ -838,7 +902,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     });
 
     it("INSERTs job with job_type='curriculum_generation' and real claim_token", async () => {
-      await runStreamAndCapture();
+      await runStreamAndCapture("test-curriculum-id", false, false);
 
       const jobInserts = capturedJobInserts();
       expect(jobInserts.length).toBe(1);
@@ -849,7 +913,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     });
 
     it("guest generation: job has created_by = NULL (no authenticated user)", async () => {
-      await runStreamAndCapture();
+      await runStreamAndCapture("test-curriculum-id", false, false);
 
       const jobInserts = capturedJobInserts();
       expect(jobInserts.length).toBe(1);
@@ -866,7 +930,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
 
   describe("Retry idempotency: stable external_key for nodes and MUs", () => {
     it("INSERTs nodes with stable external_key (topic-N from order_index)", async () => {
-      await runStreamAndCapture();
+      await runStreamAndCapture("test-curriculum-id", false, false);
 
       const nodeInserts = allNodeInserts();
       expect(nodeInserts.length).toBe(1);
@@ -877,7 +941,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     });
 
     it("INSERTs major_understandings with stable external_key from code or fallback", async () => {
-      await runStreamAndCapture();
+      await runStreamAndCapture("test-curriculum-id", false, false);
 
       const muInserts = allMuInserts().flat();
       expect(muInserts.length).toBeGreaterThan(0);
@@ -904,7 +968,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
         error: null,
       });
 
-      await runStreamAndCapture();
+      await runStreamAndCapture("test-curriculum-id", false, false);
 
       // claim_next_job was called
       const rpcCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls;
@@ -934,7 +998,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       // Simulate unique violation on the INSERT
       jobInsertMockError = { code: "23505", message: "duplicate key value" };
 
-      await runStreamAndCapture();
+      await runStreamAndCapture("test-curriculum-id", false, false);
 
       // claim_next_job should have been called twice (initial + retry)
       const claimCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.filter(
@@ -1038,6 +1102,8 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       expect(completeCall[1]).toMatchObject({
         p_has_progress: true,
       });
+      expect(rpcCalls.some((call: any) => call[0] === "publish_and_complete_job")).toBe(false);
+      expect(capturedCurriculumUpdates.some((update) => update.status === "published")).toBe(false);
     });
 
     it("all lifecycle RPCs receive the job id and claim_token", async () => {
@@ -1133,7 +1199,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     });
   });
 
-  it("resumes the same nine-topic skeleton after the two-topic quota and skips completed topics", async () => {
+  it("resumes the same nine-topic skeleton after persisted coverage attempts and skips completed topics", async () => {
     resumeScenario = true;
     const skeleton = {
       title: "High School Geometry Semester Curriculum",
@@ -1173,62 +1239,25 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     const firstEvents = (await consumeSseEvents(firstResponse, 10_000, originalSetTimeout)).map(parseSseEvent);
     const firstYield = firstEvents.find((event) => event.event === "yielded");
     expect(firstYield?.data).toEqual({
-      message: "Processing quota reached. Resuming…",
-      topicsCompleted: 2,
+      message: "Resource attempt saved. Resuming…",
+      topicsCompleted: 0,
       totalTopics: 9,
     });
     expect(simulatedResumeJob.status).toBe("pending");
-    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual(["node-topic-1", "node-topic-2"]);
+    expect(simulatedResumeJob.result_data.checkpoint).toBeUndefined();
+    expect(simulatedResumeJob.result_data.resourceCoverage["topic:node-topic-1"]).toMatchObject({ attempts: 1, status: "retrying" });
     expect(persistedResumeNodes).toHaveLength(9);
+    expect(allResourceInserts()).toHaveLength(1);
+    expect(allResourceInserts()[0].node_id).toBe("node-topic-1");
 
-    // Reconnecting claims the existing pending row; it does not insert a new job.
-    let releaseResumedDiscovery!: () => void;
-    let notifyResumedDiscoveryStarted!: () => void;
-    const resumedDiscoveryGate = new Promise<void>((resolve) => { releaseResumedDiscovery = resolve; });
-    const resumedDiscoveryStarted = new Promise<void>((resolve) => { notifyResumedDiscoveryStarted = resolve; });
-    const baseProvider = mockAIInstance;
-    const resumedDiscovery = vi.fn(async (prompt: string, options: any) => {
-      const topicCalls = baseProvider.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt").length;
-      if (prompt === "discover prompt" && topicCalls === 4) {
-        notifyResumedDiscoveryStarted();
-        await resumedDiscoveryGate;
-      }
-      return baseProvider.structured(prompt, options);
-    });
-    vi.mocked((await import("@/lib/ai")).getAIProvider).mockReturnValue({
-      structured: resumedDiscovery,
-      complete: baseProvider.complete.bind(baseProvider),
-      name: "mock",
-      capabilities: baseProvider.capabilities,
-    } as any);
-
+    // Reconnecting claims the existing pending row and resumes its saved
+    // second attempt rather than rerunning skeleton/source generation.
     const secondResponse = await GET(createMockRequest("test-curriculum-id"), {
       params: Promise.resolve({ id: "test-curriculum-id" }),
     });
-    const secondEventsPromise = consumeSseEvents(secondResponse, 10_000, originalSetTimeout);
-    await resumedDiscoveryStarted;
-
-    // A duplicate stream sees the running lease, fails its unique insert, then attaches as an observer.
-    const duplicateResponse = await GET(createMockRequest("test-curriculum-id"), {
-      params: Promise.resolve({ id: "test-curriculum-id" }),
-    });
-    const duplicateReader = duplicateResponse.body!.getReader();
-    const duplicateEvents = [];
-    for (let i = 0; i < 3; i++) {
-      const { done, value } = await duplicateReader.read();
-      if (done) break;
-      duplicateEvents.push(parseSseEvent(new TextDecoder().decode(value)));
-    }
-    await duplicateReader.cancel();
-    expect(duplicateEvents.some((event) => event.data?.step === "waiting")).toBe(true);
-    expect(capturedInserts.filter((entry) => entry.table === "acquisition_jobs")).toHaveLength(2); // second insert rejected by the active-job unique constraint mock
-    expect(simulatedResumeJob.status).toBe("running");
-
-    releaseResumedDiscovery();
-    const secondEvents = (await secondEventsPromise).map(parseSseEvent);
+    const secondEvents = (await consumeSseEvents(secondResponse, 10_000, originalSetTimeout)).map(parseSseEvent);
     expect(simulatedResumeJob.id).toBe("job-1");
     expect(simulatedResumeJob.status).toBe("pending");
-    expect(capturedInserts.filter((entry) => entry.table === "acquisition_jobs")).toHaveLength(2);
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "skeleton prompt")).toHaveLength(1);
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "sources prompt")).toHaveLength(1);
     expect(persistedResumeNodes.map((node) => node.title)).toEqual(skeleton.nodes.map((node) => node.title));
@@ -1237,18 +1266,18 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
       .filter((event) => event.event === "status" && event.data.step === "discovery")
       .map((event) => event.data);
     expect(resumedDiscoveryStatuses.map((status) => status.message)).toEqual([
-      "Finding resources for: Geometry Topic 3",
-      "Finding resources for: Geometry Topic 4",
+      "Finding resources for: Geometry Topic 1",
     ]);
-    expect(resumedDiscoveryStatuses[0].current).toBe(3);
-    expect(secondEvents.filter((event) => event.event === "yielded")[0]?.data.topicsCompleted).toBe(2);
+    expect(resumedDiscoveryStatuses[0].current).toBe(1);
+    expect(secondEvents.filter((event) => event.event === "yielded")[0]?.data.topicsCompleted).toBe(1);
     expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual([
-      "node-topic-1", "node-topic-2", "node-topic-3", "node-topic-4",
+      "node-topic-1",
     ]);
+    expect(allResourceInserts()).toHaveLength(1); // the first attempt's resource survived resume without duplication
 
-    // Continue every later two-topic window (including the independent batch phase)
+    // Continue each bounded topic and concept-batch attempt
     // until the same persisted job reaches its terminal state.
-    for (let continuation = 0; continuation < 10 && simulatedResumeJob.status !== "completed"; continuation++) {
+    for (let continuation = 0; continuation < 40 && simulatedResumeJob.status !== "completed"; continuation++) {
       const continuationResponse = await GET(createMockRequest("test-curriculum-id"), {
         params: Promise.resolve({ id: "test-curriculum-id" }),
       });
@@ -1273,7 +1302,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     expect(topicTrackers).toHaveLength(18); // two bounded discovery attempts for each topic
     expect(new Set(topicTrackers).size).toBe(18);
     const topicCaches = topicOptions.map((options) => options!.cache);
-    expect(new Set(topicCaches).size).toBeLessThan(topicCaches.length);
+    expect(new Set(topicCaches).size).toBe(topicCaches.length); // cache lifetime is scoped to one invocation
   }, 120_000);
 
   it("records an empty topic as terminally insufficient after bounded retries", async () => {
@@ -1323,9 +1352,8 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
 
     const initialEvents = await captureStream();
     expect(initialEvents.some((event) => event.event === "yielded")).toBe(true);
-    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual([
-      "node-topic-1", "node-topic-2",
-    ]);
+    expect(simulatedResumeJob.result_data.checkpoint).toBeUndefined();
+    expect(simulatedResumeJob.result_data.resourceCoverage["topic:node-topic-1"]).toMatchObject({ attempts: 1, status: "retrying" });
 
     vi.mocked(discoverVerifiedResource).mockResolvedValue(null as any);
     const failedTopicEvents = await captureStream();
@@ -1333,18 +1361,16 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     expect(failedTopicEvents.some((event) => event.event === "yielded")).toBe(true);
     expect(failedTopicEvents.some((event) => event.event === "complete")).toBe(false);
     expect(failedTopicEvents.find((event) => event.event === "status" && event.data.step === "skeleton")?.data.message).toBe("Loading the saved curriculum structure…");
-    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual([
-      "node-topic-1", "node-topic-2", "node-topic-3", "node-topic-4",
-    ]);
+    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual(["node-topic-1"]);
     expect(simulatedResumeJob.status).toBe("pending");
 
     expect(Object.values(simulatedResumeJob.result_data.resourceCoverage).some((target: any) => target.status === "insufficient")).toBe(true);
     expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "skeleton prompt")).toHaveLength(1);
-    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(8);
+    expect(mockAIInstance.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(2);
 
     const releaseCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls
       .filter((call: any) => call[0] === "release_job_claim");
-    expect(releaseCalls).toHaveLength(2); // first quota yield, then quota yield after terminal shortfall
+    expect(releaseCalls).toHaveLength(2); // retry attempt yield, then target-quota yield
     expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.some((call: any) => call[0] === "complete_job")).toBe(false);
   }, 120_000);
 
@@ -1381,7 +1407,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     });
     const firstEvents = (await consumeSseEvents(firstResponse, 10_000, originalSetTimeout)).map(parseSseEvent);
     expect(firstEvents.some((event) => event.event === "yielded")).toBe(true);
-    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual(["node-topic-1", "node-topic-2"]);
+    expect(simulatedResumeJob.result_data.checkpoint).toBeUndefined();
     const persistedNodeTitles = persistedResumeNodes.map((node) => node.title);
 
     const baseProvider = mockAIInstance;
@@ -1407,11 +1433,11 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     expect(retryEvents.some((event) => event.event === "complete")).toBe(false);
     expect(simulatedResumeJob.id).toBe("job-1");
     expect(simulatedResumeJob.status).toBe("pending");
-    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual(["node-topic-1", "node-topic-2", "node-topic-3", "node-topic-4"]);
+    expect(simulatedResumeJob.result_data.checkpoint.completedTopicIds).toEqual(["node-topic-1"]);
     expect(persistedResumeNodes.map((node) => node.title)).toEqual(persistedNodeTitles);
     expect(baseProvider.getCalls((call) => call.method === "structured" && call.prompt === "skeleton prompt")).toHaveLength(1);
-    expect(baseProvider.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(4);
-    expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.filter((call: any) => call[0] === "record_resource_coverage_attempt" && call[1].p_phase === "topic" && call[1].p_target_id === "node-topic-3")).toHaveLength(2);
+    expect(baseProvider.getCalls((call) => call.method === "structured" && call.prompt === "discover prompt")).toHaveLength(1);
+    expect((mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls.filter((call: any) => call[0] === "record_resource_coverage_attempt" && call[1].p_phase === "topic" && call[1].p_target_id === "node-topic-1")).toHaveLength(2);
   }, 120_000);
 
   // ============================================================
@@ -1421,6 +1447,11 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
   describe("terminal state events", () => {
     it("emits complete event with phase=background on success", async () => {
       await runStreamAndCapture();
+
+      const backgroundComplete = capturedSseEvents
+        .map(parseSseEvent)
+        .find((event) => event.event === "complete" && event.data.phase === "background");
+      expect(backgroundComplete?.data.coverage_status).toBe("insufficient");
 
       const rpcCalls = (mockSupabaseClient.rpc as ReturnType<typeof vi.fn>).mock.calls;
       const completeCalls = rpcCalls.filter((c: any) => c[0] === "complete_job");

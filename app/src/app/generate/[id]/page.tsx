@@ -18,6 +18,7 @@ type Status = {
 type CompleteEvent = {
   curriculum_id: string;
   phase: "topics" | "background";
+  coverage_status?: "pending" | "complete" | "insufficient" | "failed";
 };
 
 type YieldedEvent = {
@@ -47,6 +48,7 @@ export default function GeneratePage({
   const [log, setLog] = useState<LogEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [canRetryPaused, setCanRetryPaused] = useState(false);
+  const [coverageStatus, setCoverageStatus] = useState<CompleteEvent["coverage_status"]>();
   const [skeletonTitle, setSkeletonTitle] = useState<string | null>(null);
   const [terminalState, setTerminalState] = useState<"none" | "complete" | "failed">("none");
   const terminalStateRef = useRef(terminalState);
@@ -54,8 +56,14 @@ export default function GeneratePage({
   const yieldedHandledRef = useRef(false);
   const connectRef = useRef<() => void>(() => {});
   const reconnectAttemptsRef = useRef(0);
+  const continuationAttemptsRef = useRef(0);
   const lastDiscoveryCurrentRef = useRef(0);
   const MAX_RECONNECT_ATTEMPTS = 5;
+  // Each of at most 12 targets in two phases can yield once between two
+  // coverage attempts and once at the per-invocation target boundary, plus
+  // initial structure/source and elapsed-time budget yields. Keep finite room
+  // for the full bounded workflow without conflating yields with transport retries.
+  const MAX_CONTINUATION_ATTEMPTS = 60;
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Keep terminalStateRef in sync with terminalState
@@ -93,6 +101,7 @@ export default function GeneratePage({
       ) {
         lastDiscoveryCurrentRef.current = data.current;
         reconnectAttemptsRef.current = 0;
+        continuationAttemptsRef.current = 0;
       }
 
       // A durable status response proves the job can still be observed. Do not
@@ -136,10 +145,16 @@ export default function GeneratePage({
     es.addEventListener("complete", (e) => {
       const data = JSON.parse(e.data) as CompleteEvent;
       if (data.phase === "background") {
+        terminalStateRef.current = "complete";
         setTerminalState("complete");
+        setCoverageStatus(data.coverage_status ?? "pending");
         es.close();
         esRef.current = null;
-        router.push(`/curriculum/${id}`);
+        if (data.coverage_status === "complete") {
+          router.push(`/curriculum/${id}`);
+        } else {
+          setLog((prev) => [...prev, { message: "Generation processing finished.", done: true }]);
+        }
       } else if (data.phase === "topics") {
         setLog((prev) => [
           ...prev.slice(0, -1),
@@ -164,9 +179,10 @@ export default function GeneratePage({
       // Close current connection; reconnect will be triggered by the effect
       es.close();
       esRef.current = null;
-      reconnectAttemptsRef.current += 1;
-      if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      continuationAttemptsRef.current += 1;
+      if (continuationAttemptsRef.current >= MAX_CONTINUATION_ATTEMPTS) {
         setError("Generation needs another continuation, but the retry limit was reached. Please return to the curriculum and try again.");
+        terminalStateRef.current = "failed";
         setTerminalState("failed");
       } else if (reconnectTimerRef.current === null) {
         reconnectTimerRef.current = setTimeout(() => {
@@ -209,9 +225,11 @@ export default function GeneratePage({
         try {
           const data = JSON.parse(event.data) as { message: string };
           setError(data.message);
+          terminalStateRef.current = "failed";
           setTerminalState("failed");
         } catch {
           setError("Something went wrong — please try again");
+          terminalStateRef.current = "failed";
           setTerminalState("failed");
         }
         es.close();
@@ -259,6 +277,7 @@ export default function GeneratePage({
     setError(null);
     setCanRetryPaused(false);
     reconnectAttemptsRef.current = 0;
+    continuationAttemptsRef.current = 0;
     lastDiscoveryCurrentRef.current = 0;
     connectRef.current();
   }, []);
@@ -317,9 +336,11 @@ export default function GeneratePage({
           <div className="bg-surface-card rounded-2xl border border-border-default shadow-sm p-6 sm:p-8">
             <div className="flex items-center justify-between gap-2 mb-2">
               <p className="text-xs font-display font-semibold uppercase tracking-[0.18em] text-brand-forest">
-                Building your curriculum
+                {terminalState === "complete" ? "Generation processing finished" : "Building your curriculum"}
               </p>
-              <span className="w-2 h-2 rounded-full bg-brand-fresh animate-ping" />
+              {terminalState !== "complete" && (
+                <span className="w-2 h-2 rounded-full bg-brand-fresh animate-ping" />
+              )}
             </div>
 
             {skeletonTitle ? (
@@ -347,6 +368,21 @@ export default function GeneratePage({
                       width: `${((status.current ?? 0) / status.total) * 100}%`,
                     }}
                   />
+                </div>
+              </div>
+            )}
+
+            {terminalState === "complete" && (
+              <div role="status" className="mt-4 rounded-lg border border-border-default bg-canvas-subtle p-4 text-sm text-text-secondary">
+                {coverageStatus === "insufficient"
+                  ? "Resource coverage is insufficient. Some topic or concept targets did not meet their resource minimums."
+                  : coverageStatus === "complete"
+                    ? "Resource coverage is complete for all topic and concept targets."
+                    : "Resource coverage could not be confirmed."}
+                <div className="mt-3">
+                  <Link href={`/curriculum/${id}`} className="font-medium text-brand-forest underline">
+                    View curriculum
+                  </Link>
                 </div>
               </div>
             )}

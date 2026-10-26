@@ -53,6 +53,20 @@ describe("resource coverage status", () => {
     expect(mapUnderstandingCodesToIds(["unknown"], understandings)).toEqual([]);
   });
 
+  it("yields an incomplete target operation without recording or consuming an attempt", async () => {
+    let recorded = false;
+    const result = await runBoundedCoverageAttempts({
+      maxAttempts: 2,
+      threshold: 3,
+      attempt: async () => "yield",
+      measureEligibleResources: async () => 1,
+      record: async () => { recorded = true; return { status: "retrying", retry: true, attempts: 0 }; },
+    });
+
+    expect(result).toBe("yielded");
+    expect(recorded).toBe(false);
+  });
+
   it("retries empty discovery and checkpoints only after a later eligible association exists", async () => {
     let persisted = 0;
     let attempts = 0;
@@ -64,7 +78,9 @@ describe("resource coverage status", () => {
       measureEligibleResources: async () => persisted,
       record: async ({ resourcesFound, sufficient }) => {
         checkpointCounts.push(resourcesFound);
-        return { attempts, status: sufficient ? "complete" : "retrying", retry: !sufficient } as const;
+        return sufficient
+          ? { attempts, status: "complete", retry: false } as const
+          : { attempts, status: "retrying", retry: true } as const;
       },
     });
     expect(outcome).toBe("complete");
@@ -78,6 +94,7 @@ describe("resource coverage status", () => {
     const outcome = await runBoundedCoverageAttempts({
       maxAttempts: 2,
       initialAttempts: 1,
+      threshold: 3,
       attemptIdFor: (index) => `attempt-${index}`,
       attempt: async (index) => { attemptIndices.push(index); return 'attempted'; },
       measureEligibleResources: async () => 3,
@@ -91,11 +108,54 @@ describe("resource coverage status", () => {
     expect(outcome).toBe('complete');
   });
 
+  it("yields after persisting a retryable attempt and resumes at the saved attempt count", async () => {
+    let storedAttempts = 0;
+    let eligibleResources = 0;
+    const firstAttempt = await runBoundedCoverageAttempts({
+      maxAttempts: 2,
+      yieldAfterRetry: true,
+      attempt: async () => "attempted",
+      measureEligibleResources: async () => eligibleResources,
+      threshold: 2,
+      record: async ({ sufficient }) => {
+        storedAttempts++;
+        return sufficient
+          ? { status: "complete", retry: false, attempts: storedAttempts } as const
+          : { status: "retrying", retry: true, attempts: storedAttempts } as const;
+      },
+    });
+
+    expect(firstAttempt).toBe("yielded");
+    expect(storedAttempts).toBe(1);
+
+    eligibleResources = 2;
+    const resumedIndices: number[] = [];
+    const resumed = await runBoundedCoverageAttempts({
+      maxAttempts: 2,
+      initialAttempts: storedAttempts,
+      yieldAfterRetry: true,
+      attempt: async (index) => { resumedIndices.push(index); return "attempted"; },
+      measureEligibleResources: async () => eligibleResources,
+      threshold: 2,
+      record: async ({ sufficient }) => {
+        storedAttempts++;
+        return sufficient
+          ? { status: "complete", retry: false, attempts: storedAttempts } as const
+          : { status: "insufficient", retry: false, attempts: storedAttempts } as const;
+      },
+    });
+
+    expect(resumed).toBe("complete");
+    expect(resumedIndices).toEqual([1]);
+    expect(storedAttempts).toBe(2);
+  });
+
   it("reuses the same attempt ID when an invocation is interrupted before its attempt checkpoint", async () => {
     const ids: string[] = [];
     let interrupt = true;
     const config = {
       maxAttempts: 2,
+        threshold: 3,
       attemptIdFor: (index: number) => `attempt-${index}`,
       attempt: async (index: number) => {
         ids.push(`reserved-${index}`);
@@ -169,7 +229,7 @@ describe("resource coverage status", () => {
       measureEligibleResources: async () => 0,
       record: async ({ budgetExhausted }) => {
         statuses.push(budgetExhausted ? "insufficient" : "retrying");
-        return { status: "insufficient", retry: false };
+        return { attempts: 1, status: "insufficient", retry: false };
       },
     });
     expect(statuses).toEqual(["insufficient"]);
@@ -178,7 +238,7 @@ describe("resource coverage status", () => {
       threshold: 3,
       attempt: async () => "ownership_lost",
       measureEligibleResources: async () => 0,
-      record: async () => null,
+      record: async () => ({ status: "ownership_lost", retry: false }),
     });
     expect(lost).toBe("ownership_lost");
   });

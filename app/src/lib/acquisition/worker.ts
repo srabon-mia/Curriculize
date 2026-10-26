@@ -35,7 +35,7 @@ import { createClient } from '@supabase/supabase-js';
 import type { AICompleteResult } from '@/lib/ai/types';
 import type { JobBudgetLimits, JobClaimResult } from '@/lib/acquisition/jobTypes';
 import { mapUnderstandingCodesToIds } from '@/lib/acquisition/coverage';
-import { runBoundedCoverageAttempts } from '@/lib/acquisition/coverage';
+import { getStoredCoverageStatus, runBoundedCoverageAttempts } from '@/lib/acquisition/coverage';
 import { createWorkerDeadline, WorkerYieldRequested } from '@/lib/acquisition/workerDeadline';
 import { withAbortSignal } from '@/lib/acquisition/abortableRequest';
 import { createHash } from 'node:crypto';
@@ -593,6 +593,21 @@ export async function finalizeJobPublication(
   });
 }
 
+/** Publish only after every persisted topic and concept target meets coverage. */
+export async function finalizeJobForCoverage(
+  job: JobClaimResult,
+  coverageStatus: 'complete' | 'insufficient' | 'pending' | 'failed',
+  publish: typeof publishAndCompleteJob = publishAndCompleteJob,
+  complete: typeof completeJob = completeJob,
+  signal?: AbortSignal
+): Promise<ProcessJobOutcome> {
+  if (coverageStatus === 'complete') {
+    return finalizeJobPublication(job, publish, signal);
+  }
+  const completed = await complete(job.id, job.claim_token!, job.claim_version, true);
+  return completed ? 'completed' : 'ownership_lost';
+}
+
 export async function processJob(
   job: JobClaimResult,
   invocationDeadline?: ReturnType<typeof createWorkerDeadline>
@@ -1006,7 +1021,24 @@ export async function processJob(
     // Final completion: only mark the job 'completed' if ALL work succeeded
     // and there is enough invocation budget to perform the terminal write.
     deadline.checkBeforeExpensiveOperation();
-    const finalization = await finalizeJobPublication(job, publishAndCompleteJob, deadline.signal);
+    const finalJobState = await getJobById(job.id, deadline.signal);
+    if (!finalJobState) throw new Error('Unable to read final resource coverage checkpoint');
+    const resultData = finalJobState.result_data as { resourceCoverage?: unknown } | null;
+    const coverage = resultData?.resourceCoverage && typeof resultData.resourceCoverage === 'object'
+      ? resultData.resourceCoverage as Record<string, { status?: string }>
+      : undefined;
+    const coverageStatus = getStoredCoverageStatus({
+      jobStatus: 'completed',
+      coverage,
+      expectedTargets: nodeIds.length * 2,
+    });
+    const finalization = await finalizeJobForCoverage(
+      job,
+      coverageStatus,
+      publishAndCompleteJob,
+      completeJob,
+      deadline.signal
+    );
 
     if (finalization === 'ownership_lost') {
       // Atomic publication rejected this stale or expired claim. The job

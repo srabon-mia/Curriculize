@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { finalizeJobPublication } from '@/lib/acquisition/worker';
+import { finalizeJobForCoverage, finalizeJobPublication } from '@/lib/acquisition/worker';
 import type { JobClaimResult } from '@/lib/acquisition/jobTypes';
 
 const job = { id: 'job-1', claim_token: 'token-1', claim_version: 4 } as JobClaimResult;
@@ -19,5 +19,23 @@ describe('atomic job publication finalization', () => {
   it('propagates publication errors instead of reporting completion', async () => {
     await expect(finalizeJobPublication(job, vi.fn().mockRejectedValue(new Error('publication failed'))))
       .rejects.toThrow('publication failed');
+  });
+
+  it('completes insufficient processing without publishing the curriculum', async () => {
+    const publish = vi.fn();
+    const complete = vi.fn().mockResolvedValue(true);
+
+    await expect(finalizeJobForCoverage(job, 'insufficient', publish, complete)).resolves.toBe('completed');
+    expect(publish).not.toHaveBeenCalled();
+    expect(complete).toHaveBeenCalledWith('job-1', 'token-1', 4, true);
+  });
+
+  it('uses atomic publication only for coverage-complete curricula', async () => {
+    const publish = vi.fn().mockResolvedValue('completed');
+    const complete = vi.fn();
+
+    await expect(finalizeJobForCoverage(job, 'complete', publish, complete)).resolves.toBe('completed');
+    expect(publish).toHaveBeenCalledWith({ jobId: 'job-1', claimToken: 'token-1', claimVersion: 4 });
+    expect(complete).not.toHaveBeenCalled();
   });
 });

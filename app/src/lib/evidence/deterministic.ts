@@ -15,6 +15,24 @@ export function extractEducationalEvidence(
   structuredContent: StructuredContent,
   targetContext?: EvidenceTargetContext
 ): EducationalEvidence {
+  if (targetContext && isCommercePage(structuredContent)) {
+    return {
+      source: {
+        cleanedHash: structuredContent.source.cleanedHash,
+        contentHash: structuredContent.source.contentHash,
+      },
+      interpreted: {
+        explicitLearningObjectives: [],
+        explicitDefinitions: [],
+        explicitExercises: [],
+        workedExamples: [],
+        instructionalExplanations: [],
+        targetRelevantEvidence: [],
+        targetTermsMatched: [],
+      },
+    };
+  }
+
   let explicitLearningObjectives = extractLearningObjectives(structuredContent.blocks);
   let explicitDefinitions = extractDefinitions(structuredContent.blocks);
   let explicitExercises = extractExercises(structuredContent.blocks);
@@ -94,6 +112,17 @@ const BOILERPLATE_PATTERNS = [
   /\bsubscribe to (?:our|the) newsletter\b/i,
   /\b(?:share this page|print this page|back to top)\b/i,
 ];
+const DIRECT_PURCHASE_ACTION = /\b(?:add to cart|add to basket|buy now|checkout|place order)\b/i;
+const COMMERCE_CONTEXT = /\b(?:\$\s?\d|\b(?:USD|EUR|GBP)\s?\d|price\s*:|shipping\s+(?:from|to)|ships? from|sold by|seller|quantity|SKU|product details|customer reviews?)\b/i;
+
+/** Reject obvious transaction pages by combining an action with transaction context. */
+function isCommercePage(content: StructuredContent): boolean {
+  const pageText = [content.metadata.title, content.metadata.description ?? "", ...content.blocks.map((block) => block.text)]
+    .join(" ")
+    .slice(0, 40_000);
+  return DIRECT_PURCHASE_ACTION.test(pageText) && COMMERCE_CONTEXT.test(pageText);
+}
+
 const INSTRUCTIONAL_LANGUAGE =
   /\b(?:because|therefore|thus|hence|substitut\w*|differentiat\w*|integrat\w*|rearrang\w*|simplif\w*|factor\w*|expand\w*|isolat\w*|derive\w*|solv\w*|we obtain|which gives|it follows|satisf\w*|relat\w*|represent\w*|model\w*|describ\w*|consider|initial condition|general solution|particular solution)\b/i;
 const MATHEMATICAL_CONTENT =

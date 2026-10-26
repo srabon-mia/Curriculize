@@ -743,6 +743,47 @@ describe("extractEducationalEvidence", () => {
       expect(evidence.interpreted.targetRelevantEvidence).toEqual([]);
     });
 
+    test("rejects a target-relevant Etsy-style product listing despite descriptive copy", () => {
+      const content = makeStructuredContent({
+        metadata: {
+          ...makeStructuredContent().metadata,
+          title: "Space Exploration Mission Patch",
+          description: "A detailed commemorative patch showing a future space mission.",
+        },
+        blocks: [
+          makeTextBlock("This detailed space exploration mission patch explains the technologies enabling modern space exploration and astronomical research."),
+          makeTextBlock("Price: $24.00. Sold by StarShop. Shipping from the United States. Add to cart."),
+        ],
+      });
+
+      const evidence = extractEducationalEvidence(content, {
+        topicTitle: "Space Exploration Technologies",
+        conceptDescription: "Technologies enabling modern space exploration and astronomical research",
+      });
+
+      expect(evidence.interpreted.targetRelevantEvidence).toEqual([]);
+      expect(evidence.interpreted.targetTermsMatched).toEqual([]);
+    });
+
+    test("does not reject substantive instructional content that mentions products but has no transaction signals", () => {
+      const content = makeStructuredContent({
+        metadata: {
+          ...makeStructuredContent().metadata,
+          title: "Spacecraft Thermal Control",
+        },
+        blocks: [makeTextBlock(
+          "Spacecraft thermal control works by circulating coolant between exposed surfaces and radiators, allowing instruments to release excess energy safely during long space exploration missions."
+        )],
+      });
+
+      const evidence = extractEducationalEvidence(content, {
+        topicTitle: "Space Exploration Technologies",
+        conceptDescription: "Thermal control systems for spacecraft",
+      });
+
+      expect(evidence.interpreted.targetRelevantEvidence?.length).toBeGreaterThan(0);
+    });
+
     test("does not borrow a mechanism signal from a neighboring block", () => {
       const evidence = extractEducationalEvidence(makeStructuredContent({
         blocks: [

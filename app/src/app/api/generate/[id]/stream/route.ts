@@ -16,18 +16,72 @@ import {
   reserveAICall,
   releaseJobClaim,
   recordResourceCoverageAttempt,
+  saveJobSkeleton,
+  publishAndCompleteJob,
 } from "@/lib/acquisition/jobService";
-import { runBoundedCoverageAttempts, mapUnderstandingCodesToIds } from "@/lib/acquisition/coverage";
+import { getStoredCoverageStatus, runBoundedCoverageAttempts, mapUnderstandingCodesToIds } from "@/lib/acquisition/coverage";
 import { PersistenceError } from "@/lib/persistence";
 import { z } from "zod";
 
 export const maxDuration = 300;
 
-// Maximum topics to process per SSE invocation before yielding.
-// Matches the durable worker's MAX_TOPICS_PER_INVOCATION to ensure
-// the job stays within the 300s Vercel limit and can resume via cron.
-const MAX_TOPICS_PER_SSE_INVOCATION = 2;
+// Keep each SSE invocation to one expensive resource target. A topic target
+// may itself span multiple persisted coverage attempts across invocations.
+const MAX_TOPICS_PER_SSE_INVOCATION = 1;
 const MAX_COVERAGE_ATTEMPTS = 2;
+const INVOCATION_WORK_BUDGET_MS = 240_000;
+const INVOCATION_CLEANUP_RESERVE_MS = 30_000;
+const CANDIDATE_WORK_RESERVE_MS = 15_000;
+
+export function hasSufficientInvocationBudget(
+  startedAtMs: number,
+  nowMs: number,
+  requiredOperationMs: number
+): boolean {
+  return nowMs - startedAtMs + requiredOperationMs + INVOCATION_CLEANUP_RESERVE_MS <= INVOCATION_WORK_BUDGET_MS;
+}
+
+function getStoredCoverageAttempts(
+  resultData: unknown,
+  phase: "topic" | "batch",
+  targetId: string
+): number {
+  if (!resultData || typeof resultData !== "object") return 0;
+  const coverage = (resultData as { resourceCoverage?: Record<string, { attempts?: unknown }> }).resourceCoverage;
+  const attempts = coverage?.[`${phase}:${targetId}`]?.attempts;
+  return typeof attempts === "number" && Number.isSafeInteger(attempts) && attempts > 0
+    ? attempts
+    : 0;
+}
+
+async function getPersistedCoverageStatus(
+  curriculumId: string,
+  resultData: unknown,
+  topicCount?: number
+): Promise<"pending" | "complete" | "insufficient" | "failed"> {
+  try {
+    let expectedTopicCount = topicCount;
+    if (expectedTopicCount === undefined) {
+      const { data, error } = await supabase
+        .from("nodes")
+        .select("id")
+        .eq("curriculum_id", curriculumId);
+      if (error) return "pending";
+      expectedTopicCount = data?.length ?? 0;
+    }
+
+    const coverage = resultData && typeof resultData === "object"
+      ? (resultData as { resourceCoverage?: Record<string, { status?: string }> }).resourceCoverage
+      : undefined;
+    return getStoredCoverageStatus({
+      jobStatus: "completed",
+      coverage,
+      expectedTargets: expectedTopicCount * 2,
+    });
+  } catch {
+    return "pending";
+  }
+}
 
 const supabase = createServiceClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -135,7 +189,7 @@ function extractSkeletonJson(text: string): Skeleton | null {
 }
 
 // Leave time inside this route's 300s execution limit for cleanup and checkpointing.
-const AI_CALL_TIMEOUT_MS = 4 * 60 * 1000;
+const AI_CALL_TIMEOUT_MS = 3 * 60 * 1000;
 const STALL_TIMEOUT_MS = 4 * 60 * 1000;
 
 class AITimeoutError extends Error {
@@ -750,7 +804,11 @@ export async function observeGeneration(
         }
 
         if (latestJob?.status === "completed") {
-          send("complete", { curriculum_id: id, phase: "background" });
+          send("complete", {
+            curriculum_id: id,
+            phase: "background",
+            coverage_status: await getPersistedCoverageStatus(id, latestJob.result_data),
+          });
           close();
           return;
         }
@@ -788,7 +846,11 @@ export async function observeGeneration(
               .maybeSingle();
             if (activeError) throw new Error(`Could not observe active generation job: ${activeError.message}`);
             if (activeJob?.status === "completed") {
-              send("complete", { curriculum_id: id, phase: "background" });
+              send("complete", {
+                curriculum_id: id,
+                phase: "background",
+                coverage_status: await getPersistedCoverageStatus(id, activeJob.result_data),
+              });
               close();
               return;
             }
@@ -819,7 +881,11 @@ export async function observeGeneration(
             // A temporary status read failure is not a failed generation.
             send("status", { message: "Generation is saved; checking its latest status…", step: "status_unavailable", job_id: jobId });
           } else if (current.status === "completed") {
-            send("complete", { curriculum_id: id, phase: "background" });
+            send("complete", {
+              curriculum_id: id,
+              phase: "background",
+              coverage_status: await getPersistedCoverageStatus(id, current.result_data),
+            });
             close();
             return;
           } else if (current.status === "failed") {
@@ -891,6 +957,7 @@ export async function legacyGenerationGet(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  const invocationStartedAt = Date.now();
   const streamId = crypto.randomUUID();
   console.info(`[stream] Request opened: stream_id=${streamId}, curriculum_id=${id}`);
 
@@ -933,6 +1000,26 @@ export async function legacyGenerationGet(
           clearInterval(heartbeatInterval);
           heartbeatInterval = null;
         }
+      };
+
+      const canStartAiCall = () => hasSufficientInvocationBudget(invocationStartedAt, Date.now(), AI_CALL_TIMEOUT_MS);
+      const canStartCandidateAcquisition = () => hasSufficientInvocationBudget(invocationStartedAt, Date.now(), CANDIDATE_WORK_RESERVE_MS);
+      const yieldOwner = async (message: string): Promise<void> => {
+        if (!jobRecord || jobRecord.mode !== "owner") return;
+        const released = await releaseJobClaim(jobRecord.id, jobRecord.claim_token, jobRecord.claim_version);
+        clearHeartbeat();
+        if (released) {
+          send(controller, "yielded", {
+            message,
+            topicsCompleted: 0,
+            totalTopics: 0,
+          });
+        } else {
+          send(controller, "error", {
+            message: "Generation progress was saved, but the job could not be safely paused. Refresh to check its status.",
+          });
+        }
+        controller.close();
       };
 
       try {
@@ -1065,7 +1152,11 @@ export async function legacyGenerationGet(
                   lastStateSignature = signature;
                 }
               } else if (currentJob.status === "completed") {
-                safeSend("complete", { curriculum_id: id, phase: "background" });
+                safeSend("complete", {
+                  curriculum_id: id,
+                  phase: "background",
+                  coverage_status: await getPersistedCoverageStatus(id, currentJob.result_data),
+                });
                 closeObserverStream();
                 return;
               } else if (["failed", "cancelled", "canceled"].includes(currentJob.status)) {
@@ -1183,48 +1274,52 @@ export async function legacyGenerationGet(
         let skeletonParsed: Skeleton | null = null;
         let updatedCurriculumTitle = curriculum.title;
         const nodeIds: Array<{ nodeId: string; node: SkeletonNode }> = [];
-        const { data: existingNodes } = await supabase
+        const { data: existingNodes, error: existingNodesError } = await supabase
           .from("nodes")
           .select("id, title, order_index")
           .eq("curriculum_id", id)
           .order("order_index", { ascending: true });
+        if (existingNodesError) throw new Error(`Failed to inspect existing curriculum structure: ${existingNodesError.message}`);
 
-        const resumingSkeleton = Boolean(existingNodes && existingNodes.length > 0);
+        const { getJobById } = await import("@/lib/acquisition/jobService");
+        const skeletonJob = await getJobById(ownerJobRecord.id);
+        const storedSkeleton = skeletonJob?.result_data && typeof skeletonJob.result_data === "object"
+          ? (skeletonJob.result_data as { skeleton?: unknown }).skeleton
+          : undefined;
+        if (storedSkeleton !== undefined) {
+          const parsedCheckpoint = SkeletonSchema.safeParse(storedSkeleton);
+          if (!parsedCheckpoint.success) {
+            throw new Error("Persisted curriculum skeleton is malformed; manual recovery required");
+          }
+          skeletonParsed = parsedCheckpoint.data;
+        } else if (existingNodes && existingNodes.length > 0) {
+          clearHeartbeat();
+          const failed = await failJob(
+            ownerJobRecord.id,
+            ownerJobRecord.claim_token,
+            ownerJobRecord.claim_version,
+            "legacy_structure_without_skeleton: existing topic rows cannot prove full structure; operator recovery required"
+          );
+          send(controller, "error", {
+            message: failed
+              ? "This curriculum has topic rows but no saved complete structure; operator recovery is required."
+              : "Generation ownership changed while checking the saved structure. Refresh to check its status.",
+          });
+          controller.close();
+          return;
+        }
+
+        const resumingSkeleton = skeletonParsed !== null;
         send(controller, "status", {
           message: resumingSkeleton ? "Loading the saved curriculum structure…" : "Finding the best curriculum structure…",
           step: "skeleton",
         });
 
-        if (existingNodes && existingNodes.length > 0) {
-          const existingNodeIds = existingNodes.map((node: { id: string }) => node.id);
-          const { data: existingMus } = await supabase
-            .from("major_understandings")
-            .select("id, node_id, code, description, order_index")
-            .in("node_id", existingNodeIds);
-
-          const persistedNodes: SkeletonNode[] = existingNodes.map((node: { id: string; title: string; order_index: number }) => ({
-            title: node.title,
-            order_index: node.order_index,
-            major_understandings: (existingMus ?? [])
-              .filter((mu: { node_id: string }) => mu.node_id === node.id)
-              .sort((a: { order_index: number }, b: { order_index: number }) => a.order_index - b.order_index)
-              .map((mu: { code: string | null; description: string }) => ({
-                code: mu.code,
-                description: mu.description,
-              })),
-          }));
-          skeletonParsed = {
-            title: curriculum.title,
-            source_type: curriculum.source_type === "adapted" ? "adapted" : "ai_organized",
-            source_attribution: curriculum.source_attribution ?? null,
-            source_url: curriculum.source_url ?? null,
-            nodes: persistedNodes,
-          };
-          existingNodes.forEach((node: { id: string }, index: number) => {
-            nodeIds.push({ nodeId: node.id, node: persistedNodes[index] });
-          });
-          console.info(`[stream] Resuming persisted skeleton: stream_id=${streamId}, job_id=${ownerJobRecord.id}, topic_count=${nodeIds.length}, operation=skeleton_resume`);
-        } else {
+        if (!skeletonParsed) {
+          if (!canStartAiCall()) {
+            await yieldOwner("Generation is checkpointed and will continue in another invocation.");
+            return;
+          }
           const skeletonPrompt = buildSkeletonPrompt(
             curriculum.title,
             notes.grade_level ?? "high school",
@@ -1267,7 +1362,10 @@ export async function legacyGenerationGet(
           skeletonParsed = await callAIStructured(skeletonPrompt, SkeletonSchema, true, "skeleton_ai");
           console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=skeleton_ai, topic_count=${skeletonParsed.nodes.length}`);
         } catch (err) {
-          if (err instanceof AITimeoutError) throw err;
+          if (err instanceof AITimeoutError) {
+            await yieldOwner("Curriculum structure generation reached its call limit; continuing from the job checkpoint.");
+            return;
+          }
           // If structured output fails, fall back to text completion with robust extraction
           // This handles providers that don't support structured output well (e.g., Anthropic)
           console.warn(
@@ -1275,6 +1373,10 @@ export async function legacyGenerationGet(
           );
 
           const fallbackPrompt = `${skeletonPrompt}\n\nFallback instructions: Create an original, logically ordered curriculum skeleton from the student's request alone. Do not claim it is adapted from a source. Set source_type to "ai_organized", source_attribution to null, and source_url to null. Do not invent citations, URLs, or claims of verification. Return only the JSON object matching the schema above.`;
+          if (!canStartAiCall()) {
+            await yieldOwner("Curriculum structure generation is checkpointed and will continue in another invocation.");
+            return;
+          }
           const skeletonText = await callAI(fallbackPrompt, false, "skeleton_fallback");
 
           // Check ownership after AI call — if lost, fail the job
@@ -1357,6 +1459,10 @@ export async function legacyGenerationGet(
 
           // Retry with explicit instruction to return valid JSON only
           const retryPrompt = `${fallbackPrompt}\n\nYour previous fallback response was invalid or did not match the schema. Correct it and return ONLY the required JSON structure. Do not include markdown, explanation, citations, URLs, or any text outside the JSON object. Ensure every required field and nested field matches the schema exactly.`;
+            if (!canStartAiCall()) {
+              await yieldOwner("Curriculum structure generation is checkpointed and will continue in another invocation.");
+              return;
+            }
           const skeletonRetry = await callAI(retryPrompt, false, "skeleton_retry");
 
           // Check ownership after retry AI call
@@ -1407,12 +1513,29 @@ export async function legacyGenerationGet(
         } else {
           parseDurationMs = Date.now() - skeletonParseStartTime;
         }
-          }
+        }
+        }
 
         // Update curriculum with real title and attribution
         if (!skeletonParsed) {
           // This should not happen as we would have returned earlier
           send(controller, "error", { message: "Failed to parse skeleton JSON after retry" });
+          controller.close();
+          return;
+        }
+
+        // Save the complete, validated structure through the job's immutable,
+        // claim-fenced checkpoint before writing any topic or understanding row.
+        const skeletonSave = await saveJobSkeleton({
+          jobId: ownerJobRecord.id,
+          claimToken: ownerJobRecord.claim_token,
+          claimVersion: ownerJobRecord.claim_version,
+          skeleton: skeletonParsed,
+        });
+        if (skeletonSave === "ownership_lost") {
+          ownershipLost = true;
+          clearHeartbeat();
+          send(controller, "error", { message: "Generation ownership changed before its structure could be saved." });
           controller.close();
           return;
         }
@@ -1458,12 +1581,16 @@ export async function legacyGenerationGet(
           return;
         }
 
-        // Step 2: Insert nodes and major understandings only for a fresh skeleton.
-        // Existing nodes are the persisted source of truth on a resumed job.
-        if (!existingNodes || existingNodes.length === 0) for (const node of skeletonParsed.nodes) {
+        // Re-materialize every expected row from the immutable checkpoint.
+        // Stable external keys make this repair-safe after a partial write.
+        for (const node of skeletonParsed.nodes) {
+          if (!hasSufficientInvocationBudget(invocationStartedAt, Date.now(), CANDIDATE_WORK_RESERVE_MS)) {
+            await yieldOwner("The complete structure is saved; remaining topic rows will be restored in another invocation.");
+            return;
+          }
           const topicExternalKey = `topic-${node.order_index}`;
           console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=node_upsert, external_key=${topicExternalKey}`);
-          const { data: nodeRow } = await supabase
+          const { data: nodeRow, error: nodeError } = await supabase
             .from("nodes")
             .upsert({
               curriculum_id: id,
@@ -1475,7 +1602,7 @@ export async function legacyGenerationGet(
             .single();
 
           console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=node_upsert, persisted=${Boolean(nodeRow)}`);
-          if (!nodeRow) continue;
+          if (nodeError || !nodeRow) throw new Error(`Could not persist topic ${topicExternalKey}: ${nodeError?.message ?? "missing row"}`);
 
           const mus = node.major_understandings.map((mu, i) => ({
             node_id: nodeRow.id,
@@ -1486,14 +1613,14 @@ export async function legacyGenerationGet(
           }));
 
           console.info(`[stream] Operation started: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=understanding_upsert, topic_id=${nodeRow.id}`);
-          await supabase
+          const { error: muError } = await supabase
             .from("major_understandings")
             .upsert(mus, { onConflict: "node_id,external_key" });
+          if (muError) throw new Error(`Could not persist understandings for ${topicExternalKey}: ${muError.message}`);
           console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=understanding_upsert, topic_id=${nodeRow.id}, count=${mus.length}`);
           nodeIds.push({ nodeId: nodeRow.id, node });
         }
         console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=skeleton_persist, topic_count=${nodeIds.length}`);
-        }
 
         // Step 3: Discover best sources for this subject/difficulty
         type DiscoveredSource = {
@@ -1503,7 +1630,6 @@ export async function legacyGenerationGet(
           best_for: string;
         };
 
-        const { getJobById } = await import("@/lib/acquisition/jobService");
         const resumeJobData = await getJobById(ownerJobRecord.id);
         const rawPersistedSources = (resumeJobData?.result_data as { discoveredSources?: unknown })?.discoveredSources;
         const hasPersistedSources = Array.isArray(rawPersistedSources);
@@ -1544,6 +1670,10 @@ export async function legacyGenerationGet(
         if (hasPersistedSources) {
           console.info(`[stream] Reusing persisted sources: stream_id=${streamId}, job_id=${ownerJobRecord.id}, source_count=${discoveredSources.length}, operation=source_resume`);
         } else try {
+          if (!canStartAiCall()) {
+            await yieldOwner("Curriculum structure is saved; source discovery will continue in another invocation.");
+            return;
+          }
           const sourcesPrompt = buildSourceDiscoveryPrompt(
             updatedCurriculumTitle,
             notes.difficulty ?? "standard",
@@ -1607,7 +1737,10 @@ export async function legacyGenerationGet(
             );
           }
         } catch (err) {
-          if (err instanceof AITimeoutError) throw err;
+          if (err instanceof AITimeoutError) {
+            await yieldOwner("Source discovery reached its call limit; continuing from the saved structure.");
+            return;
+          }
           console.log("Source discovery failed, continuing without prioritized sources:", err);
         }
 
@@ -1674,6 +1807,11 @@ export async function legacyGenerationGet(
           if (completedTopics.has(nodeId)) {
             console.log(`[stream] Skipping topic ${nodeId} - already completed (checkpoint)`);
             continue;
+          }
+
+          if (!canStartAiCall()) {
+            await yieldOwner("Topic discovery is checkpointed and will continue in another invocation.");
+            return;
           }
 
           // Bounded work: yield when quota exhausted.
@@ -1743,8 +1881,11 @@ export async function legacyGenerationGet(
 
             const topicOutcome = await runBoundedCoverageAttempts({
               maxAttempts: MAX_COVERAGE_ATTEMPTS,
+              initialAttempts: getStoredCoverageAttempts(jobData?.result_data, "topic", nodeId),
+              yieldAfterRetry: true,
               threshold: 3,
               attempt: async () => {
+                if (!canStartAiCall()) return "yield";
                 const reservation = await reserveAICall(
                   ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version,
                   DEFAULT_BUDGET_LIMITS.max_ai_calls, crypto.randomUUID()
@@ -1759,13 +1900,13 @@ export async function legacyGenerationGet(
                     curriculumId: id, jobId: ownerJobRecord.id, streamId, topicId: nodeId,
                   });
                 } catch (discoveryError) {
-                  if (discoveryError instanceof AITimeoutError) throw discoveryError;
                   console.warn(`[stream] Discovery attempt returned no usable result for ${node.title}`, discoveryError);
                   return "attempted";
                 }
                 if (ownershipLost) return "ownership_lost";
                 console.info(`[stream] Operation completed: stream_id=${streamId}, job_id=${ownerJobRecord.id}, operation=topic_discovery_ai, topic_id=${nodeId}, candidate_count=${candidates.length}`);
                 for (const candidate of (Array.isArray(candidates) ? candidates : []).filter((item) => item.url && item.title)) {
+                  if (!canStartCandidateAcquisition()) return "yield";
                   try {
                     await discoverVerifiedResource(toLearnParams(
                       candidate as Record<string, unknown>, { nodeId }, acquisitionJobId,
@@ -1800,6 +1941,26 @@ export async function legacyGenerationGet(
               controller.close();
               return;
             }
+            if (topicOutcome === "yielded") {
+              const released = await releaseJobClaim(
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version
+              );
+              clearHeartbeat();
+              if (!released) {
+                send(controller, "error", { message: "Resource discovery progress was saved, but the job could not be safely paused. Refresh to check its status." });
+              } else {
+                send(controller, "yielded", {
+                  message: "Resource attempt saved. Resuming…",
+                  topicsCompleted: completedTopics.size,
+                  totalTopics: nodeIds.length,
+                });
+              }
+              controller.close();
+              return;
+            }
+            completedTopics.add(nodeId);
             if (topicOutcome === "insufficient") {
               console.warn(`[stream] Topic ${nodeId} has insufficient coverage after ${MAX_COVERAGE_ATTEMPTS} attempts`);
             }
@@ -1911,6 +2072,28 @@ export async function legacyGenerationGet(
           return;
         }
 
+        // Do not stack topic discovery and concept-batch work in one bounded
+        // serverless invocation. The next owner resumes from persisted state.
+        if (topicsProcessedThisInvocation > 0) {
+          const released = await releaseJobClaim(
+            ownerJobRecord.id,
+            ownerJobRecord.claim_token,
+            ownerJobRecord.claim_version
+          );
+          clearHeartbeat();
+          if (!released) {
+            send(controller, "error", { message: "Topic discovery progress was saved, but the job could not be safely paused. Refresh to check its status." });
+          } else {
+            send(controller, "yielded", {
+              message: "Topic discovery saved. Resuming concept resources…",
+              topicsCompleted: completedTopics.size,
+              totalTopics: nodeIds.length,
+            });
+          }
+          controller.close();
+          return;
+        }
+
         // Topic-level work is complete; the per-understanding batch continues below.
         send(controller, "complete", { curriculum_id: id, phase: "topics" });
 
@@ -1954,6 +2137,12 @@ export async function legacyGenerationGet(
             if (completedBatchTopics.has(nodeId)) {
               console.log(`[stream] Skipping batch for topic ${nodeId} - already completed (batch checkpoint)`);
               continue;
+            }
+
+            if (!canStartAiCall()) {
+              await yieldOwner("Concept resource discovery is checkpointed and will continue in another invocation.");
+              backgroundYielded = true;
+              return;
             }
 
             const { data: muRows } = await supabase
@@ -2016,8 +2205,11 @@ export async function legacyGenerationGet(
             const muIds = muRows.map((mu) => mu.id);
             const batchOutcome = await runBoundedCoverageAttempts({
               maxAttempts: MAX_COVERAGE_ATTEMPTS,
+              initialAttempts: getStoredCoverageAttempts(batchJobData?.result_data, "batch", nodeId),
+              yieldAfterRetry: true,
               threshold: 2,
               attempt: async () => {
+                if (!canStartAiCall()) return "yield";
                 const reservation = await reserveAICall(
                   ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version,
                   DEFAULT_BUDGET_LIMITS.max_ai_calls, crypto.randomUUID()
@@ -2029,7 +2221,6 @@ export async function legacyGenerationGet(
                 try {
                   batchResult = await callAIStructured(prompt, BatchResponseSchema, true, "topic_batch_ai");
                 } catch (discoveryError) {
-                  if (discoveryError instanceof AITimeoutError) throw discoveryError;
                   console.warn(`[stream] Batch discovery attempt returned no usable result for ${node.title}`, discoveryError);
                   return "attempted";
                 }
@@ -2041,6 +2232,7 @@ export async function legacyGenerationGet(
                   );
                   if (!candidate.url || !candidate.title || targetMuIds.length === 0) continue;
                   for (const muId of targetMuIds) {
+                    if (!canStartCandidateAcquisition()) return "yield";
                     try {
                       await discoverVerifiedResource(toLearnParams(
                         candidate as Record<string, unknown>, { understandingId: muId },
@@ -2073,6 +2265,26 @@ export async function legacyGenerationGet(
             });
             if (batchOutcome === "ownership_lost") {
               ownershipLost = true;
+              return;
+            }
+            if (batchOutcome === "yielded") {
+              const released = await releaseJobClaim(
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version
+              );
+              clearHeartbeat();
+              if (!released) {
+                send(controller, "error", { message: "Concept resource progress was saved, but the job could not be safely paused. Refresh to check its status." });
+              } else {
+                send(controller, "yielded", {
+                  message: "Concept resource attempt saved. Resuming…",
+                  topicsCompleted: batchTopicsProcessedThisInvocation,
+                  totalTopics: nodeIds.length,
+                });
+              }
+              backgroundYielded = true;
+              controller.close();
               return;
             }
             if (batchOutcome === "insufficient") {
@@ -2111,12 +2323,29 @@ export async function legacyGenerationGet(
             controller.close();
             return;
           }
-          const ok = await completeJob(
-            ownerJobRecord.id,
-            ownerJobRecord.claim_token,
-            ownerJobRecord.claim_version,
-            true
-          );
+          let coverageStatus: "pending" | "complete" | "insufficient" | "failed" = "pending";
+          try {
+            const finalJobData = await getJobById(ownerJobRecord.id);
+            coverageStatus = await getPersistedCoverageStatus(
+              id,
+              finalJobData?.result_data,
+              nodeIds.length
+            );
+          } catch (coverageReadError) {
+            console.warn("[stream] Could not read final coverage checkpoint:", coverageReadError);
+          }
+          const ok = coverageStatus === "complete"
+            ? (await publishAndCompleteJob({
+                jobId: ownerJobRecord.id,
+                claimToken: ownerJobRecord.claim_token,
+                claimVersion: ownerJobRecord.claim_version,
+              })) === "completed"
+            : await completeJob(
+                ownerJobRecord.id,
+                ownerJobRecord.claim_token,
+                ownerJobRecord.claim_version,
+                true
+              );
           if (!ok) {
             console.error(
               `[stream] complete_job returned false — job ${ownerJobRecord.id} may have been reclaimed by cron worker during background batch`
@@ -2129,13 +2358,13 @@ export async function legacyGenerationGet(
             controller.close();
             return;
           }
-          // Job is terminally completed. Now publish the curriculum.
-          await supabase
-            .from("curricula")
-            .update({ status: "published" })
-            .eq("id", id);
-          // Emit background_complete: all generation done AND job finalized
-          send(controller, "complete", { curriculum_id: id, phase: "background" });
+          // A job can finish processing with insufficient resource coverage;
+          // only the coverage-complete path atomically publishes the curriculum.
+          send(controller, "complete", {
+            curriculum_id: id,
+            phase: "background",
+            coverage_status: coverageStatus,
+          });
         } catch (bgErr) {
           console.error("[stream] Background batch failed:", bgErr);
           // If background fails, mark the job as failed so the cron worker

@@ -28,16 +28,22 @@ export function getStoredCoverageStatus(input: {
 export async function runBoundedCoverageAttempts(input: {
   maxAttempts: number;
   initialAttempts?: number;
+  /** Let the caller checkpoint and resume before starting another expensive attempt. */
+  yieldAfterRetry?: boolean;
   attemptIdFor?: (attemptIndex: number) => string;
-  attempt: (attemptIndex: number) => Promise<"attempted" | "budget_exhausted" | "ownership_lost">;
+  attempt: (attemptIndex: number) => Promise<"attempted" | "budget_exhausted" | "ownership_lost" | "yield">;
   measureEligibleResources: () => Promise<number>;
   threshold: number;
   record: (result: { resourcesFound: number; sufficient: boolean; budgetExhausted: boolean; attemptId: string }) => Promise<CoverageAttemptDecision>;
-}): Promise<"complete" | "insufficient" | "ownership_lost"> {
+}): Promise<"complete" | "insufficient" | "ownership_lost" | "yielded"> {
   const startAt = Math.min(input.maxAttempts, Math.max(0, input.initialAttempts ?? 0));
   for (let attemptIndex = startAt; attemptIndex < input.maxAttempts; attemptIndex++) {
     const outcome = await input.attempt(attemptIndex);
     if (outcome === "ownership_lost") return "ownership_lost";
+    // The target operation stopped at a safe boundary before it was complete.
+    // Its resources may already be persisted, so retry the same attempt after
+    // resume without recording a misleading coverage result.
+    if (outcome === "yield") return "yielded";
     const budgetExhausted = outcome === "budget_exhausted";
     const resourcesFound = await input.measureEligibleResources();
     const decision = await input.record({
@@ -47,6 +53,7 @@ export async function runBoundedCoverageAttempts(input: {
       attemptId: input.attemptIdFor?.(attemptIndex) ?? crypto.randomUUID(),
     });
     if (decision.status === "ownership_lost") return "ownership_lost";
+    if (decision.retry && input.yieldAfterRetry) return "yielded";
     if (!decision.retry) return decision.status === "complete" ? "complete" : "insufficient";
   }
   return "insufficient";
