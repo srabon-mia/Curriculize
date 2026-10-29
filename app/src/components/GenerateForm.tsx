@@ -87,19 +87,14 @@ export function GenerateForm() {
     }
   }
 
-  // Shared input classes for consistency and touch targets
-  const inputClasses =
-    "w-full rounded-lg border border-border-default bg-surface-card px-4 py-3.5 text-base text-text-primary placeholder:text-text-tertiary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:border-brand-forest transition shadow-xs min-h-[44px]";
-  const selectClasses =
-    "w-full rounded-lg border border-border-default bg-surface-card px-4 py-3.5 text-base text-text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:border-brand-forest transition appearance-none cursor-pointer pr-10 shadow-xs min-h-[44px]";
-  const labelClasses =
-    "block text-xs font-semibold uppercase tracking-wider text-text-secondary mb-2";
-
   return (
-    <form onSubmit={handleSubmit} className="space-y-5">
+    <form onSubmit={handleSubmit} className="space-y-4">
       {/* 1. Topic (Primary Field) */}
       <div>
-        <label htmlFor="topic-input" className={labelClasses}>
+        <label
+          htmlFor="topic-input"
+          className="block text-xs font-semibold uppercase tracking-wider text-text-secondary mb-1.5"
+        >
           What do you want to learn?
         </label>
         <input
@@ -108,15 +103,17 @@ export function GenerateForm() {
           value={topic}
           onChange={(e) => setTopic(e.target.value)}
           placeholder="e.g. AP Chemistry, Calculus AB, World History"
-          className={inputClasses}
-          autoComplete="off"
+          className="w-full rounded-lg border border-border-default bg-surface-card px-4 py-3 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:border-brand-forest transition shadow-xs"
         />
       </div>
 
       {/* 2 & 3. Grade Level and Difficulty */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
-          <label htmlFor="grade-level-select" className={labelClasses}>
+          <label
+            htmlFor="grade-level-select"
+            className="block text-xs font-semibold uppercase tracking-wider text-text-secondary mb-1.5"
+          >
             Grade level
           </label>
           <div className="relative">
@@ -124,7 +121,7 @@ export function GenerateForm() {
               id="grade-level-select"
               value={gradeLevel}
               onChange={(e) => setGradeLevel(e.target.value)}
-              className={selectClasses}
+              className="w-full rounded-lg border border-border-default bg-surface-card px-3.5 py-2.5 text-sm text-text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:border-brand-forest transition appearance-none cursor-pointer pr-9 shadow-xs"
             >
               {GRADE_LEVELS.map((l) => (
                 <option key={l} value={l}>
@@ -132,27 +129,17 @@ export function GenerateForm() {
                 </option>
               ))}
             </select>
-            <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-4 text-text-tertiary">
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 24 24"
-                width="18"
-                height="18"
-                aria-hidden="true"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M6 9l6 6 6-6" />
-              </svg>
+            <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3 text-text-tertiary text-xs">
+              ▾
             </span>
           </div>
         </div>
 
         <div>
-          <label htmlFor="difficulty-select" className={labelClasses}>
+          <label
+            htmlFor="difficulty-select"
+            className="block text-xs font-semibold uppercase tracking-wider text-text-secondary mb-1.5"
+          >
             Difficulty
           </label>
           <div className="relative">
@@ -160,7 +147,7 @@ export function GenerateForm() {
               id="difficulty-select"
               value={difficulty}
               onChange={(e) => setDifficulty(e.target.value)}
-              className={selectClasses}
+              className="w-full rounded-lg border border-border-default bg-surface-card px-3.5 py-2.5 text-sm text-text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:border-brand-forest transition appearance-none cursor-pointer pr-9 shadow-xs"
             >
               {DIFFICULTIES.map((d) => (
                 <option key={d} value={d}>
@@ -168,21 +155,8 @@ export function GenerateForm() {
                 </option>
               ))}
             </select>
-            <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-4 text-text-tertiary">
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 24 24"
-                width="18"
-                height="18"
-                aria-hidden="true"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M6 9l6 6 6-6" />
-              </svg>
+            <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3 text-text-tertiary text-xs">
+              ▾
             </span>
           </div>
         </div>
@@ -190,7 +164,10 @@ export function GenerateForm() {
 
       {/* 4. Existing Knowledge */}
       <div>
-        <label htmlFor="existing-knowledge-input" className={labelClasses}>
+        <label
+          htmlFor="existing-knowledge-input"
+          className="block text-xs font-semibold uppercase tracking-wider text-text-secondary mb-1.5"
+        >
           Existing knowledge (optional)
         </label>
         <input
@@ -199,15 +176,17 @@ export function GenerateForm() {
           value={existingKnowledge}
           onChange={(e) => setExistingKnowledge(e.target.value)}
           placeholder="e.g. completed Algebra 2, familiar with basic biology"
-          className={inputClasses}
-          autoComplete="off"
+          className="w-full rounded-lg border border-border-default bg-surface-card px-3.5 py-2.5 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:border-brand-forest transition shadow-xs"
         />
       </div>
 
       {/* 5 & 6. Learning Goal and Time Available */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
-          <label htmlFor="learning-goal-select" className={labelClasses}>
+          <label
+            htmlFor="learning-goal-select"
+            className="block text-xs font-semibold uppercase tracking-wider text-text-secondary mb-1.5"
+          >
             Learning goal
           </label>
           <div className="relative">
@@ -215,7 +194,7 @@ export function GenerateForm() {
               id="learning-goal-select"
               value={learningGoal}
               onChange={(e) => setLearningGoal(e.target.value)}
-              className={selectClasses}
+              className="w-full rounded-lg border border-border-default bg-surface-card px-3.5 py-2.5 text-sm text-text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:border-brand-forest transition appearance-none cursor-pointer pr-9 shadow-xs"
             >
               {LEARNING_GOALS.map((g) => (
                 <option key={g} value={g}>
@@ -223,27 +202,17 @@ export function GenerateForm() {
                 </option>
               ))}
             </select>
-            <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-4 text-text-tertiary">
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 24 24"
-                width="18"
-                height="18"
-                aria-hidden="true"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M6 9l6 6 6-6" />
-              </svg>
+            <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3 text-text-tertiary text-xs">
+              ▾
             </span>
           </div>
         </div>
 
         <div>
-          <label htmlFor="time-available-select" className={labelClasses}>
+          <label
+            htmlFor="time-available-select"
+            className="block text-xs font-semibold uppercase tracking-wider text-text-secondary mb-1.5"
+          >
             Time available
           </label>
           <div className="relative">
@@ -251,7 +220,7 @@ export function GenerateForm() {
               id="time-available-select"
               value={timeAvailable}
               onChange={(e) => setTimeAvailable(e.target.value)}
-              className={selectClasses}
+              className="w-full rounded-lg border border-border-default bg-surface-card px-3.5 py-2.5 text-sm text-text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:border-brand-forest transition appearance-none cursor-pointer pr-9 shadow-xs"
             >
               {TIME_AVAILABLE.map((t) => (
                 <option key={t} value={t}>
@@ -259,21 +228,8 @@ export function GenerateForm() {
                 </option>
               ))}
             </select>
-            <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-4 text-text-tertiary">
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 24 24"
-                width="18"
-                height="18"
-                aria-hidden="true"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M6 9l6 6 6-6" />
-              </svg>
+            <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3 text-text-tertiary text-xs">
+              ▾
             </span>
           </div>
         </div>
@@ -281,7 +237,10 @@ export function GenerateForm() {
 
       {/* 7. Additional Context */}
       <div>
-        <label htmlFor="added-context-textarea" className={labelClasses}>
+        <label
+          htmlFor="added-context-textarea"
+          className="block text-xs font-semibold uppercase tracking-wider text-text-secondary mb-1.5"
+        >
           Anything else? (optional)
         </label>
         <textarea
@@ -289,14 +248,14 @@ export function GenerateForm() {
           value={addedContext}
           onChange={(e) => setAddedContext(e.target.value)}
           placeholder="e.g. I'm preparing for the MCAT, focus on the math-heavy parts, I already know basic algebra…"
-          rows={3}
-          className={`${inputClasses} resize-y min-h-[88px]`}
+          rows={2}
+          className="w-full rounded-lg border border-border-default bg-surface-card px-3.5 py-2.5 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:border-brand-forest transition resize-none shadow-xs"
         />
       </div>
 
       {error && (
-        <div className="p-4 rounded-lg bg-status-error-bg text-status-error text-sm font-medium border border-status-error/20 flex items-center gap-3 min-h-[44px]">
-          <span aria-hidden="true" className="text-lg shrink-0">⚠️</span>
+        <div className="p-3 rounded-lg bg-status-error-bg text-status-error text-sm font-medium border border-status-error/20 flex items-center gap-2">
+          <span>⚠️</span>
           <span>{error}</span>
         </div>
       )}
@@ -304,11 +263,11 @@ export function GenerateForm() {
       <button
         type="submit"
         disabled={loading || !topic.trim()}
-        className="w-full py-4 rounded-lg bg-brand-forest text-white text-base font-semibold hover:bg-brand-forest-hover active:scale-[0.99] transition shadow-sm hover:shadow flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed min-h-[48px]"
+        className="w-full py-3.5 rounded-lg bg-brand-forest text-white text-sm sm:text-base font-semibold hover:bg-brand-forest-hover active:scale-[0.99] transition shadow-sm hover:shadow flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
       >
         {loading ? (
           <>
-            <span className="inline-block w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+            <span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
             <span>Starting…</span>
           </>
         ) : (
@@ -316,7 +275,7 @@ export function GenerateForm() {
         )}
       </button>
 
-      <p className="text-sm text-text-tertiary text-center pt-2 leading-relaxed">
+      <p className="text-xs text-text-tertiary text-center pt-1">
         Takes 3-5 minutes · No account required ·{" "}
         <Link
           href="/curriculum"

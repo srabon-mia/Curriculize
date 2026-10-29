@@ -181,7 +181,7 @@ export default function LandingPage() {
           <div className="mx-auto grid max-w-6xl items-center gap-10 lg:grid-cols-12 lg:gap-12">
             <div className="lg:col-span-6">
               <p className="mb-5 inline-flex items-center gap-2 rounded-full border border-brand-aqua/60 bg-brand-aqua-tint px-3 py-1 text-xs font-semibold text-brand-forest"><span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-brand-fresh" />Independent learning, with more structure</p>
-              <h1 className="font-display text-4xl font-bold leading-[1.05] tracking-[-0.03em] text-brand-navy sm:text-5xl lg:text-6xl xl:text-7xl">A clearer path to <span className="text-brand-forest">what you want to learn.</span></h1>
+              <h1 className="max-w-[13ch] font-display text-5xl font-bold leading-[0.98] tracking-[-0.045em] text-brand-navy sm:text-6xl lg:text-7xl">A clearer path to <span className="text-brand-forest">what you want to learn.</span></h1>
               <p className="mt-6 max-w-xl text-lg leading-relaxed text-text-secondary sm:text-xl">Spend less time sorting through scattered resources and deciding where to start. Build a curriculum that organizes a topic into a learning path.</p>
               <div className="mt-8 flex flex-wrap items-center gap-x-6 gap-y-3">
                 <a href="#generate" className="inline-flex items-center justify-center gap-2 rounded-lg bg-brand-forest px-6 py-3.5 text-base font-semibold text-white shadow-sm transition hover:bg-brand-forest-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest focus-visible:ring-offset-2">Build my curriculum <span aria-hidden="true">→</span></a>

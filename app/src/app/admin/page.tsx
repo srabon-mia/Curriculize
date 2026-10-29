@@ -52,7 +52,7 @@ export default async function AdminHome() {
                       </span>
                       <span>·</span>
                       <span
-                        className={`px-2 py-0.5 rounded-full text-xs font-medium capitalize border ${
+                        className={`px-2 py-0.5 rounded-full text-[11px] font-medium capitalize border ${
                           c.status === "published"
                             ? "bg-status-success-bg text-status-success border-status-success/20"
                             : c.status === "archived"

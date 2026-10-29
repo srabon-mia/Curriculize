@@ -134,7 +134,6 @@ export function CurriculumBuilder({
   const [refreshKey, setRefreshKey] = useState(0);
   const [discovering, setDiscovering] = useState(false);
   const [discoverResult, setDiscoverResult] = useState<string | null>(null);
-  const [mobileView, setMobileView] = useState<"tree" | "detail">("detail");
 
   // Configuration for bulk discovery
   const BULK_DELAY_MS = 3000; // 3 seconds between requests (was 60s)
@@ -247,17 +246,10 @@ export function CurriculumBuilder({
 
   const currentResources = targetKey ? resources[targetKey] ?? [] : [];
 
-  // Mobile: show topic tree as a full-screen overlay when "tree" view
-  // Desktop: show persistent left rail
   return (
     <div className="flex min-h-[calc(100vh-1px)]">
-      {/* Desktop Left Rail (>= 768px) */}
-      <nav className="w-80 shrink-0 border-r border-border-default bg-surface-card overflow-y-auto hidden md:block">
-        <div className="p-4 border-b border-border-subtle">
-          <p className="text-xs font-display font-semibold uppercase tracking-[0.16em] text-text-secondary">
-            Curriculum Topics
-          </p>
-        </div>
+      {/* Left rail: topic tree */}
+      <nav className="w-80 shrink-0 border-r border-border-default bg-surface-card overflow-y-auto">
         <ol>
           {initialNodes.map((node) => {
             const isExpanded = expandedNodeIds.has(node.id);
@@ -297,7 +289,7 @@ export function CurriculumBuilder({
                             style={{ width: `${(barWidth / 50) * 100}%` }}
                           />
                         </div>
-                        <span className="text-xs text-text-muted tabular-nums">
+                        <span className="text-[10px] text-text-muted tabular-nums">
                           {node.exam_weight_pct}
                         </span>
                       </div>
@@ -313,7 +305,7 @@ export function CurriculumBuilder({
                         <li key={mu.id}>
                           <button
                             onClick={() => setSelected({ type: "mu", id: mu.id, nodeId: node.id })}
-                            className={`w-full text-left px-4 pl-10 py-2 text-xs leading-snug transition min-h-[44px] ${
+                            className={`w-full text-left px-4 pl-10 py-1.5 text-xs leading-snug transition ${
                               muSelected
                                 ? "bg-brand-forest-subtle text-brand-forest font-medium"
                                 : "text-text-secondary hover:bg-canvas-subtle"
@@ -322,7 +314,9 @@ export function CurriculumBuilder({
                             <span className="text-brand-forest font-mono mr-1.5 font-semibold">
                               {mu.code ?? mu.external_key}
                             </span>
-                            <span className="truncate block">{mu.description}</span>
+                            {mu.description.length > 70
+                              ? mu.description.slice(0, 70) + "…"
+                              : mu.description}
                           </button>
                         </li>
                       );
@@ -335,140 +329,10 @@ export function CurriculumBuilder({
         </ol>
       </nav>
 
-      {/* Mobile Topic Tree Drawer */}
-      <div className="md:hidden fixed inset-y-0 left-0 z-50 w-full max-w-sm bg-surface-card border-r border-border-default shadow-xl transform transition-transform duration-200 ease-out"
-        style={{
-          transform: mobileView === "tree" ? "translateX(0)" : "translateX(-100%)",
-        }}
-        role="dialog"
-        aria-modal="true"
-        aria-label="Curriculum topics"
-      >
-        <div className="flex flex-col h-full">
-          {/* Drawer Header */}
-          <div className="flex items-center justify-between p-4 border-b border-border-subtle sticky top-0 bg-surface-card z-10">
-            <h2 className="font-display text-lg font-semibold text-brand-navy">Topics</h2>
-            <button
-              onClick={() => setMobileView("detail")}
-              className="p-2 rounded-lg text-text-secondary hover:bg-canvas-subtle transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest"
-              aria-label="Close topic list"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
-            </button>
-          </div>
-          {/* Topic List */}
-          <nav className="flex-1 overflow-y-auto p-4">
-            <ol>
-              {initialNodes.map((node) => {
-                const isExpanded = expandedNodeIds.has(node.id);
-                const isSelected = selected?.type === "node" && selected.id === node.id;
-                const barWidth = weightBarWidth(node.exam_weight_pct);
-
-                return (
-                  <li key={node.id} className="border-b border-border-subtle">
-                    <div
-                      className={`flex items-start gap-2 px-3 py-3 cursor-pointer transition rounded-lg ${
-                        isSelected ? "bg-brand-forest-subtle" : "hover:bg-canvas-subtle"
-                      }`}
-                      onClick={() => {
-                        setSelected({ type: "node", id: node.id });
-                        if (!isExpanded) toggleExpand(node.id);
-                        setMobileView("detail");
-                      }}
-                    >
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleExpand(node.id);
-                        }}
-                        className="mt-0.5 text-text-muted hover:text-text-primary text-xs w-4 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center"
-                        aria-label={isExpanded ? "Collapse" : "Expand"}
-                      >
-                        {isExpanded ? "▾" : "▸"}
-                      </button>
-                      <div className="min-w-0 flex-1">
-                        <p className={`font-display text-sm leading-snug ${isSelected ? "font-semibold text-brand-forest" : "text-text-primary"}`}>
-                          {node.order_index}. {node.title}
-                        </p>
-                        {node.exam_weight_pct && (
-                          <div className="flex items-center gap-2 mt-1.5">
-                            <div className="h-1 flex-1 bg-border-subtle rounded-full overflow-hidden max-w-[80px]">
-                              <div
-                                className="h-full bg-brand-forest rounded-full"
-                                style={{ width: `${(barWidth / 50) * 100}%` }}
-                              />
-                            </div>
-                            <span className="text-xs text-text-muted tabular-nums">
-                              {node.exam_weight_pct}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-
-                    {isExpanded && (
-                      <ul className="pb-2 pt-1 ml-7 border-l border-border-subtle">
-                        {node.major_understandings.map((mu) => {
-                          const muSelected = selected?.type === "mu" && selected.id === mu.id;
-                          return (
-                            <li key={mu.id}>
-                              <button
-                                onClick={() => {
-                                  setSelected({ type: "mu", id: mu.id, nodeId: node.id });
-                                  setMobileView("detail");
-                                }}
-                                className={`w-full text-left px-3 py-2.5 text-xs leading-snug transition min-h-[44px] rounded-lg ${
-                                  muSelected
-                                    ? "bg-brand-forest-subtle text-brand-forest font-medium"
-                                    : "text-text-secondary hover:bg-canvas-subtle"
-                                }`}
-                              >
-                                <span className="text-brand-forest font-mono mr-1.5 font-semibold">
-                                  {mu.code ?? mu.external_key}
-                                </span>
-                                <span className="block">{mu.description}</span>
-                              </button>
-                            </li>
-                          );
-                        })}
-                      </ul>
-                    )}
-                  </li>
-                );
-              })}
-            </ol>
-          </nav>
-        </div>
-      </div>
-
-      {/* Mobile backdrop when tree is open */}
-      {mobileView === "tree" && (
-        <div
-          className="md:hidden fixed inset-0 bg-brand-navy/30 backdrop-blur-sm z-40"
-          onClick={() => setMobileView("detail")}
-          aria-hidden="true"
-        />
-      )}
-
-      {/* Right/Detail Pane */}
-      <div className="flex-1 overflow-y-auto bg-canvas-default md:overflow-hidden">
-        {/* Mobile toolbar */}
-        <div className="md:hidden sticky top-0 z-30 bg-surface-card/95 backdrop-blur-sm border-b border-border-subtle px-4 py-3 flex items-center justify-between">
-          <button
-            onClick={() => setMobileView("tree")}
-            className="p-2 rounded-lg text-text-secondary hover:bg-canvas-subtle transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest min-h-[44px] min-w-[44px] flex items-center justify-center"
-            aria-label="Open topic list"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
-          </button>
-          <h1 className="font-display text-lg font-semibold text-brand-navy truncate">
-            {selectedNode?.title ?? "Select a topic"}
-          </h1>
-          <div className="w-10" aria-hidden="true" />
-        </div>
-
-        <div className="max-w-2xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8">
-          {!selected && <p className="text-text-muted py-8 text-center">Select a topic to begin.</p>}
+      {/* Right pane: detail + resources */}
+      <div className="flex-1 overflow-y-auto bg-canvas-default">
+        <div className="max-w-2xl mx-auto px-8 py-10">
+          {!selected && <p className="text-text-muted">Select a topic to begin.</p>}
 
           {selected?.type === "node" && selectedNode && (
             <>
@@ -481,8 +345,9 @@ export function CurriculumBuilder({
                 <p className="text-text-secondary mt-3 leading-relaxed">{selectedNode.claim_statement}</p>
               )}
               <p className="text-sm text-text-muted mt-4">
-                {selectedNode.major_understandings.length} major understandings — select one from the topic list
-                to attach resources at that granularity, or add a resource for the whole topic below.
+                {selectedNode.major_understandings.length} major understandings — select one on the
+                left to attach resources at that granularity, or add a resource for the whole topic
+                below.
               </p>
             </>
           )}
@@ -506,14 +371,14 @@ export function CurriculumBuilder({
                   <button
                     onClick={() => handleDiscover("topic")}
                     disabled={discovering}
-                    className="text-sm px-4 py-2.5 rounded-lg border border-border-default bg-surface-card text-text-secondary hover:border-brand-forest hover:text-brand-forest transition disabled:opacity-50 shadow-2xs font-medium min-h-[44px]"
+                    className="text-xs px-3 py-1.5 rounded-lg border border-border-default bg-surface-card text-text-secondary hover:border-brand-forest hover:text-brand-forest transition disabled:opacity-50 shadow-2xs font-medium"
                   >
                     {discovering ? "Searching…" : "Find resources for topic"}
                   </button>
                   <button
                     onClick={() => handleDiscover("bulk")}
                     disabled={discovering}
-                    className="text-sm px-4 py-2.5 rounded-lg bg-brand-navy text-white hover:bg-brand-navy/90 transition disabled:opacity-50 shadow-2xs font-medium min-h-[44px]"
+                    className="text-xs px-3 py-1.5 rounded-lg bg-brand-navy text-white hover:bg-brand-navy/90 transition disabled:opacity-50 shadow-2xs font-medium"
                   >
                     {discovering ? "Searching…" : "Find all understandings"}
                   </button>
@@ -521,7 +386,7 @@ export function CurriculumBuilder({
                     <button
                       onClick={() => handleDiscover("understanding")}
                       disabled={discovering}
-                      className="text-sm px-4 py-2.5 rounded-lg border border-border-default bg-surface-card text-text-secondary hover:border-brand-forest hover:text-brand-forest transition disabled:opacity-50 shadow-2xs font-medium min-h-[44px]"
+                      className="text-xs px-3 py-1.5 rounded-lg border border-border-default bg-surface-card text-text-secondary hover:border-brand-forest hover:text-brand-forest transition disabled:opacity-50 shadow-2xs font-medium"
                     >
                       {discovering ? "Searching…" : "Find resources for this concept"}
                     </button>

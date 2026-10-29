@@ -59,21 +59,6 @@ body {
   color: var(--foreground);
 }
 
-@keyframes slide-in {
-  from {
-    transform: translateX(100%);
-    opacity: 0;
-  }
-  to {
-    transform: translateX(0);
-    opacity: 1;
-  }
-}
-
-.animate-slide-in {
-  animation: slide-in 150ms ease-out forwards;
-}
-
 @media (prefers-reduced-motion: reduce) {
   html:focus-within,
   *,
@@ -83,9 +68,5 @@ body {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
-  }
-
-  .animate-slide-in {
-    animation: none !important;
   }
 }
