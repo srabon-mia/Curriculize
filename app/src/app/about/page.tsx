@@ -56,7 +56,7 @@ export default function AboutPage() {
                   <span aria-hidden="true" className="hidden text-lg text-brand-forest sm:block">→</span>
                   <div className="rounded-xl bg-status-success-bg/70 p-4"><span aria-hidden="true" className="text-lg text-brand-forest">↗</span><p className="mt-2 text-sm font-semibold text-brand-navy">Resources</p><p className="mt-1 text-xs text-text-secondary">Existing material to explore</p></div>
                 </div>
-                <p className="mt-3 text-center text-[11px] text-text-tertiary">An illustration, not a specific curriculum</p>
+                <p className="mt-3 text-center text-xs text-text-tertiary">An illustration, not a specific curriculum</p>
               </div>
             </div>
           </div>

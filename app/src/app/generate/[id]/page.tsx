@@ -440,11 +440,11 @@ export default function GeneratePage({
                 return (
                   <div key={i} className="flex items-start gap-2.5 text-sm">
                     {isFinished ? (
-                      <span className="w-4 h-4 rounded-full bg-status-success-bg text-status-success text-[10px] font-bold inline-flex items-center justify-center shrink-0 mt-0.5">
+                      <span className="w-4 h-4 rounded-full bg-status-success-bg text-status-success text-xs font-bold inline-flex items-center justify-center shrink-0 mt-0.5">
                         ✓
                       </span>
                     ) : (
-                      <span className="w-4 h-4 rounded-full bg-brand-aqua-tint text-brand-forest text-[10px] font-bold inline-flex items-center justify-center shrink-0 mt-0.5 animate-pulse">
+                      <span className="w-4 h-4 rounded-full bg-brand-aqua-tint text-brand-forest text-xs font-bold inline-flex items-center justify-center shrink-0 mt-0.5 animate-pulse">
                         →
                       </span>
                     )}

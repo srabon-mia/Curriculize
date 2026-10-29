@@ -35,7 +35,7 @@ export function CurriculumHeader({ title, subject, source_type, source_attributi
               <span>Browse Guides</span>
             </Link>
             <span className="text-text-tertiary text-xs">/</span>
-            <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-brand-forest bg-brand-aqua-tint px-2 py-0.5 rounded-full border border-brand-aqua/40">
+            <span className="text-xs font-semibold uppercase tracking-[0.16em] text-brand-forest bg-brand-aqua-tint px-2 py-0.5 rounded-full border border-brand-aqua/40">
               {subject}
             </span>
           </div>

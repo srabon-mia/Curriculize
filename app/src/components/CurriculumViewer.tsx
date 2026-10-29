@@ -36,9 +36,9 @@ function ResourceLink({ resource }: { resource: Resource }) {
     : null;
 
   return (
-    <div className="flex items-start gap-3 py-2.5 border-b border-border-subtle last:border-0">
+    <div className="flex items-start gap-3 py-3 border-b border-border-subtle last:border-0">
       <span
-        className={`shrink-0 text-[11px] font-medium px-2.5 py-0.5 rounded-full mt-0.5 ${typeColor}`}
+        className={`shrink-0 text-xs font-medium px-2.5 py-1 rounded-full mt-0.5 ${typeColor}`}
       >
         {typeLabel}
       </span>
@@ -47,17 +47,17 @@ function ResourceLink({ resource }: { resource: Resource }) {
           href={resource.url}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-sm font-medium text-text-primary hover:text-brand-forest underline decoration-border-default hover:decoration-brand-forest underline-offset-2 break-words transition-colors"
+          className="text-sm font-medium text-text-primary hover:text-brand-forest underline decoration-border-default hover:decoration-brand-forest underline-offset-2 break-words transition-colors block min-h-[44px] flex items-start"
         >
           {resource.title}
         </a>
         {resource.source_domain && (
-          <span className="text-xs font-mono text-text-tertiary ml-2">
+          <span className="text-xs font-mono text-text-tertiary mt-1 block sm:inline sm:ml-2">
             ({resource.source_domain})
           </span>
         )}
         {displayNote && (
-          <p className="text-xs text-text-secondary mt-0.5 italic">
+          <p className="text-xs text-text-secondary mt-1.5 italic leading-relaxed">
             {displayNote}
           </p>
         )}
@@ -177,7 +177,7 @@ export function CurriculumViewer({
       <div className="md:hidden border-b border-border-default bg-surface-card px-4 py-3 sticky top-[65px] z-20 shadow-xs">
         <label
           htmlFor="mobile-topic-selector"
-          className="block text-[11px] font-semibold uppercase tracking-wider text-text-secondary mb-1"
+          className="block text-xs font-semibold uppercase tracking-wider text-text-secondary mb-1.5"
         >
           Select Topic ({selectedNode?.order_index} of {nodes.length})
         </label>
@@ -186,7 +186,7 @@ export function CurriculumViewer({
             id="mobile-topic-selector"
             value={selectedNodeId}
             onChange={(e) => setSelectedNodeId(e.target.value)}
-            className="w-full rounded-lg border border-border-default bg-surface-card px-3 py-2 text-sm font-medium text-text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest appearance-none pr-8 cursor-pointer shadow-xs"
+            className="w-full rounded-lg border border-border-default bg-surface-card px-4 py-3.5 text-base font-medium text-text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-forest appearance-none pr-10 cursor-pointer shadow-xs min-h-[44px]"
           >
             {nodes.map((node) => (
               <option key={node.id} value={node.id}>
@@ -195,8 +195,21 @@ export function CurriculumViewer({
               </option>
             ))}
           </select>
-          <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3 text-text-tertiary text-xs">
-            ▾
+          <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-4 text-text-tertiary">
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              width="18"
+              height="18"
+              aria-hidden="true"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M6 9l6 6 6-6" />
+            </svg>
           </span>
         </div>
       </div>
@@ -244,21 +257,21 @@ export function CurriculumViewer({
                     {node.order_index}. {node.title}
                   </p>
                   <div className="flex items-center gap-2 mt-1.5 flex-wrap">
-                    <span className="text-[11px] text-text-tertiary">
+                    <span className="text-xs text-text-tertiary">
                       {muCount} concept{muCount !== 1 ? "s" : ""}
                     </span>
                     <span className="text-border-default">·</span>
-                    <span className="text-[11px] font-medium text-brand-forest">
+                    <span className="text-xs font-medium text-brand-forest">
                       {topicResourceCount} topic-wide
                     </span>
                     <span className="text-border-default">·</span>
-                    <span className="text-[11px] font-medium text-brand-forest">
+                    <span className="text-xs font-medium text-brand-forest">
                       {conceptResourceCount} concept-level
                     </span>
                     {node.exam_weight_pct && (
                       <>
                         <span className="text-border-default">·</span>
-                        <span className="text-[11px] font-mono text-text-tertiary">
+                        <span className="text-xs font-mono text-text-tertiary">
                           {node.exam_weight_pct}
                         </span>
                       </>
@@ -274,7 +287,7 @@ export function CurriculumViewer({
       {/* Right Content Pane */}
       <div className="flex-1 overflow-y-auto">
         {selectedNode && (
-          <div className="max-w-3xl mx-auto px-6 sm:px-10 py-8 sm:py-10">
+          <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-10 py-6 sm:py-8">
             {/* Topic header */}
             <div className="mb-8 pb-6 border-b border-border-subtle">
               <p className="text-xs font-display font-semibold uppercase tracking-[0.18em] text-brand-forest mb-2">
@@ -340,7 +353,7 @@ export function CurriculumViewer({
             {nodeCandidates.length > 0 && (
               <div className="mb-8 rounded-xl border border-border-default bg-surface-card p-5 shadow-xs">
                 <p className="text-xs font-semibold uppercase tracking-wider text-text-secondary mb-3">More learning resources</p>
-                <p className="-mt-2 mb-2 text-[11px] leading-relaxed text-text-tertiary">
+                <p className="-mt-2 mb-2 text-xs leading-relaxed text-text-tertiary">
                   Discovered resources — not yet formally reviewed; relevance and quality may vary.
                 </p>
                 <div className="divide-y divide-border-subtle">
@@ -393,7 +406,7 @@ export function CurriculumViewer({
                           <div className="mt-3.5 pt-3 border-t border-border-subtle space-y-3">
                             {learning.length > 0 && (
                               <div>
-                                <p className="text-[11px] font-semibold uppercase tracking-wider text-text-tertiary mb-1">
+                                <p className="text-xs font-semibold uppercase tracking-wider text-text-tertiary mb-1">
                                   Learning resources
                                 </p>
                                 {learning.map((r) => (
@@ -403,7 +416,7 @@ export function CurriculumViewer({
                             )}
                             {practice.length > 0 && (
                               <div>
-                                <p className="text-[11px] font-semibold uppercase tracking-wider text-text-tertiary mb-1">
+                                <p className="text-xs font-semibold uppercase tracking-wider text-text-tertiary mb-1">
                                   Practice exercises
                                 </p>
                                 {practice.map((r) => (
@@ -417,8 +430,8 @@ export function CurriculumViewer({
 
                     {muCandidates.length > 0 && (
                       <div className="mt-3.5 pt-3 border-t border-border-subtle">
-                        <p className="text-[11px] font-semibold uppercase tracking-wider text-text-secondary mb-1">More learning resources</p>
-                        <p className="mb-2 text-[11px] leading-relaxed text-text-tertiary">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-text-secondary mb-1">More learning resources</p>
+                        <p className="mb-2 text-xs leading-relaxed text-text-tertiary">
                           Discovered resources — not yet formally reviewed; relevance and quality may vary.
                         </p>
                         {muCandidates.map((resource) => (
@@ -457,7 +470,7 @@ export function CurriculumViewer({
                 <div className="mt-8 rounded-xl border border-dashed border-border-default bg-surface-card px-6 py-10 text-center">
                   {generationFinished ? (
                     <p className="text-sm text-text-secondary">
-                      "No resources are available for this topic yet."
+                      No resources are available for this topic yet.
                     </p>
                   ) : (
                     <p className="text-sm text-text-secondary">
@@ -473,22 +486,26 @@ export function CurriculumViewer({
                 <button
                   type="button"
                   onClick={() => setSelectedNodeId(prevNode.id)}
-                  className="text-xs font-medium px-3.5 py-2.5 rounded-lg border border-border-default bg-surface-card hover:bg-canvas-subtle transition flex items-center gap-1 text-text-secondary shadow-xs"
+                  className="text-sm font-medium px-4 py-3 rounded-lg border border-border-default bg-surface-card hover:bg-canvas-subtle transition flex items-center gap-2 text-text-secondary shadow-xs min-h-[44px] min-w-[120px]"
                 >
-                  ← Topic {prevNode.order_index}
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+                  <span>Topic {prevNode.order_index}</span>
                 </button>
               ) : (
-                <div />
+                <div className="w-[120px]" aria-hidden="true" />
               )}
               {nextNode ? (
                 <button
                   type="button"
                   onClick={() => setSelectedNodeId(nextNode.id)}
-                  className="text-xs font-medium px-3.5 py-2.5 rounded-lg bg-brand-forest text-white hover:bg-brand-forest-hover transition flex items-center gap-1 shadow-xs ml-auto"
+                  className="text-sm font-medium px-4 py-3 rounded-lg bg-brand-forest text-white hover:bg-brand-forest-hover transition flex items-center gap-2 shadow-xs min-h-[44px] min-w-[120px] ml-auto"
                 >
-                  Topic {nextNode.order_index} →
+                  <span>Topic {nextNode.order_index}</span>
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18l6-6-6-6"/></svg>
                 </button>
-              ) : null}
+              ) : (
+                <div className="w-[120px]" aria-hidden="true" />
+              )}
             </div>
           </div>
         )}

@@ -98,7 +98,7 @@ export function AddResourceForm({
     return (
       <button
         onClick={() => setOpen(true)}
-        className="text-xs sm:text-sm font-medium px-3.5 py-2 rounded-lg border border-dashed border-border-default text-text-muted hover:border-brand-forest hover:text-brand-forest bg-surface-card hover:bg-canvas-subtle transition"
+        className="w-full sm:w-auto text-sm font-medium px-4 py-3 rounded-lg border border-dashed border-border-default text-text-muted hover:border-brand-forest hover:text-brand-forest bg-surface-card hover:bg-canvas-subtle transition min-h-[44px]"
       >
         + Add resource
       </button>
@@ -108,10 +108,10 @@ export function AddResourceForm({
   return (
     <form
       onSubmit={handleSubmit}
-      className="rounded-xl border border-border-default bg-surface-card p-4 sm:p-5 space-y-3.5 shadow-2xs"
+      className="rounded-xl border border-border-default bg-surface-card p-4 sm:p-5 space-y-4 shadow-2xs"
     >
       <div>
-        <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-1">
+        <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-2">
           URL
         </label>
         <input
@@ -120,12 +120,14 @@ export function AddResourceForm({
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           placeholder="https://..."
-          className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition"
+          className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-4 py-3.5 text-base text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition min-h-[44px]"
+          autoComplete="url"
+          inputMode="url"
         />
       </div>
 
       <div>
-        <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-1">
+        <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-2">
           Title
         </label>
         <input
@@ -134,19 +136,20 @@ export function AddResourceForm({
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           placeholder="e.g. Mr. Ting — Atomic Structure lesson"
-          className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition"
+          className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-4 py-3.5 text-base text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition min-h-[44px]"
+          autoComplete="off"
         />
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div>
-          <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-1">
+          <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-2">
             Type
           </label>
           <select
             value={resourceType}
             onChange={(e) => setResourceType(e.target.value as typeof resourceType)}
-            className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition"
+            className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-4 py-3.5 text-base text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition min-h-[44px]"
           >
             {RESOURCE_TYPES.map((t) => (
               <option key={t} value={t}>
@@ -157,13 +160,13 @@ export function AddResourceForm({
         </div>
 
         <div>
-          <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-1">
+          <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-2">
             License
           </label>
           <select
             value={licenseStatus}
             onChange={(e) => setLicenseStatus(e.target.value as typeof licenseStatus)}
-            className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition"
+            className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-4 py-3.5 text-base text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition min-h-[44px]"
           >
             {LICENSE_OPTIONS.map((o) => (
               <option key={o.value} value={o.value}>
@@ -181,7 +184,7 @@ export function AddResourceForm({
       </p>
 
       <div>
-        <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-1">
+        <label className="block text-xs uppercase tracking-wider text-text-muted font-medium mb-2">
           Note (optional)
         </label>
         <input
@@ -189,28 +192,29 @@ export function AddResourceForm({
           value={aiNote}
           onChange={(e) => setAiNote(e.target.value)}
           placeholder="Why this resource, why here"
-          className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition"
+          className="w-full rounded-lg border border-border-default bg-canvas-subtle/50 px-4 py-3.5 text-base text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-forest/20 focus:border-brand-forest transition min-h-[44px]"
+          autoComplete="off"
         />
       </div>
 
       {error && (
-        <p className="text-sm text-status-error bg-status-error-bg border border-status-error/20 p-2.5 rounded-lg">
+        <p className="text-sm text-status-error bg-status-error-bg border border-status-error/20 p-3 rounded-lg min-h-[44px] flex items-center">
           {error}
         </p>
       )}
 
-      <div className="flex gap-2.5 pt-1">
+      <div className="flex gap-3 pt-2 flex-wrap">
         <button
           type="submit"
           disabled={submitting}
-          className="text-xs sm:text-sm font-medium px-4 py-2 rounded-lg bg-brand-forest text-white hover:bg-brand-forest-hover transition disabled:opacity-50 shadow-xs"
+          className="flex-1 sm:flex-none text-sm font-medium px-5 py-3 rounded-lg bg-brand-forest text-white hover:bg-brand-forest-hover transition disabled:opacity-50 shadow-xs min-h-[48px]"
         >
           {submitting ? "Adding…" : "Add to review queue"}
         </button>
         <button
           type="button"
           onClick={() => setOpen(false)}
-          className="text-xs sm:text-sm font-medium px-4 py-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-canvas-subtle transition"
+          className="flex-1 sm:flex-none text-sm font-medium px-5 py-3 rounded-lg text-text-secondary hover:text-text-primary hover:bg-canvas-subtle transition min-h-[48px]"
         >
           Cancel
         </button>
