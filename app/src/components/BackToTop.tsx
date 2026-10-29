@@ -46,7 +46,6 @@ export function BackToTop() {
         viewBox="0 0 24 24"
         width="18"
         height="18"
-        className="block translate-y-1"
         aria-hidden="true"
         fill="none"
         stroke="currentColor"
