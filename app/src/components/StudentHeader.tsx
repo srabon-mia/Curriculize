@@ -78,7 +78,12 @@ export function StudentHeader() {
     }
 
     function handleFocusIn(event: FocusEvent) {
-      if (event.target instanceof Node && !menu.contains(event.target)) {
+      const activeMenu = menuRef.current;
+      if (
+        event.target instanceof Node &&
+        activeMenu &&
+        !activeMenu.contains(event.target)
+      ) {
         getFocusableElements()[0]?.focus();
       }
     }
