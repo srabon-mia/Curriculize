@@ -94,17 +94,27 @@ export default async function GenerationResultsPage({
 
   const nodeIds = topics.flatMap((topic) => topic.id ? [topic.id] : []);
   const muIds = topics.flatMap((topic) => topic.major_understandings.flatMap((mu) => mu.id ? [mu.id] : []));
-  const resourceRows: any[] = [];
+  const resourceRows: Resource[] = [];
   if (nodeIds.length) {
-    const { data } = await service.from("resources")
+    const query = service.from("resources")
       .select("*")
       .in("node_id", nodeIds);
+    // For published curricula, filter at DB level to only fetch approved+verified resources.
+    // For draft curricula (creator/admin only), fetch all resources for candidate review.
+    if (curriculum.status === "published") {
+      query.eq("status", "approved").eq("content_type_verified", true);
+    }
+    const { data } = await query;
     resourceRows.push(...(data ?? []));
   }
   if (muIds.length) {
-    const { data } = await service.from("resources")
+    const query = service.from("resources")
       .select("*")
       .in("major_understanding_id", muIds);
+    if (curriculum.status === "published") {
+      query.eq("status", "approved").eq("content_type_verified", true);
+    }
+    const { data } = await query;
     resourceRows.push(...(data ?? []));
   }
 
@@ -118,7 +128,12 @@ export default async function GenerationResultsPage({
   for (const [target, resources] of groupedResources) {
     const split = splitResultResources(resources);
     resourcesByTarget[target] = split.approved.filter((resource) => resource.title?.trim() && /^https?:\/\//i.test(resource.url));
-    candidateResourcesByTarget[target] = split.candidates.filter((resource) => resource.title?.trim() && /^https?:\/\//i.test(resource.url));
+    // Published result pages are public, so draft candidates must not be
+    // serialized into their server-rendered payload. Private in-progress
+    // results remain visible only to their authorized viewer.
+    candidateResourcesByTarget[target] = curriculum.status === "published"
+      ? []
+      : split.candidates.filter((resource) => resource.title?.trim() && /^https?:\/\//i.test(resource.url));
   }
   const viewerNodes: NodeWithChildren[] = topics.map((topic, index) => {
     const nodeId = topic.id ?? `saved-topic-${index + 1}`;

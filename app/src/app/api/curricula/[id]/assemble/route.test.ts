@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { MockSupabaseClient } from "@/lib/phase6-integration/mock-supabase";
+import type { Resource } from "@/lib/curriculum-data";
 
 const mockClient = new MockSupabaseClient();
 
@@ -12,6 +13,41 @@ vi.mock("@/lib/supabase/server", () => ({
 
 const mod = await import("./route");
 const GET = mod.GET;
+
+interface AssembleResponse {
+  curriculum: {
+    id: string;
+    title: string;
+    subject: string;
+    source_type: string;
+    source_attribution: string | null;
+    source_url: string | null;
+    status: string;
+  };
+  nodes: Array<{
+    id: string;
+    curriculum_id: string;
+    external_key: string | null;
+    title: string;
+    order_index: number;
+    exam_weight_pct: string | null;
+    claim_statement: string | null;
+    major_understandings: Array<{
+      id: string;
+      node_id: string;
+      external_key: string | null;
+      code: string | null;
+      description: string;
+      order_index: number;
+    }>;
+  }>;
+  resourcesByTarget: Record<string, Resource[]>;
+  candidateResourcesByTarget: Record<string, Resource[]>;
+  coverage: {
+    eligible_targets: number;
+    total_targets: number;
+  };
+}
 
 const CURR_ID = "curriculum-1";
 const NODE_A = "node-a";
@@ -83,44 +119,101 @@ describe("GET /api/curricula/[id]/assemble (warm-path assembly)", () => {
   });
 
   it("404s for unknown / non-published curriculum", async () => {
-    const res = await GET(new Request("http://localhost/api/curricula/nope/assemble"), { params: Promise.resolve({ id: "nope" }) } as any);
+    const res = await GET(new Request("http://localhost/api/curricula/nope/assemble"), { params: Promise.resolve({ id: "nope" }) });
     const json = await res.json();
     expect(res.status).toBe(404);
     expect(json.error).toBeDefined();
   });
 
-  it("selects only approved + verified resources in the student-facing response", async () => {
+  it("returns only approved + verified resources and never draft candidate metadata", async () => {
     // Approved + verified → eligible
-    resource({ id: "eligible-1", major_understanding_id: muA1, source_domain: "nysed.gov" });
+    resource({
+      id: "eligible-1",
+      major_understanding_id: muA1,
+      source_domain: "nysed.gov",
+      url: "https://nysed.gov/eligible-resource",
+      title: "Eligible Resource",
+      ai_note: "Eligible explanation",
+    });
     verifiedVr("eligible-1", "2026-09-01T00:00:00Z");
 
     // Approved but NOT content_type_verified → excluded (unverified)
-    resource({ id: "seed-yet-unverified", major_understanding_id: muA1, status: "approved", content_type_verified: false });
+    resource({
+      id: "seed-yet-unverified",
+      major_understanding_id: muA1,
+      status: "approved",
+      content_type_verified: false,
+      url: "https://private.example/unverified-url",
+      title: "PRIVATE-UNVERIFIED-TITLE",
+      ai_note: "PRIVATE-UNVERIFIED-NOTE",
+    });
 
     // content_type_verified but DRAFT → excluded (not admin-approved)
-    resource({ id: "draft-verified", node_id: nodeA, source_domain: "nysed.gov", status: "draft", content_type_verified: true });
+    resource({
+      id: "draft-verified",
+      node_id: nodeA,
+      source_domain: "nysed.gov",
+      status: "draft",
+      content_type_verified: true,
+      url: "https://private.example/draft-url",
+      title: "PRIVATE-DRAFT-TITLE",
+      ai_note: "PRIVATE-DRAFT-NOTE",
+    });
     verifiedVr("draft-verified", "2026-09-01T00:00:00Z");
-    resource({ id: "draft-unverified", node_id: nodeA, status: "draft", content_type_verified: false });
-    resource({ id: "rejected-candidate", node_id: nodeA, status: "rejected", content_type_verified: false });
+    resource({
+      id: "draft-unverified",
+      node_id: nodeA,
+      status: "draft",
+      content_type_verified: false,
+      url: "https://private.example/draft-unverified-url",
+      title: "PRIVATE-DRAFT-UNVERIFIED-TITLE",
+      ai_note: "PRIVATE-DRAFT-UNVERIFIED-NOTE",
+    });
+    resource({
+      id: "rejected-candidate",
+      node_id: nodeA,
+      status: "rejected",
+      content_type_verified: false,
+      url: "https://private.example/rejected-url",
+      title: "PRIVATE-REJECTED-TITLE",
+      ai_note: "PRIVATE-REJECTED-NOTE",
+    });
 
     const res = await callAssemble();
-    const json = await res.json();
+    const json = (await res.json()) as AssembleResponse;
 
     expect(res.status).toBe(200);
-    // MU_A1 has exactly 1 eligible resource; node_a has 0; node_b has 0; mu_b1 has 0
-    expect(json.resourcesByTarget[`mu:${muA1}`].map((r: any) => r.id)).toEqual(["eligible-1"]);
+    // MU_A1 has exactly 1 eligible resource; node_a has 0; node_b has 0; mu_b1 has 0.
+    // Approved-but-unverified, draft, and rejected resources are absent.
+    expect(json.resourcesByTarget[`mu:${muA1}`].map((r) => r.id)).toEqual(["eligible-1"]);
     expect(json.resourcesByTarget[`node:${nodeA}`]).toEqual([]);
     expect(json.resourcesByTarget[`node:${nodeB}`]).toEqual([]);
     expect(json.resourcesByTarget[`mu:${muB1}`]).toEqual([]);
-    // No draft/unverified resource leaks
-    const allReturned = Object.values(json.resourcesByTarget).flat() as any[];
+    // No draft/unverified resource appears in the normal resource lists.
+    const allReturned = Object.values(json.resourcesByTarget).flat();
     expect(allReturned.map((r) => r.id)).not.toContain("draft-verified");
     expect(allReturned.map((r) => r.id)).not.toContain("seed-yet-unverified");
-    expect(json.candidateResourcesByTarget[`node:${nodeA}`].map((r: any) => r.id)).toEqual(["draft-verified", "draft-unverified"]);
-    expect(json.candidateResourcesByTarget[`node:${nodeA}`].map((r: any) => r.content_type_verified)).toEqual([true, false]);
+    expect(json.candidateResourcesByTarget[`node:${nodeA}`]).toEqual([]);
     expect(json.candidateResourcesByTarget[`mu:${muA1}`]).toEqual([]);
     expect(json.candidateResourcesByTarget[`node:${nodeB}`]).toEqual([]);
     expect(json.candidateResourcesByTarget[`mu:${muB1}`]).toEqual([]);
+
+    // Candidate URLs, titles, notes, and other metadata are never serialized
+    // by the public endpoint, even for a published curriculum.
+    const responseText = JSON.stringify(json);
+    for (const privateMarker of [
+      "private.example",
+      "PRIVATE-UNVERIFIED-TITLE",
+      "PRIVATE-UNVERIFIED-NOTE",
+      "PRIVATE-DRAFT-TITLE",
+      "PRIVATE-DRAFT-NOTE",
+      "PRIVATE-DRAFT-UNVERIFIED-TITLE",
+      "PRIVATE-DRAFT-UNVERIFIED-NOTE",
+      "PRIVATE-REJECTED-TITLE",
+      "PRIVATE-REJECTED-NOTE",
+    ]) {
+      expect(responseText).not.toContain(privateMarker);
+    }
   });
 
   it("ranks eligible resources by domain score (primary), then recency", async () => {
@@ -133,9 +226,9 @@ describe("GET /api/curricula/[id]/assemble (warm-path assembly)", () => {
     verifiedVr("r-high", "2026-01-01T00:00:00Z");
 
     const res = await callAssemble();
-    const json = await res.json();
+    const json = (await res.json()) as AssembleResponse;
     // nysed(5) > openstax(4) > unknownblog(1)
-    expect(json.resourcesByTarget[`mu:${muA1}`].map((r: any) => r.id)).toEqual(["r-high", "r-low-new", "r-high-old"]);
+    expect(json.resourcesByTarget[`mu:${muA1}`].map((r) => r.id)).toEqual(["r-high", "r-low-new", "r-high-old"]);
   });
 
   it("stably preserves insertion order for equal-ranked resources", async () => {
@@ -148,8 +241,8 @@ describe("GET /api/curricula/[id]/assemble (warm-path assembly)", () => {
     verifiedVr("r-new-3", "2026-09-01T00:00:00Z");
 
     const res = await callAssemble();
-    const json = await res.json();
-    expect(json.resourcesByTarget[`mu:${muA1}`].map((r: any) => r.id)).toEqual(["r-new-1", "r-new-2", "r-new-3"]);
+    const json = (await res.json()) as AssembleResponse;
+    expect(json.resourcesByTarget[`mu:${muA1}`].map((r) => r.id)).toEqual(["r-new-1", "r-new-2", "r-new-3"]);
   });
 
   it("reports honest coverage when resources are missing", async () => {
@@ -158,7 +251,7 @@ describe("GET /api/curricula/[id]/assemble (warm-path assembly)", () => {
     verifiedVr("only-1", "2026-09-01T00:00:00Z");
 
     const res = await callAssemble();
-    const json = await res.json();
+    const json = (await res.json()) as AssembleResponse;
 
     expect(res.status).toBe(200);
     expect(json.coverage.total_targets).toBe(4); // 2 node + 2 mu
@@ -168,7 +261,7 @@ describe("GET /api/curricula/[id]/assemble (warm-path assembly)", () => {
   it("assembles with zero resources for a freshly published curriculum", async () => {
     // No resource rows seeded → all targets have empty arrays, coverage 0.
     const res = await callAssemble();
-    const json = await res.json();
+    const json = (await res.json()) as AssembleResponse;
 
     expect(res.status).toBe(200);
     expect(json.coverage.eligible_targets).toBe(0);
@@ -187,7 +280,7 @@ describe("GET /api/curricula/[id]/assemble (warm-path assembly)", () => {
     verifiedVr("ok", "2026-09-01T00:00:00Z");
 
     const res = await callAssemble();
-    const json = await res.json();
+    const json = (await res.json()) as AssembleResponse;
 
     expect(json).toHaveProperty("curriculum");
     expect(json.curriculum.id).toBe(CURR_ID);
@@ -197,9 +290,9 @@ describe("GET /api/curricula/[id]/assemble (warm-path assembly)", () => {
     expect(json).toHaveProperty("coverage");
 
     // nodes carry their MUs in order.
-    const nodeResult = (json.nodes as any[]).find((n) => n.id === nodeA);
+    const nodeResult = json.nodes.find((n) => n.id === nodeA);
     expect(nodeResult).toBeDefined();
-    expect(nodeResult.major_understandings[0].id).toBe(muA1);
+    expect(nodeResult?.major_understandings[0].id).toBe(muA1);
 
     // resourcesByTarget is keyed node:<id> / mu:<id>.
     expect(json.resourcesByTarget[`mu:${muA1}`][0].id).toBe("ok");
@@ -236,5 +329,5 @@ function verifiedVr(resId: string, fetchedAt: string) {
 }
 
 async function callAssemble() {
-  return GET(new Request(`http://localhost/api/curricula/${CURR_ID}/assemble`), { params: Promise.resolve({ id: CURR_ID }) } as any);
+  return GET(new Request(`http://localhost/api/curricula/${CURR_ID}/assemble`), { params: Promise.resolve({ id: CURR_ID }) });
 }

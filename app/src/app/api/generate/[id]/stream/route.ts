@@ -1,4 +1,12 @@
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { cookies } from "next/headers";
+import { NextResponse } from "next/server";
+import { createClient } from "@/lib/supabase/server";
+import {
+  canReadCurriculumResult,
+  streamAccessCookieName,
+  verifyStreamAccessToken,
+} from "@/lib/generation/resultAccess";
 import { buildSkeletonPrompt } from "@/lib/prompts/skeleton";
 import { buildDiscoverPrompt, buildTopicBatchPrompt } from "@/lib/prompts/discover";
 import { buildSourceDiscoveryPrompt } from "@/lib/prompts/sources";
@@ -744,6 +752,61 @@ export async function GET(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
+  const { id } = await context.params;
+  let authorized = false;
+
+  try {
+    const cookieStore = await cookies();
+    const signingSecret = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
+    const hasValidResultToken = verifyStreamAccessToken(
+      id,
+      signingSecret,
+      cookieStore.get(streamAccessCookieName(id))?.value
+    );
+
+    if (hasValidResultToken) {
+      // Guest capability is checked before handing control to the service-role
+      // stream handler, which reads the curriculum and claims/registers jobs.
+      authorized = true;
+    } else {
+      // Use the caller's RLS-scoped client for the access lookup. It can see
+      // published curricula, the authenticated user's own curricula, and
+      // admin-visible curricula, but cannot expose unrelated private drafts.
+      const userClient = await createClient();
+      const { data: { user } } = await userClient.auth.getUser();
+      const { data: curriculum, error: curriculumError } = await userClient
+        .from("curricula")
+        .select("status, created_by")
+        .eq("id", id)
+        .maybeSingle();
+
+      if (!curriculumError && curriculum) {
+        const { data: adminRow } = user
+          ? await userClient
+              .from("admins")
+              .select("user_id")
+              .eq("user_id", user.id)
+              .maybeSingle()
+          : { data: null };
+
+        authorized = canReadCurriculumResult({
+          published: curriculum.status === "published",
+          createdBy: curriculum.created_by ?? null,
+          userId: user?.id ?? null,
+          isAdmin: Boolean(adminRow),
+          hasValidResultToken: false,
+        });
+      }
+    }
+  } catch {
+    // Authorization fails closed without revealing lookup or credential errors.
+    authorized = false;
+  }
+
+  if (!authorized) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+
   return legacyGenerationGet(request, context);
 }
 

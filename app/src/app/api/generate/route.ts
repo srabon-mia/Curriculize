@@ -1,7 +1,14 @@
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 import { notesMatchRequest } from "@/lib/curriculum/finder";
-import { createResultAccessToken, resultAccessCookieName } from "@/lib/generation/resultAccess";
+import {
+  createProgressAccessToken,
+  createResultAccessToken,
+  createStreamAccessToken,
+  progressAccessCookieName,
+  resultAccessCookieName,
+  streamAccessCookieName,
+} from "@/lib/generation/resultAccess";
 
 const supabase = createServiceClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -99,6 +106,24 @@ export async function POST(request: Request) {
     secure: process.env.NODE_ENV === "production",
     path: `/results/${draft.id}`,
     maxAge: 60 * 60 * 24 * 7,
+  });
+  response.cookies.set({
+    name: streamAccessCookieName(draft.id),
+    value: createStreamAccessToken(draft.id, process.env.SUPABASE_SERVICE_ROLE_KEY!),
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    path: `/api/generate/${draft.id}/stream`,
+    maxAge: 60 * 60 * 24 * 7,
+  });
+  response.cookies.set({
+    name: progressAccessCookieName(draft.id),
+    value: createProgressAccessToken(draft.id, process.env.SUPABASE_SERVICE_ROLE_KEY!),
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    path: `/api/curricula/${draft.id}/progress`,
+    maxAge: 60 * 60 * 2,
   });
   return response;
 }

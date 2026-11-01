@@ -1,5 +1,12 @@
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
+import { createClient } from "@/lib/supabase/server";
+import {
+  canReadCurriculumResult,
+  progressAccessCookieName,
+  verifyProgressAccessToken,
+} from "@/lib/generation/resultAccess";
 import { getCoverageStatus } from "@/lib/acquisition/coverage";
 
 const supabase = createServiceClient(
@@ -12,6 +19,64 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+
+  // Resolve access with the caller's RLS-scoped client before any service-role
+  // reads. The guest progress capability is scoped to this endpoint and expires.
+  // Treat an unknown publication state conservatively. A progress capability
+  // grants aggregate polling only; detailed fields require creator/admin access.
+  let published = true;
+  let authorized = false;
+  let detailedProgressAuthorized = false;
+  try {
+    const cookieStore = await cookies();
+    const signingSecret = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
+    const hasValidGuestCapability = verifyProgressAccessToken(
+      id,
+      signingSecret,
+      cookieStore.get(progressAccessCookieName(id))?.value
+    );
+    authorized = hasValidGuestCapability;
+
+    const userClient = await createClient();
+    const { data: { user } } = await userClient.auth.getUser();
+    const { data: curriculum, error: curriculumError } = await userClient
+      .from("curricula")
+      .select("status, created_by")
+      .eq("id", id)
+      .maybeSingle();
+
+    if (!curriculumError && curriculum) {
+      published = curriculum.status === "published";
+      const { data: adminRow } = user
+        ? await userClient
+            .from("admins")
+            .select("user_id")
+            .eq("user_id", user.id)
+            .maybeSingle()
+        : { data: null };
+      const isCreator = Boolean(
+        user?.id && curriculum.created_by && user.id === curriculum.created_by
+      );
+      const isAdmin = Boolean(adminRow);
+
+      authorized = authorized || canReadCurriculumResult({
+        published,
+        createdBy: curriculum.created_by ?? null,
+        userId: user?.id ?? null,
+        isAdmin,
+        hasValidResultToken: false,
+      });
+      detailedProgressAuthorized = !published && (isCreator || isAdmin);
+    }
+  } catch {
+    // Fail closed without revealing whether the curriculum or credentials exist.
+    // A previously verified guest capability remains authorization; the
+    // public response shape is retained while publication is unknown.
+  }
+
+  if (!authorized) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
 
   // Get all MU ids for this curriculum
   const { data: nodes } = await supabase
@@ -66,7 +131,7 @@ export async function GET(
     : getCoverageStatus({ jobStatus, topicCounts, understandingCounts });
   const generationFinished = jobStatus === "failed" || jobStatus === "completed";
 
-  return NextResponse.json({
+  const progress = {
     total: mus.length,
     with_resources: withResources,
     complete: coverageStatus === "complete",
@@ -75,5 +140,19 @@ export async function GET(
     coverage_status: coverageStatus,
     topics: nodes.map((node, index) => ({ id: node.id, resource_count: topicCounts[index], sufficient: topicCounts[index] >= 3 })),
     understandings: mus.map((mu, index) => ({ id: mu.id, resource_count: understandingCounts[index], sufficient: understandingCounts[index] >= 2 })),
-  });
+  };
+
+  // Aggregate completion is sufficient for anonymous polling. Keep the
+  // latest job status and target-level metadata private to authorized viewers.
+  if (!detailedProgressAuthorized) {
+    return NextResponse.json({
+      total: progress.total,
+      with_resources: progress.with_resources,
+      complete: progress.complete,
+      generation_finished: progress.generation_finished,
+      coverage_status: progress.coverage_status,
+    });
+  }
+
+  return NextResponse.json(progress);
 }

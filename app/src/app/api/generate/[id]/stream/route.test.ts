@@ -404,6 +404,14 @@ const mockSupabaseClient = createMockSupabaseClient();
 vi.mock("@supabase/supabase-js", () => ({
   createClient: vi.fn(() => mockSupabaseClient),
 }));
+// These tests exercise the durable stream lifecycle itself. Authorization is
+// covered separately in route.authorization.test.ts; provide the same valid
+// scoped capability the production client sends so this suite stays focused
+// on claim, observer, retry, and checkpoint behavior.
+vi.mock("@/lib/generation/resultAccess", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/generation/resultAccess")>();
+  return { ...actual, verifyStreamAccessToken: vi.fn(() => true) };
+});
 
 // ============================================================
 // Mock AI provider factory
@@ -444,7 +452,7 @@ vi.mock("@/lib/acquisition/jobTypes", () => ({
 // Import the route AFTER all mocks are registered
 // Exercise the production inline generation path and retain direct coverage of
 // the read-only observer used to inspect durable job state.
-const { GET, observeGeneration, hasSufficientInvocationBudget } = await import("./route");
+const { legacyGenerationGet: GET, observeGeneration, hasSufficientInvocationBudget } = await import("./route");
 
 // ============================================================
 // Test data factories
@@ -805,7 +813,7 @@ describe("Generation Stream - Phase 12 Resource Status Regression", () => {
     });
 
     const request = createMockRequest(curriculumId);
-    let events: string[] = [];
+    const events: string[] = [];
     for (let invocation = 0; invocation < (followYields ? 60 : 1); invocation++) {
       const response = await GET(invocation === 0 ? request : createMockRequest(curriculumId), {
         params: Promise.resolve({ id: curriculumId }),

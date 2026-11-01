@@ -31,8 +31,9 @@ export async function GET(
   const nodeIds = nodes.map((n) => n.id);
   const muIds = nodes.flatMap((n) => n.major_understandings.map((mu) => mu.id));
 
-  // Fetch ALL resources for this curriculum (draft + approved + rejected).
-  // Fetch resources for this curriculum's nodes and major understandings.
+  // Fetch only resources eligible for student visibility. Draft candidates
+  // and unverified or rejected resources remain available through the
+  // authenticated admin review route, not this public assembly endpoint.
   // Two separate queries merged client-side (equivalent to .or() with XOR targets).
   const nodeRes: Resource[] = (nodeIds.length > 0
     ? (await supabase
@@ -40,7 +41,9 @@ export async function GET(
         .select(
           "id, node_id, major_understanding_id, url, title, source_domain, resource_type, license_status, embed_allowed, ai_note, status, content_type_verified, created_at"
         )
-        .in("node_id", nodeIds)).data ?? []
+        .in("node_id", nodeIds)
+        .eq("status", "approved")
+        .eq("content_type_verified", true)).data ?? []
     : []);
   const muRes: Resource[] = (muIds.length > 0
     ? (await supabase
@@ -48,7 +51,9 @@ export async function GET(
         .select(
           "id, node_id, major_understanding_id, url, title, source_domain, resource_type, license_status, embed_allowed, ai_note, status, content_type_verified, created_at"
         )
-        .in("major_understanding_id", muIds)).data ?? []
+        .in("major_understanding_id", muIds)
+        .eq("status", "approved")
+        .eq("content_type_verified", true)).data ?? []
     : []);
   // Merge and deduplicate by id (resources have XOR targets so no overlap, but safe).
   const allResources = [...nodeRes, ...muRes].reduce((acc, r) => {
@@ -116,11 +121,7 @@ export async function GET(
       domainScores,
       fetchedAtByResourceId
     );
-    candidateResourcesByTarget[topicKey] = rankResourcesV1(
-      (grouped[topicKey] ?? []).filter((resource) => resource.status === "draft"),
-      domainScores,
-      fetchedAtByResourceId
-    );
+    candidateResourcesByTarget[topicKey] = [];
     for (const mu of n.major_understandings) {
       const muKey = `mu:${mu.id}`;
       resourcesByTarget[`mu:${mu.id}`] = rankResourcesV1(
@@ -128,11 +129,7 @@ export async function GET(
         domainScores,
         fetchedAtByResourceId
       );
-      candidateResourcesByTarget[muKey] = rankResourcesV1(
-        (grouped[muKey] ?? []).filter((resource) => resource.status === "draft"),
-        domainScores,
-        fetchedAtByResourceId
-      );
+      candidateResourcesByTarget[muKey] = [];
     }
   }
 

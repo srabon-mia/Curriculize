@@ -10,6 +10,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { MockSupabaseClient } from "@/lib/phase6-integration/mock-supabase";
 import { type CurriculumRequest } from "@/lib/curriculum/finder";
+import { progressAccessCookieName, verifyProgressAccessToken } from "@/lib/generation/resultAccess";
 
 const mockClient = new MockSupabaseClient();
 
@@ -34,6 +35,7 @@ const FIELDS = {
 
 const topic = "AP Chemistry";
 let originalServiceRoleKey: string | undefined;
+let originalNodeEnv: string | undefined;
 
 function bodyFor(topicValue: string, overrides: Partial<typeof FIELDS> = {}) {
   return {
@@ -69,6 +71,7 @@ function seededCurriculumCount() {
 describe("POST /api/generate warm-path cache lookup", () => {
   beforeEach(() => {
     originalServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    originalNodeEnv = process.env.NODE_ENV;
     process.env.SUPABASE_SERVICE_ROLE_KEY = "test-result-cookie-signing-key";
     mockClient.reset();
     vi.clearAllMocks();
@@ -77,6 +80,8 @@ describe("POST /api/generate warm-path cache lookup", () => {
   afterEach(() => {
     if (originalServiceRoleKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
     else process.env.SUPABASE_SERVICE_ROLE_KEY = originalServiceRoleKey;
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
     vi.clearAllMocks();
   });
 
@@ -96,12 +101,14 @@ describe("POST /api/generate warm-path cache lookup", () => {
 
     expect(response.status).toBe(200);
     expect(json).toEqual({ curriculum_id: "curriculum-hit-1", cached: true });
+    expect(response.headers.get("set-cookie")).toBeNull();
 
     // No new curriculum row created on a cache hit.
     expect(mockClient.getRows("curricula")).toHaveLength(1);
   });
 
   it("returns cached: false and creates a draft when notes fields differ (same title, different grade level)", async () => {
+    process.env.NODE_ENV = "production";
     mockClient.insert("curricula", {
       id: "curriculum-miss-1",
       title: topic,
@@ -121,6 +128,22 @@ describe("POST /api/generate warm-path cache lookup", () => {
     expect(json.curriculum_id).toBeDefined();
     expect(response.headers.get("set-cookie")).toContain(`curriculum_result_${json.curriculum_id}=`);
     expect(response.headers.get("set-cookie")).toContain("HttpOnly");
+    expect(response.headers.get("set-cookie")).toContain(`curriculum_stream_${json.curriculum_id}=`);
+    expect(response.headers.get("set-cookie")).toContain(`Path=/api/generate/${json.curriculum_id}/stream`);
+    const progressCookie = response.headers.get("set-cookie")?.match(
+      new RegExp(`${progressAccessCookieName(json.curriculum_id)}=([^;]+)`)
+    );
+    const progressCookieHeader = response.headers.get("set-cookie")
+      ?.split(/, (?=curriculum_)/)
+      .find((cookie) => cookie.startsWith(`${progressAccessCookieName(json.curriculum_id)}=`));
+    expect(progressCookie?.[1]).toBeDefined();
+    expect(verifyProgressAccessToken(json.curriculum_id, process.env.SUPABASE_SERVICE_ROLE_KEY!, progressCookie?.[1])).toBe(true);
+    expect(verifyProgressAccessToken("another-curriculum", process.env.SUPABASE_SERVICE_ROLE_KEY!, progressCookie?.[1])).toBe(false);
+    expect(progressCookieHeader).toContain(`Path=/api/curricula/${json.curriculum_id}/progress`);
+    expect(progressCookieHeader).toContain("Max-Age=7200");
+    expect(progressCookieHeader).toContain("SameSite=lax");
+    expect(progressCookieHeader).toContain("HttpOnly");
+    expect(progressCookieHeader).toContain("Secure");
     expect(typeof json.curriculum_id).toBe("string");
 
     // A new draft was created for the new request.
