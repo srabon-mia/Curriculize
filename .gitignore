@@ -18,3 +18,26 @@ next-env.d.ts
 
 # Supabase CLI
 .supabase/
+
+# Local-only artifacts (public-release cleanup)
+supabase/.temp/
+*.patch
+
+# Root-level local-only documents
+audit.md
+AUDIT_REPORT.md
+FINAL_AUDIT_REPORT.md
+GENERATION_ROUTE_AUDIT_REPORT.md
+PHASE_0_SCOPE.md
+PHASE_1_README.md
+PHASE_2_README.md
+PHASE_6D_DESIGN_AUDIT.md
+PHASE_6D_DESIGN_AUDIT_REVISED.md
+PHASE_10_README.md
+PHASE_11_README.md
+phase12_launch_audit.md
+report_scheduler_inspection.md
+summary.md
+summary_cold_path.md
+CURRICULUM_GENERATOR_PRODUCTION_REPAIR.sql
+PRODUCTION_REPAIR_REVIEW.sql

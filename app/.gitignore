@@ -46,3 +46,6 @@ next-env.d.ts
 .env.local
 
 .claude
+
+# Local-only artifacts (public-release cleanup)
+*.patch
