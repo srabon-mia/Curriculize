@@ -95,7 +95,10 @@ export default function GeneratePage({
       const data = JSON.parse(e.data) as Status;
       if (data.step === "resume" && (data.current ?? 0) > 0) savedStructureRef.current = true;
       setStatus(data);
-      setLog((prev) => [...prev, { message: data.message, done: false }]);
+      // Hide internal "Generation job active." message from user-facing log
+      if (data.message !== "Generation job active.") {
+        setLog((prev) => [...prev, { message: data.message, done: false }]);
+      }
 
       if (
         data.step === "discovery" &&
@@ -132,13 +135,16 @@ export default function GeneratePage({
       };
       savedStructureRef.current = data.topic_count > 0;
       setSkeletonTitle(data.title);
-      setLog((prev) => [
-        ...prev.slice(0, -1),
-        {
-          message: `${data.resumed ? "Reused saved structure" : "Found structure"}: ${data.title} (${data.topic_count} topics)`,
-          done: true,
-        },
-      ]);
+      // Only log "Found structure" — hide "Reused saved structure" (internal resume message)
+      if (!data.resumed) {
+        setLog((prev) => [
+          ...prev.slice(0, -1),
+          {
+            message: `Found structure: ${data.title} (${data.topic_count} topics)`,
+            done: true,
+          },
+        ]);
+      }
     });
 
     es.addEventListener("complete", (e) => {
@@ -175,13 +181,27 @@ export default function GeneratePage({
 
     es.addEventListener("yielded", (e) => {
       const data = JSON.parse(e.data) as YieldedEvent;
-      setLog((prev) => [
-        ...prev.slice(0, -1),
-        {
-          message: `${data.message} (${data.topicsCompleted}/${data.totalTopics} topics this session)`,
-          done: true,
-        },
-      ]);
+      // Hide internal checkpoint messages from user-facing log
+      const isResourceAttemptSaved = data.message.includes("Resource attempt saved");
+      const isTopicDiscoverySaved = data.message.includes("Topic discovery saved");
+      const isConceptResourceAttempt = data.message.includes("Concept resource attempt saved");
+
+      if (!isResourceAttemptSaved && !isTopicDiscoverySaved) {
+        // Transform concept resource message to user-friendly wording
+        let displayMessage = data.message;
+        if (isConceptResourceAttempt) {
+          displayMessage = `Finding concept resources (${data.topicsCompleted}/${data.totalTopics} topics)`;
+        } else {
+          displayMessage = `${data.message} (${data.topicsCompleted}/${data.totalTopics} topics this session)`;
+        }
+        setLog((prev) => [
+          ...prev.slice(0, -1),
+          {
+            message: displayMessage,
+            done: true,
+          },
+        ]);
+      }
       yieldedHandledRef.current = true;
       // Close current connection; reconnect will be triggered by the effect
       es.close();
