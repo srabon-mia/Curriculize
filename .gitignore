@@ -1,2 +1,20 @@
 /node_modules
 /.vite
+
+# Next.js build output
+.next/
+/out/
+/build/
+
+# Environment
+.env*
+
+# TypeScript cache
+*.tsbuildinfo
+next-env.d.ts
+
+# Claude Code
+.claude/
+
+# Supabase CLI
+.supabase/
