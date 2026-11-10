@@ -49,3 +49,5 @@ next-env.d.ts
 
 # Local-only artifacts (public-release cleanup)
 *.patch
+
+AGENTS.md
