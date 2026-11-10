@@ -67,7 +67,7 @@ export async function verifyCurriculumSource(
   const title = acquired.cleanedPage.title.trim();
   const text = `${title}\n${acquired.cleanedPage.text}`;
   const wordCount = text.match(/[\p{L}\p{N}]+/gu)?.length ?? 0;
-  const hasCurriculumStructure = /\b(curricul(?:um|a)|syllabus|course outline|learning outcomes|standards framework|units of study)\b/i.test(text);
+  const hasCurriculumStructure = /\b(curricul(?:um|a)|syllabus|course outline|learning outcomes|standards framework|units of study|course framework|course and exam description|course at a glance)\b/i.test(text);
   if (!credibleEducationalHost(parsed.hostname) || !title || wordCount < 40 || !hasCurriculumStructure) return null;
 
   return {

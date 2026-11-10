@@ -16,6 +16,16 @@ const fetched = {
   },
 } as any;
 
+// College Board-style fetched page using modern AP terminology (no "syllabus", "learning outcomes", etc.)
+const fetchedCollegeBoardStyle = {
+  success: true,
+  acquiredPage: { finalUrl: "https://apcentral.collegeboard.org/courses/ap-statistics" },
+  cleanedPage: {
+    title: "AP Statistics Course and Exam Description",
+    text: "Course Framework. Course at a Glance. Units. Topics. Skills. The AP Statistics course framework is organized into nine units of study. Each unit contains multiple topics and skills that students must master. The course framework provides a clear structure for the course. Teachers use the framework to plan instruction and assessment.",
+  },
+} as any;
+
 describe("curriculum source provenance", () => {
   it("requires a cited, fetched, credible curriculum page and derives attribution from it", async () => {
     const acquire = vi.fn().mockResolvedValue(fetched);
@@ -52,6 +62,31 @@ describe("curriculum source provenance", () => {
       async () => ({ ...fetched, acquiredPage: { finalUrl: "https://example.com/course" } }) as any
     );
     expect(result).toBeNull();
+  });
+
+  it("accepts College Board-style curriculum pages with Course Framework / Course and Exam Description terminology", async () => {
+    const collegeBoardClaim = {
+      source_type: "adapted" as const,
+      source_attribution: "College Board AP Statistics",
+      source_url: "https://apcentral.collegeboard.org/courses/ap-statistics",
+    };
+    const collegeBoardCitation = [{ url: collegeBoardClaim.source_url, title: "AP Statistics Course and Exam Description" }];
+    const acquire = vi.fn().mockResolvedValue(fetchedCollegeBoardStyle);
+
+    const verified = await verifyCurriculumSource(collegeBoardClaim, collegeBoardCitation, acquire);
+
+    expect(acquire).toHaveBeenCalledWith(collegeBoardClaim.source_url);
+    expect(verified).not.toBeNull();
+    expect(verified).toMatchObject({
+      source_url: "https://apcentral.collegeboard.org/courses/ap-statistics",
+      source_title: "AP Statistics Course and Exam Description",
+      source_institution: "College Board",
+    });
+    expect(applyVerifiedCurriculumSource(collegeBoardClaim, verified)).toMatchObject({
+      source_type: "adapted",
+      source_attribution: "College Board — AP Statistics Course and Exam Description",
+      source_url: "https://apcentral.collegeboard.org/courses/ap-statistics",
+    });
   });
 
   it("persists source title, institution, canonical URL, and verification evidence", async () => {
