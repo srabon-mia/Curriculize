@@ -873,8 +873,12 @@ export class AzureProvider implements AIProvider {
       }
       searchCitations = searchResult.searchCitations ?? [];
     }
+    // If still no citations after retry, log warning but proceed with grounded
+    // generation using the search text. The AI may have found URLs in the
+    // search results text. Verification will naturally fail if no citations
+    // exist, resulting in ai_organized provenance.
     if (searchResult && searchCitations.length === 0) {
-      console.warn("[Azure] Structured discovery rejected", {
+      console.warn("[Azure] Web search completed without source citations; proceeding with grounded generation using search text.", {
         provider: "azure",
         curriculum_id: diagnosticContext?.curriculumId,
         job_id: diagnosticContext?.jobId,
@@ -882,11 +886,6 @@ export class AzureProvider implements AIProvider {
         operation: diagnosticContext?.operation,
         topic_id: diagnosticContext?.topicId,
         attempt_number: searchAttempt,
-        failure_category: "missing_citations",
-      });
-      throw new AIError("MODEL_ERROR", "Azure web search completed without source citations; structured discovery was not generated.", {
-        retryable: true,
-        provider: "azure",
       });
     }
 

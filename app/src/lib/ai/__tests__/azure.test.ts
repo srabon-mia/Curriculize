@@ -1153,16 +1153,29 @@ describe("AzureProvider", () => {
         ],
       },
     });
-    mockFetch.mockResolvedValueOnce(citationFreeResponse).mockResolvedValueOnce(citationFreeResponse);
+    mockFetch
+      .mockResolvedValueOnce(citationFreeResponse)
+      .mockResolvedValueOnce(citationFreeResponse)
+      .mockResolvedValueOnce(createMockResponse({
+        json: {
+          id: "chatcmpl_test",
+          object: "chat.completion",
+          created: Date.now(),
+          model: "gpt-4.1-mini",
+          choices: [{ index: 0, message: { role: "assistant", content: '{"result":"grounded without citations"}' }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+        },
+      }));
 
-    await expect(provider.structured("Test prompt", { schema, useSearch: true })).rejects.toMatchObject({
-      code: "MODEL_ERROR",
-      provider: "azure",
-      message: "Azure web search completed without source citations; structured discovery was not generated.",
-    });
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const result = await provider.structured("Test prompt", { schema, useSearch: true });
+
+    expect(result.data).toEqual({ result: "grounded without citations" });
+    expect(result.searchCitations).toEqual([]);
+    expect(result.searchCompleted).toBe(true);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
     expect(mockFetch.mock.calls[0][0]).toContain("/responses?");
     expect(mockFetch.mock.calls[1][0]).toContain("/responses?");
+    expect(mockFetch.mock.calls[2][0]).toContain("/chat/completions");
   });
 
   test("structured() retries a citation-free search once and grounds output in real citation annotations", async () => {
