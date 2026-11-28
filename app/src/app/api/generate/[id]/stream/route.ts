@@ -2221,6 +2221,53 @@ export async function legacyGenerationGet(
         // Runs after topic-level resources are done. We keep the stream open
         // so the student receives the final `complete` event with phase="background".
         let backgroundYielded = false;
+
+        // ============================================================
+        // TEMPORARY DIAGNOSTIC INSTRUMENTATION (debugTrace)
+        // Records per-candidate pipeline diagnostics to result_data.debugTrace
+        // Remove after root cause is identified.
+        // ============================================================
+        type DebugTraceEntry = {
+          topicNumber: number;
+          topicId: string;
+          attemptNumber: number;
+          understandingCode: string | null;
+          url: string | null;
+          stage: string;
+          result: "success" | "failure" | "skipped";
+          reason?: string;
+          aiCallNumber?: number;
+          candidateCount?: number;
+          reservationOk?: boolean;
+          reservationReason?: string;
+        };
+
+        async function appendDebugTrace(
+          jobId: string,
+          claimToken: string,
+          claimVersion: number,
+          entries: DebugTraceEntry[]
+        ): Promise<void> {
+          try {
+            const { data: job } = await supabase
+              .from("acquisition_jobs")
+              .select("result_data")
+              .eq("id", jobId)
+              .single();
+            const existing = (job?.result_data as { debugTrace?: DebugTraceEntry[] })?.debugTrace ?? [];
+            const merged = [...existing, ...entries];
+            await supabase
+              .from("acquisition_jobs")
+              .update({ result_data: { ...(job?.result_data ?? {}), debugTrace: merged } })
+              .eq("id", jobId)
+              .eq("claim_token", claimToken)
+              .eq("claim_version", claimVersion);
+          } catch {
+            // Best-effort diagnostics; never fail the job for tracing
+          }
+        }
+        // ============================================================
+
         async function runBackgroundBatch() {
           const { data: curriculumRow } = await supabase
             .from("curricula")
@@ -2328,47 +2375,198 @@ export async function legacyGenerationGet(
               initialAttempts: getStoredCoverageAttempts(batchJobData?.result_data, "batch", nodeId),
               yieldAfterRetry: true,
               threshold: 2,
-              attempt: async () => {
+              attempt: async (attemptIndex) => {
                 if (!canStartAiCall()) return "yield";
                 const reservation = await reserveAICall(
                   ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version,
                   DEFAULT_BUDGET_LIMITS.max_ai_calls, crypto.randomUUID()
                 );
+
+                // Record AI reservation outcome
+                const attemptNumber = attemptIndex + 1;
+                const aiCallsUsed = (await getJobById(ownerJobRecord.id))?.result_data?.aiCallsUsed ?? 0;
+                await appendDebugTrace(ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version, [{
+                  topicNumber: node.order_index,
+                  topicId: nodeId,
+                  attemptNumber,
+                  understandingCode: null,
+                  url: null,
+                  stage: "ai_reservation",
+                  result: reservation.reserved ? "success" : "failure",
+                  reason: reservation.reserved ? undefined : reservation.reason,
+                  aiCallNumber: aiCallsUsed + 1,
+                  reservationOk: reservation.reserved,
+                  reservationReason: reservation.reason,
+                }]);
+
                 if (!reservation.reserved) {
                   return reservation.reason === "budget_exhausted" ? "budget_exhausted" : "ownership_lost";
                 }
+
                 let batchResult: z.infer<typeof BatchResponseSchema>;
                 try {
                   batchResult = await callAIStructured(prompt, BatchResponseSchema, true, "topic_batch_ai");
                 } catch (discoveryError) {
                   console.warn(`[stream] Batch discovery attempt returned no usable result for ${node.title}`, discoveryError);
+                  await appendDebugTrace(ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version, [{
+                    topicNumber: node.order_index,
+                    topicId: nodeId,
+                    attemptNumber,
+                    understandingCode: null,
+                    url: null,
+                    stage: "ai_structured_call",
+                    result: "failure",
+                    reason: discoveryError instanceof Error ? discoveryError.message : String(discoveryError),
+                    aiCallNumber: aiCallsUsed + 1,
+                    candidateCount: 0,
+                  }]);
                   return "attempted";
                 }
+
+                // Record candidate count from AI response
+                const candidateCount = batchResult.topic_resources?.length ?? 0;
+                await appendDebugTrace(ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version, [{
+                  topicNumber: node.order_index,
+                  topicId: nodeId,
+                  attemptNumber,
+                  understandingCode: null,
+                  url: null,
+                  stage: "ai_response_received",
+                  result: "success",
+                  reason: undefined,
+                  aiCallNumber: aiCallsUsed + 1,
+                  candidateCount,
+                }]);
+
                 if (ownershipLost) return "ownership_lost";
+
                 for (const candidate of batchResult.topic_resources) {
                   const targetMuIds = mapUnderstandingCodesToIds(
                     candidate.understanding_codes,
                     muRows.map((mu) => ({ id: mu.id, code: mu.code ?? null, external_key: mu.external_key ?? null }))
                   );
-                  if (!candidate.url || !candidate.title || targetMuIds.length === 0) continue;
+                  if (!candidate.url || !candidate.title || targetMuIds.length === 0) {
+                    await appendDebugTrace(ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version, [{
+                      topicNumber: node.order_index,
+                      topicId: nodeId,
+                      attemptNumber,
+                      understandingCode: candidate.understanding_codes?.join(",") ?? null,
+                      url: candidate.url ?? null,
+                      stage: "candidate_validation",
+                      result: "skipped",
+                      reason: !candidate.url || !candidate.title ? "missing_url_or_title" : "no_matching_understanding_codes",
+                    }]);
+                    continue;
+                  }
+
                   for (const muId of targetMuIds) {
-                    // The AI discovery attempt has completed. If there is no
-                    // time left to acquire every candidate, record the
-                    // eligible resources saved so far as this bounded attempt;
-                    // yielding without recording it would replay the same
-                    // batch indefinitely with unchanged attempt/checkpoint data.
-                    if (!canStartCandidateAcquisition()) return "attempted";
+                    const mu = muRows.find((m) => m.id === muId);
+                    const understandingCode = mu?.code ?? mu?.external_key ?? null;
+
+                    // Record candidate received
+                    await appendDebugTrace(ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version, [{
+                      topicNumber: node.order_index,
+                      topicId: nodeId,
+                      attemptNumber,
+                      understandingCode,
+                      url: candidate.url,
+                      stage: "candidate_received",
+                      result: "success",
+                    }]);
+
+                    // Check acquisition budget
+                    if (!canStartCandidateAcquisition()) {
+                      await appendDebugTrace(ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version, [{
+                        topicNumber: node.order_index,
+                        topicId: nodeId,
+                        attemptNumber,
+                        understandingCode,
+                        url: candidate.url,
+                        stage: "acquisition_budget_check",
+                        result: "failure",
+                        reason: "budget_exhausted_or_time_limit",
+                      }]);
+                      return "attempted";
+                    }
+
                     try {
-                      await discoverVerifiedResource(toLearnParams(
+                      // Record acquisition start
+                      await appendDebugTrace(ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version, [{
+                        topicNumber: node.order_index,
+                        topicId: nodeId,
+                        attemptNumber,
+                        understandingCode,
+                        url: candidate.url,
+                        stage: "acquisition_started",
+                        result: "success",
+                      }]);
+
+                      const learnParams = toLearnParams(
                         candidate as Record<string, unknown>, { understandingId: muId },
                         acquisitionJobId, candidate.ai_note ?? null,
                         {
                           topicTitle: node.title,
-                          conceptDescription: muRows.find((mu) => mu.id === muId)?.description,
+                          conceptDescription: mu?.description,
                         }
-                      ), { cache, jobId: ownerJobRecord.id, claimToken: ownerJobRecord.claim_token });
+                      );
+
+                      const result = await discoverVerifiedResource(learnParams, { cache, jobId: ownerJobRecord.id, claimToken: ownerJobRecord.claim_token });
+
+                      if (result === null) {
+                        // discoverVerifiedResource returned null - need to infer reason from internal logs
+                        // We can't directly access the internal error, but we know it's one of:
+                        // - acquisition_failed
+                        // - content_extraction_failed
+                        // - verification_failed (shouldn't happen, verification only fails on wordCount=0)
+                        // - evidence_failed (verification passes but educationalEvidencePresent=false -> draft, not null)
+                        // - lease_failed
+                        // - persistence_failed
+                        await appendDebugTrace(ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version, [{
+                          topicNumber: node.order_index,
+                          topicId: nodeId,
+                          attemptNumber,
+                          understandingCode,
+                          url: candidate.url,
+                          stage: "discoverVerifiedResource_returned_null",
+                          result: "failure",
+                          reason: "acquisition_failed_or_content_extraction_failed_or_lease_failed_or_persistence_failed",
+                        }]);
+                      } else {
+                        await appendDebugTrace(ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version, [{
+                          topicNumber: node.order_index,
+                          topicId: nodeId,
+                          attemptNumber,
+                          understandingCode,
+                          url: candidate.url,
+                          stage: "persistence_succeeded",
+                          result: "success",
+                          reason: `resource_status=${result.resource.status}, content_type_verified=${result.resource.contentTypeVerified}`,
+                        }]);
+                      }
                     } catch (candidateError) {
-                      if (candidateError instanceof PersistenceError) throw candidateError;
+                      if (candidateError instanceof PersistenceError) {
+                        await appendDebugTrace(ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version, [{
+                          topicNumber: node.order_index,
+                          topicId: nodeId,
+                          attemptNumber,
+                          understandingCode,
+                          url: candidate.url,
+                          stage: "persistence_failed",
+                          result: "failure",
+                          reason: candidateError.message,
+                        }]);
+                        throw candidateError;
+                      }
+                      await appendDebugTrace(ownerJobRecord.id, ownerJobRecord.claim_token, ownerJobRecord.claim_version, [{
+                        topicNumber: node.order_index,
+                        topicId: nodeId,
+                        attemptNumber,
+                        understandingCode,
+                        url: candidate.url,
+                        stage: "candidate_exception",
+                        result: "failure",
+                        reason: candidateError instanceof Error ? candidateError.message : String(candidateError),
+                      }]);
                       console.warn(`[stream] Batch candidate failed for ${candidate.url}`, candidateError);
                     }
                   }
